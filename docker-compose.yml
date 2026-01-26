@@ -1,0 +1,75 @@
+version: "3.8"
+
+services:
+  openwebui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: openwebui
+    ports:
+      - "3000:8080"
+    environment:
+      ENV: "dev"
+    volumes:
+      - openwebui-data:/app/backend/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  sandbox:
+    build: ./sandbox_service
+    container_name: spreadsheet-sandbox
+    ports:
+      - "8081:8081"
+    env_file:
+      - ./config/user_params.env
+    environment:
+      SANDBOX_API_KEY: ""
+      DF_CACHE_TTL_S: "1800"
+      MAX_DF_CACHE_ITEMS: "32"
+      MAX_MEMORY_MB: "0"
+      CPU_TIME_S: "120"
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
+      VECLIB_MAXIMUM_THREADS: "1"
+    restart: unless-stopped
+    networks:
+      - app_net
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines:main
+    container_name: openwebui-pipelines
+    ports:
+      - "9099:9099"
+    env_file:
+      - ./config/user_params.env
+    environment:
+      WEBUI_INTERNAL_BASE_URL: "http://localhost:8080"
+      PIPELINES_BASE_URL: "http://pipelines:9099/v1"
+      PIPELINES_MODEL: "spreadsheet_analyst_pipeline"
+      WEBUI_BASE_URL: "http://openwebui:8080"
+      WEBUI_API_KEY: "sk-SZ55NqwNUcnJWq5PwmUCVvbXibCIigG2RL1yy81fPIAK9xWYSMaaocELVdk05ycM"
+      BASE_LLM_BASE_URL: "http://192.168.200.129:8031/v1"
+      BASE_LLM_API_KEY: "DUMMY_KEY"
+      BASE_LLM_MODEL: "chat-model"
+      SANDBOX_URL: "http://sandbox:8081"
+      SANDBOX_API_KEY: ""
+    volumes:
+      - ./pipelines:/app/pipelines
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - openwebui
+      - sandbox
+    restart: unless-stopped
+    networks:
+      - app_net
+
+networks:
+  app_net:
+    driver: bridge
+
+volumes:
+  openwebui-data:

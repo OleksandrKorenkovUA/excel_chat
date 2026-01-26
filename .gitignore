@@ -1,0 +1,31 @@
+.DS_Store
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# secrets
+.env
+*.env
+config/*.env
+*.key
+*.pem
+.webui_secret_key
+printf "\n# python cache\n__pycache__/\n*.pyc\n" >> .gitignore
+
+
+# macOS
+.DS_Store
+
+# python cache
+__pycache__/
+*.pyc
+
+# env/secrets
+.env
+*.env
+config/*.env
+*.key
+*.pem
+.webui_secret_key

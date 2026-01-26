@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pandas
+numpy
+openpyxl
+pyarrow
+pydantic
+tabulate
