@@ -68,6 +68,27 @@ services:
 
 Після цього значення з `config/user_params.env` будуть використовуватись автоматично.
 
+### ShortcutRouter: абсолютні шляхи в Docker
+
+У контейнері pipelines робочий каталог — `/app/pipelines`. Тому для ShortcutRouter потрібно задавати **абсолютні** шляхи, інакше індекс/каталог не знайдуться.
+
+Додайте в `docker-compose.yml` (service `pipelines`):
+
+```yaml
+environment:
+  SHORTCUT_ENABLED: "true"
+  SHORTCUT_CATALOG_PATH: "/app/pipelines/sandbox_service/catalog.json"
+  SHORTCUT_INDEX_PATH: "/app/pipelines/retrieval_index/index.faiss"
+  SHORTCUT_META_PATH: "/app/pipelines/retrieval_index/meta.json"
+```
+
+Застосуйте зміни і перевірте логи:
+
+```bash
+docker-compose up -d pipelines
+docker logs openwebui-pipelines --tail 50
+```
+
 ## Запуск через Docker Compose
 
 ```bash

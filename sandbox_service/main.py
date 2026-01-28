@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 app = FastAPI()
 
+
 def _df_append_compat(self: pd.DataFrame, other: Any, ignore_index: bool = False, **kwargs: Any) -> pd.DataFrame:
     if other is None:
         return self.copy()
@@ -36,6 +37,7 @@ def _df_append_compat(self: pd.DataFrame, other: Any, ignore_index: bool = False
     else:
         other_df = pd.DataFrame([other])
     return pd.concat([self, other_df], ignore_index=ignore_index)
+
 
 if not hasattr(pd.DataFrame, "append"):
     pd.DataFrame.append = _df_append_compat
@@ -380,6 +382,18 @@ def load_dataframe(req: LoadRequest, request: Request) -> dict:
     return {"df_id": df_id, "profile": profile}
 
 
+@app.get("/v1/dataframe/{df_id}/profile")
+def get_profile(df_id: str, request: Request) -> dict:
+    _require_auth(request)
+    _cleanup_store()
+
+    entry = DF_STORE.get(df_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="df_not_found")
+    entry["ts"] = time.time()
+    return {"df_id": df_id, "profile": entry.get("profile"), "ts": entry.get("ts")}
+
+
 @app.post("/v1/dataframe/run")
 def run_code(req: RunRequest, request: Request) -> dict:
     _require_auth(request)
@@ -445,3 +459,4 @@ def run_code(req: RunRequest, request: Request) -> dict:
         "error": err,
         "profile": entry.get("profile"),
     }
+

@@ -1,0 +1,910 @@
+{
+  "catalog_version": "0.2.0",
+  "dim": 1024,
+  "rows": [
+    {
+      "intent_id": "stats_shape",
+      "text": "Скільки рядків і стовпців у таблиці?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Порахуй кількість рядків та колонок"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Який розмір таблиці?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Скажи shape таблиці"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Скільки рядків у таблиці і скільки колонок?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Дай розмірність датафрейму"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Покажи кількість записів і полів"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Скільки всього рядків і колонок тут?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Порахуй rows і columns"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Мені треба знати об'єм даних"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Скільки всього записів?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Яка структура таблиці по розміру?"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Виведи кількість стрічок і стовпчиків"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Напишіть розміри df"
+    },
+    {
+      "intent_id": "stats_shape",
+      "text": "Скільки даних завантажено?"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Покажи перші 5 рядків"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Виведи останні 10 записів"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Дай хед таблиці"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Подивитись початок таблиці"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Покажи кінець списку"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Виведи 3 приклада даних"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Покажи топ 10 рядків"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Глянути на останні 5 стрічок"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Зроби head(20)"
+    },
+    {
+      "intent_id": "head_tail",
+      "text": "Покажи зразки даних зверху"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Порахуй пропуски по всіх колонках"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Скільки пустих значень у таблиці?"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Покажи null count по колонках"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Дай кількість NaN по кожній колонці"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Чи є пропуски? Дай статистику"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Скільки пропусків у колонці price?"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Порахуй пусті значення у полі date"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Покажи де найбільше пропусків"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Виведи колонки з пропусками"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Зроби звіт по missing values"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Перевір чи є нульові значення в id"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Скільки незаповнених полів у address?"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Чи є нани в колонці score?"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Де у нас не вистачає даних?"
+    },
+    {
+      "intent_id": "stats_nulls",
+      "text": "Порахуй NaNs"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Скільки унікальних значень у колонці brand?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Порахуй унікальні імена клієнтів"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Скільки різних категорій є в таблиці?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Дай nunique для user_id"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Покажи кількість унікальних значень для кожної колонки"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Скільки унікальних міст?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Порахуй різні значення в колонці status"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Скільки унікальних записів у полі product_code?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Дай список колонок і кількість унікальних значень"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Порахуй distinct values для manager"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Як багато різних значень приймає колонка type?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Порахуй варіативність у колонці group"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Скільки неповторюваних записів у email?"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Виведи кількість унікальних для всіх стовпців"
+    },
+    {
+      "intent_id": "unique_nunique",
+      "text": "Дай статистику унікальності"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Порахуй середнє значення ціни"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Яка максимальна зарплата?"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Знайди мінімальний вік"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Дай суму продажів"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Порахуй медіану по колонці score"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Який середній чек (mean) по column 'total'?"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Знайди max для temperature"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Підсумуй значення у колонці amount"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Яке найменше значення quantity?"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Порахуй total sum для profit"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Середня оцінка (average) по класу"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Який максимум у стовпці height?"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Мінімум по weight"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Дай загальну суму витрат"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Надай кількість товарів для кожного бренду"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Порахуй скільки рядків на кожен region"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Згрупуй по department і порахуй кількість"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Скільки співробітників у кожному відділі?"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Дай count по category"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Покажи кількість записів для кожного значення status"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Зроби групування по year з кількістю"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Порахуй кількість по колонці country"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Згрупуй по gender і порахуй скільки"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Побудуй таблицю: місто → кількість клієнтів"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Розподіл замовлень по менеджерах"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Скільки разів зустрічається кожне значення в col1?"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Згрупувати за типом та порахувати"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Статистика кількості по групах товарів"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Top категорій за кількістю"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Відфільтруй рядки де city = Kyiv"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Покажи тільки записи з category = shoes"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Залиш рядки де status дорівнює active"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Вибери всі записи де id = 12345"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Покажи дані для manager 'Ivanov'"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Зроби фільтр по type 'Samsung'"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Виведи рядки де gender = M"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Покажи тільки ті рядки де currency = UAH"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Знайди всі записи де department = IT"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Відобрази рядки з color = Red"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Дай мені тільки ті де success = True"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Фільтрувати по колонці name значення John"
+    },
+    {
+      "intent_id": "filter_equals",
+      "text": "Вибрати де рік дорівнює 2023"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Покажи рядки де ціна більше 1000"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Відфільтруй де age < 18"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Залиш записи де score більше або дорівнює 90"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Виведи товари з кількістю менше 5"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Знайди де salary > 5000"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Фільтруй: year >= 2020"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Покажи де discount менше 10%"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Вибери записи з рейтингом вище 4.5"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Прибери все де value <= 0"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Покажи транзакції більше 100 грн"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Де температура нижче 0?"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Фільтр по height більше 180"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Відсортуй таблицю по price за спаданням"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Відсортуй по date за зростанням"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Зроби сортування по прізвищу"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Посортуй по quantity desc"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Сортуй по колонці rating"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Відсортуй за salary від більшої до меншої"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Зроби order by id"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Сортуй за name по алфавіту"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Відсортуй по created_at у зворотному порядку"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Покажи таблицю відсортовану по total"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Впорядкуй дані за віком"
+    },
+    {
+      "intent_id": "sort_by_column",
+      "text": "Сортування таблиці: стовпець X, descending"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Залиш тільки колонки name та email"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Покажи мені лише price і product"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Вибери стовпці: date, amount, status"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Прибери зайві колонки, залиш тільки id"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Створи таблицю тільки з колонок A і B"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Мені потрібні лише поля first_name та last_name"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Відфільтруй стовпці: залиш city та country"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Виведи тільки колонку description"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Select columns x, y, z"
+    },
+    {
+      "intent_id": "select_columns",
+      "text": "Обріж таблицю до колонок user та score"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Видали колонку old_id"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Прибери стовпці temp і aux"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Дропни колонку unnamed: 0"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Видали поля password та secret"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Мені не потрібна колонка comments"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Викинь стовпець index з таблиці"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Зроби drop columns A, B"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Видалити зайві поля: x1, x2"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Очисти таблицю від колонки internal_code"
+    },
+    {
+      "intent_id": "drop_columns",
+      "text": "Прибери колонку date_modified"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Перейменуй колонку 'name' на 'full_name'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Зміни назву стовпця 'p' на 'price'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Назви колонку 'id' як 'user_id'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Rename 'qty' to 'quantity'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Поміняй заголовок 'tel' на 'phone'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Перейменувати 'col1' в 'Category'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Дай колонці 'dt' назву 'date'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Зроби ренейм 'old' -> 'new'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Заміни назву поля 'adres' на 'address'"
+    },
+    {
+      "intent_id": "rename_column",
+      "text": "Виправ назву стовпця 'count' на 'total_count'"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали рядок номер 10"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали рядки 98 і 99"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Прибери 1, 2, 3 рядки"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали рядки з номерами 5-7"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали останній рядок"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали перші 2 рядки"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Прибери рядки 12 та 15"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали рядки 20, 21, 22"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Зітри рядок номер 4"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Видали рядки 30-35 включно"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Дропни нульовий рядок"
+    },
+    {
+      "intent_id": "drop_rows_by_position",
+      "text": "Викинь рядки під індексами 100, 101"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Видали дублікати"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Прибери повтори в таблиці"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Видали однакові рядки"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Залиш тільки унікальні рядки"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Drop duplicates"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Почисти таблицю від дублів"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Видалити записи, що повторюються"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Зроби так щоб рядки не повторювались"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Видали дублікати по колонці email"
+    },
+    {
+      "intent_id": "drop_duplicates",
+      "text": "Прибери повтори де співпадає id"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Збережи таблицю у csv"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Експортуй у CSV файл"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Зроби експорт у csv з роздільником ;"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Збережи csv без індексу"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Експортуй у CSV з кодуванням utf-8"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Зроби файл results.csv"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Вивантаж таблицю в csv"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Експорт у CSV, separator=comma"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Збережи як data.csv"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Експортуй csv з index=false"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Запиши результат у файл"
+    },
+    {
+      "intent_id": "export_csv",
+      "text": "Скачати як csv"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Зроби describe по числових колонках"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Дай описову статистику"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Покажи describe()"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Статистика по колонках"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Describe для price та quantity"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Порахуй mean median min max"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Зведена статистика по числових"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Опиши дані"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Описова статистика для score"
+    },
+    {
+      "intent_id": "stats_describe",
+      "text": "Describe numeric columns"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Сума продажів по бренду"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Порахуй середню ціну по категоріях"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Max score по групах"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Мінімум по кожному клієнту"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Sum по колонці amount для кожного city"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Середнє значення quantity по brand"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Агрегація mean по групах"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Порахуй sum для кожної марки"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Сума по регіонах"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Average price per category"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Знайди рядки де name містить ivan"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Фільтр по підрядку у колонці city"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Покажи записи де опис містить pro"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "contains для колонки brand"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Де title містить слово max"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Фільтруй коли адреса містить kyiv"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Містить текст у полі comment"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Відфільтруй за підрядком"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Пошук по частині слова"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Rows where name contains ann"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Покажи ціни між 100 і 200"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Фільтр по діапазону для amount 10-50"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Де score від 0.5 до 0.8"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "between для price"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Залиши рядки з quantity 1-5"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Відфільтруй по діапазону"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Покажи значення у межах"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Ціна від 500 до 1000"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Range filter for value 20-40"
+    },
+    {
+      "intent_id": "filter_range_numeric",
+      "text": "Between min and max"
+    }
+  ],
+  "embedding": {
+    "base_url": "http://gpu-test.silly.billy:8022/v1",
+    "model": "multilingual-embeddings"
+  }
+}

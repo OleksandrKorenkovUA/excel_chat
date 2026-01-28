@@ -1,22 +1,55 @@
-import asyncio, base64, inspect, json, logging, os, re, threading, time, traceback
-from typing import Any, Dict, Generator, Iterator, List, Optional, Tuple, Union
-
+import asyncio
+import base64
+import inspect
+import json
+import logging
+import os
+import re
+import textwrap
+import threading
+import time
+import traceback
+from typing import Any, ClassVar, Dict, Generator, Iterator, List, Optional, Tuple, Union
+from pipelines.shortcut_router.shortcut_router import ShortcutRouter, ShortcutRouterConfig
 import requests
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+
+
+
+PIPELINES_DIR = os.path.dirname(__file__)
+
 DEF_TIMEOUT_S = int(os.getenv("PIPELINE_HTTP_TIMEOUT_S", "120"))
-PROMPTS_PATH = os.path.join(os.path.dirname(__file__), "prompts.txt")
+_LOCAL_PROMPTS = os.path.join(os.path.dirname(__file__), "prompts.txt")
+PROMPTS_PATH = _LOCAL_PROMPTS if os.path.exists(_LOCAL_PROMPTS) else os.path.join(PIPELINES_DIR, "prompts.txt")
+
 DEFAULT_PLAN_CODE_SYSTEM = (
     "You write pandas code to answer questions about a DataFrame named df. "
-    "Return ONLY valid JSON with keys: analysis_code, short_plan. "
+    "Return ONLY valid JSON with keys: analysis_code, short_plan, op. "
+    "op must be 'edit' if the user asks to modify data (delete, add, rename, update values), otherwise 'read'. "
+    "CRITICAL RULE FOR COUNTS: If user asks for 'count products', 'how many items', or 'quantity of brands' -> YOU MUST USE len(df) or .size(). "
+    "NEVER calculate sum() of a column named 'Quantity', 'Amount' or 'Кількість' unless the user EXPLICITLY asks for 'total sum' or 'total volume'. "
+    "Example: 'Count products by brand' -> df.groupby('Brand').size(). "
+    "If op == 'edit', your code MUST assign the updated DataFrame back to variable df (e.g. df = df.drop(...)) "
+    "and MUST set __commit_df__ = True. "
+    "If op == 'read', your code MUST NOT modify df (no column creation, no inplace ops). "
+    "Compute structural facts (rows/cols/columns) from df, not from df_profile. "
     "analysis_code must be pure Python statements, no imports, no file or network access, no plotting. "
     "Put the final answer into variable result. Keep it concise."
 )
+
 DEFAULT_FINAL_ANSWER_SYSTEM = (
     "You are a data analysis assistant. Answer in Ukrainian. "
-    "Use only the execution results provided. If there is an error, explain what to change."
+    "CRITICAL: Use ONLY the data from result_text field. NEVER generate or invent numbers. "
+    "If result_text contains the answer, format it clearly. "
+    "If result_text is empty or has an error, explain what to change. "
+    "If a keyword for grouping is not explicitly mentioned, first try to infer the grouping column from df_profile column names. "
+    "DO NOT use data from df_profile to answer questions about counts or aggregations."
 )
+
+SHORTCUT_COL_PLACEHOLDER = "__SHORTCUT_COL__"
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -26,6 +59,7 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
 
 def _read_prompts(path: str) -> Dict[str, str]:
     try:
@@ -38,13 +72,39 @@ def _read_prompts(path: str) -> Dict[str, str]:
         prompts[match.group("name")] = match.group("body").strip()
     return prompts
 
+
+def _is_meta_task_text(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if s.startswith("### Task:"):
+        return True
+    lower = s.lower()
+    if lower.startswith("analyze the chat history"):
+        return True
+    if lower.startswith("respond to the user query using the provided context"):
+        return True
+    return False
+
+
+def _extract_user_query_from_meta(text: str) -> str:
+    s = (text or "").strip()
+    if not s or not _is_meta_task_text(s):
+        return ""
+    m = re.search(r"<user_query>\s*(.+?)\s*</user_query>", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    m = re.search(r"###\s*User Query:\s*(.+?)(?:\n###|$)", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    return ""
+
+
 def _last_user_message(messages: List[dict]) -> str:
     for msg in reversed(messages or []):
         if msg.get("role") != "user":
             continue
         content = msg.get("content", "")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
         if isinstance(content, list):
             parts: List[str] = []
             for part in content:
@@ -54,10 +114,20 @@ def _last_user_message(messages: List[dict]) -> str:
                     text = part.get("text") or part.get("content")
                     if isinstance(text, str) and text.strip():
                         parts.append(text.strip())
-            joined = "\n".join(parts).strip()
-            if joined:
-                return joined
+            content = "\n".join(parts).strip()
+        if not isinstance(content, str):
+            continue
+        s = content.strip()
+        if not s:
+            continue
+        if _is_meta_task_text(s):
+            extracted = _extract_user_query_from_meta(s)
+            if extracted:
+                return extracted
+            continue
+        return s
     return ""
+
 
 def _iter_file_objs(body: dict, messages: List[dict]) -> List[dict]:
     out: List[dict] = []
@@ -76,9 +146,12 @@ def _iter_file_objs(body: dict, messages: List[dict]) -> List[dict]:
         c = msg.get("content")
         if isinstance(c, list):
             for part in c:
-                if isinstance(part, dict) and (part.get("type") in ("file", "input_file") or part.get("kind") == "file"):
+                if isinstance(part, dict) and (
+                    part.get("type") in ("file", "input_file") or part.get("kind") == "file"
+                ):
                     out.append(part)
     return out
+
 
 def _pick_file_ref(body: dict, messages: List[dict]) -> Tuple[Optional[str], Optional[dict]]:
     for obj in reversed(_iter_file_objs(body, messages)):
@@ -90,11 +163,13 @@ def _pick_file_ref(body: dict, messages: List[dict]) -> Tuple[Optional[str], Opt
         return fid, {"id": fid}
     return None, None
 
+
 def _session_key(body: dict) -> str:
     user = (body or {}).get("user") or {}
     user_id = user.get("id") or "anon"
     chat_id = (body or {}).get("conversation_id") or (body or {}).get("chat_id") or "default"
     return f"{user_id}:{chat_id}"
+
 
 def _safe_trunc(text: str, limit: int) -> str:
     text = str(text)
@@ -102,22 +177,151 @@ def _safe_trunc(text: str, limit: int) -> str:
         return text
     return text[:limit] + "...(truncated)"
 
+_EDIT_METHODS_RETURN_DF = (
+    "drop",
+    "rename",
+    "assign",
+    "replace",
+    "fillna",
+    "drop_duplicates",
+    "sort_values",
+    "reset_index",
+    "set_index",
+    "dropna",
+    "astype",
+    "reindex",
+    "reindex_like",
+    "sort_index",
+    "insert",
+)
+
+def _is_count_intent(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(re.search(r"\b(скільк\w*|кільк\w*|count|how\s+many|qty|quantity)\b", q))
+
+def _is_sum_intent(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(re.search(r"\b(sum|сума|total|загальн\w*|обсяг|volume|units|залишк\w*)\b", q))
+
+def _has_df_assignment(code: str) -> bool:
+    return bool(re.search(r"(^|\n)\s*df\s*=", code or "")) or bool(
+        re.search(r"df\.(loc|iloc|at|iat)\[.+?\]\s*=", code or "")
+    ) or bool(re.search(r"df\[[^\]]+\]\s*=", code or ""))
+
+def _has_inplace_op(code: str) -> bool:
+    return bool(re.search(r"inplace\s*=\s*True", code or ""))
+
+def _repair_edit_code(code: str) -> str:
+    lines = (code or "").splitlines()
+    out: List[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if "=" in line or "inplace=True" in stripped.replace(" ", ""):
+            out.append(line)
+            continue
+        m = re.match(r"^(\s*)df\.(\w+)\(", line)
+        if not m:
+            out.append(line)
+            continue
+        indent, method = m.group(1), m.group(2)
+        if method in _EDIT_METHODS_RETURN_DF:
+            out.append(re.sub(r"^(\s*)df\.", r"\1df = df.", line, count=1))
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+def _validate_edit_code(code: str) -> Tuple[str, Optional[str]]:
+    if _has_df_assignment(code) or _has_inplace_op(code):
+        return code, None
+    repaired = _repair_edit_code(code)
+    if _has_df_assignment(repaired) or _has_inplace_op(repaired):
+        return repaired, None
+    return code, "Edit code does not assign back to df and has no inplace/index assignment."
+
+def _enforce_count_code(question: str, code: str) -> Tuple[str, Optional[str]]:
+    if not _is_count_intent(question) or _is_sum_intent(question):
+        return code, None
+    if re.search(r"\.sum\s*\(\s*\)", code or ""):
+        code = re.sub(r"\.sum\s*\(\s*\)", ".size()", code)
+    if re.search(r"\.sum\s*\(", code or ""):
+        return code, "Count intent detected but code uses sum()."
+    return code, None
+
+
+_ORDINAL_UA_ROOTS: Dict[str, int] = {
+    # 1-10
+    "перш": 1,
+    "друг": 2,
+    "трет": 3,
+    "четверт": 4,
+    "п'ят": 5,
+    "пʼят": 5,
+    "шост": 6,
+    "сьом": 7,
+    "восьм": 8,
+    "дев'ят": 9,
+    "девʼят": 9,
+    "десят": 10,
+    # десятки (20, 30, ..., 90)
+    "двадцят": 20,
+    "тридцят": 30,
+    "сороков": 40,
+    "п'ятдесят": 50,
+    "пʼятдесят": 50,
+    "шістдесят": 60,
+    "сімдесят": 70,
+    "вісімдесят": 80,
+    "дев'яносто": 90,
+    "девʼяносто": 90,
+    # сотні (100, 200, ..., 900)
+    "сот": 100,
+    "двісті": 200,
+    "трьохсот": 300,
+    "чотирьохсот": 400,
+    "п'ятисот": 500,
+    "пʼятисот": 500,
+    "шестисот": 600,
+    "семисот": 700,
+    "восьмисот": 800,
+    "дев'ятисот": 900,
+    "девʼятисот": 900,
+}
+
+
 def _match_column_by_index(text: str, columns: List[str]) -> Optional[str]:
-    m = re.search(r"(?:колонк|стовпец)[^\d]*(\d+)", text, re.I)
-    if not m:
+    if not text or not columns:
         return None
-    idx = int(m.group(1))
-    if idx <= 0 or idx > len(columns):
+    t = text.lower()
+    m = re.search(r"(?:колонк|стовпц|стовпчик|стовпики|стовпця|стовпці|стовп|columns?)[^\d]*(\d+)", t, re.I)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= len(columns):
+            return columns[idx - 1]
         return None
-    return columns[idx - 1]
+    m2 = re.search(
+        r"(перш\w*|друг\w*|трет\w*|четверт\w*|п[ʼ']ят\w*|шост\w*|сьом\w*|восьм\w*|дев[ʼ']ят\w*|десят\w*|двадцят\w*|тридцят\w*|сороков\w*|шістдесят\w*|сімдесят\w*|вісімдесят\w*|дев[ʼ']яносто\w*|сот\w*|двісті\w*|трьохсот\w*|чотирьохсот\w*|п[ʼ']ятисот\w*|шестисот\w*|семисот\w*|восьмисот\w*|дев[ʼ']ятисот\w*)\s+(?:колонк\w*|стовпц\w*)",
+        t,
+        re.I,
+    )
+    if not m2:
+        return None
+    root = re.sub(r"[^a-zа-яіїєґʼ']", "", m2.group(1).lower())
+    for prefix, value in _ORDINAL_UA_ROOTS.items():
+        if root.startswith(prefix):
+            if 1 <= value <= len(columns):
+                return columns[value - 1]
+            return None
+    return None
+
 
 def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
     if not text or not columns:
         return None
+    lower = text.lower()
+
     col = _match_column_by_index(text, columns)
     if col:
         return col
-    lower = text.lower()
     best = None
     for name in columns:
         if not isinstance(name, str):
@@ -128,7 +332,25 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
         if n.lower() in lower:
             if not best or len(n) > len(best):
                 best = n
-    return best
+    if best:
+        return best
+
+    _STOP_ROOTS = {"кіль", "скіл", "count", "coun", "each", "per"}
+
+    def _root_tokens(s: str) -> List[str]:
+        parts = re.split(r"[^a-zа-яіїєґ0-9]+", (s or "").lower())
+        roots = [p[:4] for p in parts if len(p) >= 3 and p[:4] not in _STOP_ROOTS]
+        return roots
+
+    q_roots = set(_root_tokens(lower))
+    for name in columns:
+        if not isinstance(name, str):
+            continue
+        roots = _root_tokens(name)
+        if roots and all(r in q_roots for r in roots):
+            return name
+    return None
+
 
 def _parse_row_index(text: str) -> Optional[int]:
     m = re.search(r"(?:рядок|рядка|row)[^\d]*(\d+)", text, re.I)
@@ -137,11 +359,13 @@ def _parse_row_index(text: str) -> Optional[int]:
     idx = int(m.group(1))
     return idx if idx > 0 else None
 
+
 def _parse_set_value(text: str) -> Optional[str]:
     m = re.search(r"(?:на|=)\s*([^\n]+)$", text, re.I)
     if not m:
         return None
     return m.group(1).strip().strip("\"'")
+
 
 def _parse_number_literal(raw: str) -> Optional[float]:
     if raw is None:
@@ -153,6 +377,7 @@ def _parse_number_literal(raw: str) -> Optional[float]:
         return float(cleaned)
     except ValueError:
         return None
+
 
 def _parse_literal(raw: str) -> Any:
     if raw is None:
@@ -169,6 +394,7 @@ def _parse_literal(raw: str) -> Any:
         return num
     return str(raw).strip().strip("\"'")
 
+
 def _parse_condition(text: str, columns: List[str]) -> Optional[Tuple[str, str, str, Optional[float]]]:
     if "де" not in text.lower():
         return None
@@ -182,6 +408,7 @@ def _parse_condition(text: str, columns: List[str]) -> Optional[Tuple[str, str, 
     value = m.group(2).strip().strip("\"'")
     num = _parse_number_literal(value) if op in (">", "<", ">=", "<=") else None
     return col, op, value, num
+
 
 def _find_columns_in_text(text: str, columns: List[str]) -> List[str]:
     if not text or not columns:
@@ -199,6 +426,7 @@ def _find_columns_in_text(text: str, columns: List[str]) -> List[str]:
     hits.sort(key=lambda x: x[0])
     return [col for _, col in hits]
 
+
 def _excel_col_index(token: str) -> Optional[int]:
     token = (token or "").strip().upper()
     if not token.isalpha():
@@ -209,6 +437,7 @@ def _excel_col_index(token: str) -> Optional[int]:
     for ch in token:
         idx = idx * 26 + (ord(ch) - ord("A") + 1)
     return idx - 1
+
 
 def _columns_from_spec(spec: str, columns: List[str]) -> List[str]:
     if not spec or not columns:
@@ -244,6 +473,7 @@ def _columns_from_spec(spec: str, columns: List[str]) -> List[str]:
         uniq.append(col)
     return uniq
 
+
 def _parse_row_range(text: str) -> Optional[Tuple[int, int]]:
     m = re.search(r"(?:рядки|рядків|rows?)\s*(\d+)\s*[-–]\s*(\d+)", text, re.I)
     if not m:
@@ -254,12 +484,14 @@ def _parse_row_range(text: str) -> Optional[Tuple[int, int]]:
         return None
     return (min(a, b), max(a, b))
 
+
 def _parse_position_index(text: str) -> Optional[int]:
     m = re.search(r"(?:позиці[яії]|position)\s*(\d+)", text, re.I)
     if not m:
         return None
     idx = int(m.group(1))
     return idx if idx > 0 else None
+
 
 def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
     q = (question or "").strip()
@@ -310,7 +542,11 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 plan = "Замінити значення в заданому діапазоні."
                 return "\n".join(code_lines) + "\n", plan
 
-    m = re.search(r"\b(додай|додати|add)\b\s+(?:колонку|стовпець)\s+([A-Za-zА-Яа-я0-9_ ]+)\s*=\s*([A-Za-zА-Яа-я0-9_ ]+)\s*([+\-*/x×])\s*([A-Za-zА-Яа-я0-9_ ]+)", q, re.I)
+    m = re.search(
+        r"\b(додай|додати|add)\b\s+(?:колонку|стовпець)\s+([A-Za-zА-Яа-я0-9_ ]+)\s*=\s*([A-Za-zА-Яа-я0-9_ ]+)\s*([+\-*/x×])\s*([A-Za-zА-Яа-я0-9_ ]+)",
+        q,
+        re.I,
+    )
     if m:
         new_col = m.group(2).strip()
         a = _find_column_in_text(m.group(3), columns)
@@ -326,7 +562,11 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             plan = f"Додати колонку {new_col} як обчислення з {a} та {b}."
             return "\n".join(code_lines) + "\n", plan
 
-    m = re.search(r"\b(встав|insert)\b.*\b(колонку|стовпець)\b\s+([A-Za-zА-Яа-я0-9_ ]+)\s+.*\b(після|after)\b\s+(?:колонки|стовпця)\s+([A-Za-zА-Яа-я0-9_ ]+)", q, re.I)
+    m = re.search(
+        r"\b(встав|insert)\b.*\b(колонку|стовпець)\b\s+([A-Za-zА-Яа-я0-9_ ]+)\s+.*\b(після|after)\b\s+(?:колонки|стовпця)\s+([A-Za-zА-Яа-я0-9_ ]+)",
+        q,
+        re.I,
+    )
     if m:
         new_col = m.group(3).strip()
         after_col = _find_column_in_text(m.group(5), columns)
@@ -419,7 +659,9 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 if num is None:
                     return None
                 code_lines.append("_raw = _col.astype(str)")
-                code_lines.append(r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')")
+                code_lines.append(
+                    r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
                 code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
                 code_lines.append("_num = _clean.where(_mask, np.nan).astype(float)")
                 code_lines.append(f"_value = {num!r}")
@@ -606,12 +848,17 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             plan = f"Показати унікальні значення у {col}."
             return "\n".join(code_lines) + "\n", plan
 
-    if re.search(r"\b(скільк|count)\b.*\b(кожн|each)\b", q_low):
+    if re.search(r"\b(скільк\w*|кільк\w*|count)\b", q_low) and re.search(r"\b(кожн\w*|each|per)\b", q_low):
         col = _find_column_in_text(q, columns)
         if col:
             code_lines.append(f"result = df[{col!r}].value_counts(dropna=False).to_dict()")
             plan = f"Порахувати частоти значень у {col}."
             return "\n".join(code_lines) + "\n", plan
+        code_lines.append(
+            f"result = df.groupby({SHORTCUT_COL_PLACEHOLDER!r}).size().reset_index(name='count').sort_values('count', ascending=False)"
+        )
+        plan = f"Порахувати кількість рядків для кожного значення у колонці {SHORTCUT_COL_PLACEHOLDER}."
+        return "\n".join(code_lines) + "\n", plan
 
     if re.search(r"\b(перетвори|convert)\b.*\b(у число|numeric)\b", q_low):
         col = _find_column_in_text(q, columns)
@@ -663,7 +910,9 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             index_col = cols[1]
             columns_col = cols[2]
             agg = "sum" if re.search(r"\b(sum|сума)\b", q_low) else "mean"
-            code_lines.append(f"result = df.pivot_table(index={index_col!r}, columns={columns_col!r}, values={value_col!r}, aggfunc={agg!r})")
+            code_lines.append(
+                f"result = df.pivot_table(index={index_col!r}, columns={columns_col!r}, values={value_col!r}, aggfunc={agg!r})"
+            )
             plan = f"Побудувати зведену {agg} для {value_col} по {index_col} та {columns_col}."
             return "\n".join(code_lines) + "\n", plan
         if len(cols) >= 2:
@@ -695,11 +944,13 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             date_col = cols[-1]
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{date_col!r}] = pd.to_datetime(df[{date_col!r}], errors='coerce')")
-            code_lines.append(f"result = df.groupby(pd.Grouper(key={date_col!r}, freq='M'))[{value_col!r}].sum().reset_index()")
+            code_lines.append(
+                f"result = df.groupby(pd.Grouper(key={date_col!r}, freq='M'))[{value_col!r}].sum().reset_index()"
+            )
             plan = f"Порахувати суму {value_col} по місяцях для {date_col}."
             return "\n".join(code_lines) + "\n", plan
 
-    if re.search(r"\b(розбий|split)\b.*\b(на)\b", q_low):
+    if re.search(r"\b(rozbiy|split)\b.*\b(на)\b", q_low):
         col = _find_column_in_text(q, columns)
         if col:
             m = re.search(r"на\s+([A-Za-zА-Яа-я0-9_]+)\s+та\s+([A-Za-zА-Яа-я0-9_]+)", q, re.I)
@@ -720,7 +971,9 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if len(cols) >= 2 and m:
             new_col = m.group(1).strip()
             code_lines.append("df = df.copy()")
-            code_lines.append(f"df[{new_col!r}] = df[{cols[0]!r}].astype(str).str.cat(df[{cols[1]!r}].astype(str), sep=' ')")
+            code_lines.append(
+                f"df[{new_col!r}] = df[{cols[0]!r}].astype(str).str.cat(df[{cols[1]!r}].astype(str), sep=' ')"
+            )
             code_lines.append("__commit_df__ = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Склеїти {cols[0]} та {cols[1]} у {new_col}."
@@ -770,16 +1023,19 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
 
     return None
 
+
 def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
     q = (question or "").strip()
     q_low = q.lower()
     if q.startswith("### Task:") and "<user_query>" not in q_low and "user query:" not in q_low:
         return None
     if re.search(r"\b(undo|відміни|скасуй|відкот|поверни)\b", q_low):
-        code = "\n".join([
-            "result = {'status': 'undo'}",
-            "__undo__ = True",
-        ]) + "\n"
+        code = "\n".join(
+            [
+                "result = {'status': 'undo'}",
+                "__undo__ = True",
+            ]
+        ) + "\n"
         return code, "Відкотити останню зміну таблиці."
 
     columns = (profile or {}).get("columns") or []
@@ -842,7 +1098,9 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
                 if num is None:
                     return None
                 code_lines.append("_raw = _col.astype(str)")
-                code_lines.append(r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')")
+                code_lines.append(
+                    r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
                 code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
                 code_lines.append("_num = _clean.where(_mask, np.nan).astype(float)")
                 code_lines.append(f"_value = {num!r}")
@@ -873,6 +1131,7 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
     code_lines.append("result = {'status': 'updated'}")
     return "\n".join(code_lines) + "\n", plan
 
+
 def _choose_column_from_question(question: str, profile: dict) -> Optional[str]:
     cols = (profile or {}).get("columns") or []
     if not cols:
@@ -893,6 +1152,7 @@ def _choose_column_from_question(question: str, profile: dict) -> Optional[str]:
         if dtype.startswith(("int", "float", "uint")):
             return col
     return cols[0]
+
 
 def _stats_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
     q = (question or "").lower()
@@ -925,16 +1185,19 @@ def _stats_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, st
     plan = f"Порахувати {', '.join(plan_parts)} для колонки {col} після приведення значень до числового типу."
     code_lines = []
     code_lines.append(f"_col = df[{col!r}]")
-    code_lines.append("_kind = getattr(_col.dtype, 'kind', '')")
-    code_lines.append("if _kind in ('i', 'u', 'f'):")
+    code_lines.append("_dtype = str(_col.dtype).lower()")
+    code_lines.append("if _dtype.startswith(('int', 'float', 'uint')):")
     code_lines.append("    _num = _col.astype(float)")
     code_lines.append("else:")
     code_lines.append("    _raw = _col.astype(str)")
-    code_lines.append(r"    _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')")
+    code_lines.append(
+        r"    _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+    )
     code_lines.append(r"    _mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
     code_lines.append("    _num = _clean.where(_mask, np.nan).astype(float)")
-    code_lines.append("df['__num_col'] = _num")
-    code_lines.append("print(f\"num_col source=%s dtype=%s nan_count=%d\" % (" + repr(col) + ", str(_num.dtype), int(_num.isna().sum())))")
+    code_lines.append(
+        "print(f\"num_col source=%s dtype=%s nan_count=%d\" % (" + repr(col) + ", str(_num.dtype), int(_num.isna().sum())))"
+    )
     code_lines.append("_min = _num.min()")
     code_lines.append("_max = _num.max()")
     code_lines.append("_mean = _num.mean()")
@@ -956,13 +1219,16 @@ def _stats_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, st
         code_lines.append("result['median'] = None if pd.isna(_median) else float(_median)")
     return "\n".join(code_lines) + "\n", plan
 
+
 def _emit_status(event_emitter: Any, description: str, done: bool = False, hidden: bool = False) -> None:
     if not event_emitter:
         return
     payload = {"type": "status", "data": {"description": description, "done": done, "hidden": hidden}}
     try:
         if hasattr(event_emitter, "emit"):
-            event_emitter.emit("status", {"description": description, "message": description, "done": done, "hidden": hidden})
+            event_emitter.emit(
+                "status", {"description": description, "message": description, "done": done, "hidden": hidden}
+            )
             return
         if callable(event_emitter):
             res = event_emitter(payload)
@@ -976,12 +1242,15 @@ def _emit_status(event_emitter: Any, description: str, done: bool = False, hidde
     except Exception:
         pass
 
+
 _STATUS_MARKER_PREFIX = "[[PIPELINE_STATUS:"
 _STATUS_MARKER_SUFFIX = "]]"
+
 
 def _status_marker(description: str, done: bool = False, hidden: bool = False) -> str:
     payload = {"description": description, "done": done, "hidden": hidden}
     return f"{_STATUS_MARKER_PREFIX}{json.dumps(payload, ensure_ascii=True)}{_STATUS_MARKER_SUFFIX}"
+
 
 def _guess_filename(meta: dict) -> str:
     for key in ("filename", "name", "path"):
@@ -989,6 +1258,7 @@ def _guess_filename(meta: dict) -> str:
         if isinstance(value, str) and value:
             return value
     return ""
+
 
 def _status_message(event: str, payload: Optional[dict]) -> str:
     if event == "start":
@@ -1042,16 +1312,23 @@ def _status_message(event: str, payload: Optional[dict]) -> str:
         return "Сталася помилка."
     return _safe_trunc(f"{event}: {payload}", 200)
 
+
 class Pipeline(object):
     class Valves(BaseModel):
         id: str = Field(default=os.getenv("PIPELINE_ID", "spreadsheet-analyst"))
         name: str = Field(default=os.getenv("PIPELINE_NAME", "Spreadsheet Analyst"))
-        description: str = Field(default=os.getenv("PIPELINE_DESCRIPTION", "Upload CSV/XLSX and ask questions; pandas runs in a sandbox."))
+        description: str = Field(
+            default=os.getenv(
+                "PIPELINE_DESCRIPTION", "Upload CSV/XLSX and ask questions; pandas runs in a sandbox."
+            )
+        )
 
         webui_base_url: str = Field(default=os.getenv("WEBUI_BASE_URL", "http://host.docker.internal:3000"))
         webui_api_key: str = Field(default=os.getenv("WEBUI_API_KEY", ""))
 
-        base_llm_base_url: str = Field(default=os.getenv("BASE_LLM_BASE_URL", "http://gpu-test.silly.billy:8099/v1/models"))
+        base_llm_base_url: str = Field(
+            default=os.getenv("BASE_LLM_BASE_URL", "http://gpu-test.silly.billy:8099/v1")
+        )
         base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", ""))
         base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "glm-4.7-flash"))
 
@@ -1067,14 +1344,57 @@ class Pipeline(object):
         session_cache_ttl_s: int = Field(default=_env_int("PIPELINE_SESSION_CACHE_TTL_S", 1800), ge=60)
         wait_tick_s: int = Field(default=_env_int("PIPELINE_WAIT_TICK_S", 5), ge=0)
 
-    api_version = "v1"
+        shortcut_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        shortcut_catalog_path: str = Field(
+            default=os.getenv("SHORTCUT_CATALOG_PATH", "sandbox_service/catalog.json")
+        )
+        shortcut_index_path: str = Field(
+            default=os.getenv("SHORTCUT_INDEX_PATH", "retrieval_index/index.faiss")
+        )
+        shortcut_meta_path: str = Field(default=os.getenv("SHORTCUT_META_PATH", "retrieval_index/meta.json"))
+        shortcut_top_k: int = Field(default=_env_int("SHORTCUT_TOP_K", 5), ge=1)
+        shortcut_threshold: float = Field(default=float(os.getenv("SHORTCUT_THRESHOLD", "0.35")))
+        shortcut_margin: float = Field(default=float(os.getenv("SHORTCUT_MARGIN", "0.05")))
+
+        vllm_base_url: str = Field(
+            default=os.getenv(
+                "EMB_BASE_URL", os.getenv("VLLM_BASE_URL", "http://gpu-test.silly.billy:8022/v1")
+            )
+        )
+        vllm_embed_model: str = Field(
+            default=os.getenv("EMB_MODEL", os.getenv("VLLM_EMBED_MODEL", "multilingual-embeddings"))
+        )
+        vllm_api_key: str = Field(
+            default=os.getenv("EMB_API_KEY", os.getenv("VLLM_API_KEY", "DUMMY_KEY"))
+        )
+        vllm_timeout_s: int = Field(default=_env_int("VLLM_TIMEOUT_S", 30), ge=1)
+
+    api_version: ClassVar[str] = "v1"
 
     def __init__(self) -> None:
         self.valves = self.Valves()
         logging.basicConfig(level=logging.INFO)
-        self._llm = OpenAI(base_url=self.valves.base_llm_base_url, api_key=self.valves.base_llm_api_key or "DUMMY_KEY")
+        self._llm = OpenAI(
+            base_url=self.valves.base_llm_base_url, api_key=self.valves.base_llm_api_key or "DUMMY_KEY"
+        )
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._prompts = _read_prompts(PROMPTS_PATH)
+        router_cfg = ShortcutRouterConfig(
+            catalog_path=self.valves.shortcut_catalog_path,
+            index_path=self.valves.shortcut_index_path,
+            meta_path=self.valves.shortcut_meta_path,
+            top_k=self.valves.shortcut_top_k,
+            threshold=float(self.valves.shortcut_threshold),
+            margin=float(self.valves.shortcut_margin),
+            vllm_base_url=self.valves.vllm_base_url,
+            vllm_embed_model=self.valves.vllm_embed_model,
+            vllm_api_key=self.valves.vllm_api_key,
+            vllm_timeout_s=self.valves.vllm_timeout_s,
+            enabled=bool(self.valves.shortcut_enabled),
+        )
+        self._shortcut_router = ShortcutRouter(router_cfg, llm_json=self._llm_json)
 
     def pipelines(self) -> List[dict]:
         return [{"id": self.valves.id, "name": self.valves.name, "description": self.valves.description}]
@@ -1091,9 +1411,25 @@ class Pipeline(object):
             headers["Authorization"] = f"Bearer {self.valves.sandbox_api_key}"
         return headers
 
+    def _sandbox_get_profile(self, df_id: str) -> Optional[dict]:
+        url = f"{self.valves.sandbox_url.rstrip('/')}/v1/dataframe/{df_id}/profile"
+        try:
+            resp = requests.get(url, headers=self._sandbox_headers(), timeout=10)
+            if resp.status_code != 200:
+                return None
+            payload = resp.json()
+        except Exception:
+            return None
+        return payload.get("profile") or {}
+
     def _fetch_file_meta(self, file_id: str, file_obj: Optional[dict]) -> dict:
         if isinstance(file_obj, dict):
-            if file_obj.get("filename") or file_obj.get("content_type") or file_obj.get("name") or file_obj.get("path"):
+            if (
+                file_obj.get("filename")
+                or file_obj.get("content_type")
+                or file_obj.get("name")
+                or file_obj.get("path")
+            ):
                 return file_obj
         url = f"{self.valves.webui_base_url.rstrip('/')}/api/v1/files/{file_id}"
         resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
@@ -1137,7 +1473,12 @@ class Pipeline(object):
         return entry
 
     def _session_set(self, key: str, file_id: str, df_id: str, profile: dict) -> None:
-        self._session_cache[key] = {"file_id": file_id, "df_id": df_id, "profile": profile, "ts": time.time()}
+        self._session_cache[key] = {
+            "file_id": file_id,
+            "df_id": df_id,
+            "profile": profile,
+            "ts": time.time(),
+        }
 
     def _apply_dynamic_limits(self, profile: dict) -> None:
         rows = (profile or {}).get("rows")
@@ -1160,13 +1501,131 @@ class Pipeline(object):
             raise ValueError("LLM did not return JSON")
         return json.loads(m.group(0))
 
-    def _plan_code(self, question: str, profile: dict) -> Tuple[str, str]:
+    def _plan_code(self, question: str, profile: dict) -> Tuple[str, str, str]:
         system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
         payload = json.dumps({"question": question, "df_profile": profile}, ensure_ascii=False)
         parsed = self._llm_json(system, payload)
-        return parsed.get("analysis_code", ""), parsed.get("short_plan", "")
+        return parsed.get("analysis_code", ""), parsed.get("short_plan", ""), (parsed.get("op") or "read")
 
-    def _final_answer(self, question: str, profile: dict, plan: str, code: str, run_status: str, stdout: str, result_text: str, result_meta: dict, error: str) -> str:
+    def _llm_pick_column_for_shortcut(self, question: str, profile: dict) -> Optional[str]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return None
+        system = (
+            "Pick the single best column name from the provided list that matches the user's question. "
+            "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\"}."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "df_profile": profile or {},
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return None
+        col = str((parsed or {}).get("column") or "").strip()
+        if not col or col not in columns:
+            return None
+        return col
+
+    def _resolve_shortcut_placeholders(
+        self, analysis_code: str, plan: str, question: str, profile: dict
+    ) -> Tuple[str, str]:
+        if SHORTCUT_COL_PLACEHOLDER not in (analysis_code or "") and SHORTCUT_COL_PLACEHOLDER not in (plan or ""):
+            return analysis_code, plan
+        columns = (profile or {}).get("columns") or []
+        col = _find_column_in_text(question, columns)
+        if not col:
+            col = self._llm_pick_column_for_shortcut(question, profile)
+        if not col:
+            return analysis_code, plan
+        return (analysis_code or "").replace(SHORTCUT_COL_PLACEHOLDER, col), (plan or "").replace(
+            SHORTCUT_COL_PLACEHOLDER, col
+        )
+
+    def _format_top_pairs_from_result(self, result_text: str, top_n: int = 15) -> Optional[str]:
+        text = (result_text or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+
+        lines: List[str] = []
+        if isinstance(data, dict):
+            items = list(data.items())
+            try:
+                items.sort(key=lambda kv: float(kv[1]) if kv[1] is not None else float("-inf"), reverse=True)
+            except Exception:
+                pass
+            for k, v in items[: max(1, top_n)]:
+                lines.append(f"{k}: {v}")
+        elif isinstance(data, list) and data and all(isinstance(x, dict) for x in data):
+            first = data[0]
+            keys = [str(k) for k in first.keys()]
+            count_key = "count" if "count" in keys else None
+            if not count_key:
+                count_key = next((k for k in keys if k.lower() in ("count", "qty", "quantity", "total")), None)
+            if count_key:
+                other_keys = [k for k in keys if k != count_key]
+                label_key = other_keys[0] if other_keys else None
+                rows = data[:]
+                try:
+                    rows.sort(key=lambda r: float(r.get(count_key) or 0), reverse=True)
+                except Exception:
+                    pass
+                for row in rows[: max(1, top_n)]:
+                    label = row.get(label_key) if label_key else row
+                    lines.append(f"{label}: {row.get(count_key)}")
+        if not lines:
+            return None
+        header = "Топ значень:"
+        return header + "\n" + "\n".join(lines)
+
+    def _deterministic_answer(self, question: str, result_text: str, profile: Optional[dict]) -> Optional[str]:
+        q = (question or "").lower()
+        wants_pairs = bool(re.search(r"\b(кожн\w*|each|per|по\s+кожн\w*|для\s+кожн\w*)\b", q))
+        wants_counts = bool(re.search(r"\b(скільк\w*|кільк\w*|count|к-?ст[ьі])\b", q))
+        is_grouping = bool(
+            re.search(
+                r"\b(бренд\w*|категорі\w*|brand|category|"
+                r"груп\w*|розбив\w*|розподіл\w*|структур\w*|"
+                r"by|group\w*|breakdown|distribution|segment\w*|"
+                r"по\s+\w+|за\s+\w+)\b",
+                q,
+            )
+        )
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        matched_col = _find_column_in_text(question, columns)
+        if not matched_col and columns and (wants_counts or wants_pairs):
+            matched_col = self._llm_pick_column_for_shortcut(question, profile or {})
+        if matched_col:
+            is_grouping = True
+        if is_grouping and (wants_counts or wants_pairs):
+            return self._format_top_pairs_from_result(result_text, top_n=100)
+        if not (wants_pairs and wants_counts):
+            return None
+        return self._format_top_pairs_from_result(result_text, top_n=15)
+
+    def _final_answer(
+        self,
+        question: str,
+        profile: dict,
+        plan: str,
+        code: str,
+        run_status: str,
+        stdout: str,
+        result_text: str,
+        result_meta: dict,
+        error: str,
+    ) -> str:
+        deterministic = self._deterministic_answer(question, result_text, profile)
+        if deterministic:
+            logging.info("event=final_answer mode=deterministic preview=%s", _safe_trunc(deterministic, 300))
+            return deterministic
         system = self._prompts.get("final_answer_system", DEFAULT_FINAL_ANSWER_SYSTEM)
         payload = {
             "question": question,
@@ -1181,12 +1640,32 @@ class Pipeline(object):
         }
         resp = self._llm.chat.completions.create(
             model=self.valves.base_llm_model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
             temperature=0.2,
         )
-        return (resp.choices[0].message.content or "").strip()
+        answer = (resp.choices[0].message.content or "").strip()
+        if result_text and re.search(r"\d+", result_text or ""):
+            real_numbers = set(re.findall(r"\d+", result_text))
+            llm_numbers = set(re.findall(r"\d+", answer))
+            if llm_numbers and not (llm_numbers & real_numbers):
+                logging.warning(
+                    "event=final_answer mode=llm_hallucinated real=%s llm=%s", real_numbers, llm_numbers
+                )
+                fallback = self._format_top_pairs_from_result(result_text, top_n=100)
+                if fallback:
+                    return fallback
+                if result_text:
+                    return result_text
+                return "Не можу безпечно сформувати відповідь: числа у відповіді не збігаються з результатом."
+        logging.info("event=final_answer mode=llm preview=%s", _safe_trunc(answer, 300))
+        return answer
 
-    def _emit(self, event_emitter: Any, event: str, payload: Dict[str, Any], status_queue: Optional[List[str]] = None) -> None:
+    def _emit(
+        self, event_emitter: Any, event: str, payload: Dict[str, Any], status_queue: Optional[List[str]] = None
+    ) -> None:
         description = _status_message(event, payload)
         done = event in ("final_answer", "error")
         if status_queue is not None:
@@ -1199,11 +1678,13 @@ class Pipeline(object):
         if not event_emitter or interval_s <= 0:
             return None
         stop_event = threading.Event()
+
         def _ticker() -> None:
             elapsed = 0
             while not stop_event.wait(interval_s):
                 elapsed += interval_s
                 self._emit(event_emitter, "wait", {"label": label, "seconds": elapsed})
+
         thread = threading.Thread(target=_ticker, daemon=True)
         thread.start()
         return stop_event
@@ -1255,18 +1736,27 @@ class Pipeline(object):
         resp.raise_for_status()
         return resp.json()
 
-    def pipe(self, user_message: str, model_id: str, messages: List[dict], body: dict, __event_emitter__: Any = None) -> Union[str, Iterator, Generator]:
+    def pipe(
+        self,
+        user_message: str,
+        model_id: str,
+        messages: List[dict],
+        body: dict,
+        __event_emitter__: Any = None,
+    ) -> Union[str, Iterator, Generator]:
         event_emitter = __event_emitter__ or (body or {}).get("event_emitter") or (body or {}).get("__event_emitter__")
         stream_requested = bool((body or {}).get("stream"))
         if stream_requested and not event_emitter:
             return self._pipe_stream(user_message, model_id, messages, body)
         return self._pipe_sync(user_message, model_id, messages, body, event_emitter)
 
-    def _pipe_sync(self, user_message: str, model_id: str, messages: List[dict], body: dict, event_emitter: Any) -> str:
+    def _pipe_sync(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict, event_emitter: Any
+    ) -> str:
         try:
             self._emit(event_emitter, "start", {"model_id": model_id, "has_messages": bool(messages)})
 
-            question = _last_user_message(messages) or (user_message or "")
+            question = (user_message or "").strip() or _last_user_message(messages)
             session_key = _session_key(body)
             session = self._session_get(session_key)
 
@@ -1283,7 +1773,14 @@ class Pipeline(object):
 
             if session and session.get("file_id") == file_id and session.get("df_id"):
                 df_id = session["df_id"]
-                profile = session.get("profile") or {}
+                cached_profile = session.get("profile") or {}
+                fresh_profile = self._sandbox_get_profile(df_id)
+                if fresh_profile:
+                    profile = fresh_profile
+                    if fresh_profile != cached_profile:
+                        self._session_set(session_key, file_id, df_id, fresh_profile)
+                else:
+                    profile = cached_profile
             else:
                 self._emit(event_emitter, "fetch_meta", {"file_id": file_id})
                 meta = self._fetch_file_meta(file_id, file_obj)
@@ -1299,25 +1796,64 @@ class Pipeline(object):
                 self._apply_dynamic_limits(profile)
                 self._session_set(session_key, file_id, df_id, profile)
 
-            shortcut = _template_shortcut_code(question, profile)
-            if not shortcut:
-                shortcut = _edit_shortcut_code(question, profile)
-            if not shortcut:
-                shortcut = _stats_shortcut_code(question, profile)
+            router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
+            shortcut = None
+            router_meta: Dict[str, Any] = {}
+            if router_hit:
+                analysis_code, router_meta = router_hit
+                plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+                logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
+            else:
+                logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
+                shortcut = _template_shortcut_code(question, profile)
+                if not shortcut:
+                    shortcut = _edit_shortcut_code(question, profile)
+                if not shortcut:
+                    shortcut = _stats_shortcut_code(question, profile)
+
             self._emit(event_emitter, "codegen", {"question": _safe_trunc(question, 200)})
-            if shortcut:
+            if router_hit:
+                logging.info("event=shortcut status=ok meta=%s", _safe_trunc(router_meta, 800))
+                self._emit(
+                    event_emitter,
+                    "codegen_shortcut",
+                    {"question": _safe_trunc(question, 200), "intent_id": router_meta.get("intent_id")},
+                )
+            elif shortcut:
                 self._emit(event_emitter, "codegen_shortcut", {"question": _safe_trunc(question, 200)})
                 analysis_code, plan = shortcut
             else:
                 wait = self._start_wait(event_emitter, "codegen")
                 try:
-                    analysis_code, plan = self._plan_code(question, profile)
+                    analysis_code, plan, op = self._plan_code(question, profile)
                 finally:
                     self._stop_wait(wait)
                 if not (analysis_code or "").strip():
                     self._emit(event_emitter, "codegen_empty", {})
                     return "I could not generate analysis code for this question. Try rephrasing."
+                is_explicit_edit = bool(
+                    re.search(
+                        r"(^|\n)\s*df\s*=|df\[.+\]\s*=|df\.(loc|iloc|at|iat)\[.+\]\s*=|inplace=True",
+                        analysis_code or "",
+                    )
+                )
+                current_op = (op or "").strip().lower()
+                if current_op == "read" and not is_explicit_edit:
+                    analysis_code = "df = df.copy(deep=False)\n" + analysis_code
+                else:
+                    if "__commit_df__" not in (analysis_code or ""):
+                        analysis_code = analysis_code.rstrip() + "\n__commit_df__ = True\n"
+                analysis_code, count_err = _enforce_count_code(question, analysis_code)
+                if count_err:
+                    return f"Неможливо виконати запит: {count_err}"
+                edit_expected = current_op != "read" or is_explicit_edit or "__commit_df__" in (analysis_code or "")
+                if edit_expected:
+                    analysis_code, edit_err = _validate_edit_code(analysis_code)
+                    if edit_err:
+                        return f"Неможливо виконати edit: {edit_err}"
 
+            analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
+            analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
             if "df_profile" in (analysis_code or ""):
                 analysis_code = f"df_profile = {profile!r}\n" + analysis_code
 
@@ -1332,8 +1868,13 @@ class Pipeline(object):
                 self._emit(event_emitter, "final_answer", {"status": run_status})
                 error = run_resp.get("error", "") or "Sandbox execution failed."
                 return f"Не вдалося виконати аналіз у sandbox (статус: {run_status}). {error}"
-            if run_resp.get("profile"):
-                self._session_set(session_key, file_id, df_id, run_resp.get("profile") or {})
+            if ("__commit_df__" in (analysis_code or "")) and not run_resp.get("committed"):
+                self._emit(event_emitter, "final_answer", {"status": "commit_failed"})
+                return "Edit не було закомічено в sandbox. Повторіть запит із явним __commit_df__ = True та присвоєнням у df."
+            new_profile = run_resp.get("profile") or {}
+            if new_profile:
+                profile = new_profile
+                self._session_set(session_key, file_id, df_id, profile)
             self._emit(event_emitter, "final_answer", {"status": run_status})
             wait = self._start_wait(event_emitter, "final_answer")
             try:
@@ -1358,7 +1899,9 @@ class Pipeline(object):
                 pass
             return f"Pipeline error: {type(exc).__name__}: {exc}\n\n{tb}"
 
-    def _pipe_stream(self, user_message: str, model_id: str, messages: List[dict], body: dict) -> Generator[str, None, None]:
+    def _pipe_stream(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Generator[str, None, None]:
         status_queue: List[str] = []
 
         def emit(event: str, payload: Dict[str, Any]) -> None:
@@ -1372,7 +1915,7 @@ class Pipeline(object):
             emit("start", {"model_id": model_id, "has_messages": bool(messages)})
             yield from drain()
 
-            question = _last_user_message(messages) or (user_message or "")
+            question = (user_message or "").strip() or _last_user_message(messages)
             session_key = _session_key(body)
             session = self._session_get(session_key)
 
@@ -1413,25 +1956,70 @@ class Pipeline(object):
                 self._apply_dynamic_limits(profile)
                 self._session_set(session_key, file_id, df_id, profile)
 
-            shortcut = _template_shortcut_code(question, profile)
-            if not shortcut:
-                shortcut = _edit_shortcut_code(question, profile)
-            if not shortcut:
-                shortcut = _stats_shortcut_code(question, profile)
+            router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
+            shortcut = None
+            router_meta: Dict[str, Any] = {}
+            if router_hit:
+                analysis_code, router_meta = router_hit
+                plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+                logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
+            else:
+                logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
+                shortcut = _template_shortcut_code(question, profile)
+                if not shortcut:
+                    shortcut = _edit_shortcut_code(question, profile)
+                if not shortcut:
+                    shortcut = _stats_shortcut_code(question, profile)
+
             emit("codegen", {"question": _safe_trunc(question, 200)})
             yield from drain()
-            if shortcut:
+            if router_hit:
+                logging.info("event=shortcut status=ok meta=%s", _safe_trunc(router_meta, 800))
+                emit(
+                    "codegen_shortcut",
+                    {"question": _safe_trunc(question, 200), "intent_id": router_meta.get("intent_id")},
+                )
+                yield from drain()
+            elif shortcut:
                 emit("codegen_shortcut", {"question": _safe_trunc(question, 200)})
                 yield from drain()
                 analysis_code, plan = shortcut
             else:
-                analysis_code, plan = self._plan_code(question, profile)
+                analysis_code, plan, op = self._plan_code(question, profile)
                 if not (analysis_code or "").strip():
                     emit("codegen_empty", {})
                     yield from drain()
                     yield "I could not generate analysis code for this question. Try rephrasing."
                     return
+                is_explicit_edit = bool(
+                    re.search(
+                        r"(^|\n)\s*df\s*=|df\[.+\]\s*=|df\.(loc|iloc|at|iat)\[.+\]\s*=|inplace=True",
+                        analysis_code or "",
+                    )
+                )
+                current_op = (op or "").strip().lower()
+                if current_op == "read" and not is_explicit_edit:
+                    analysis_code = "df = df.copy(deep=False)\n" + analysis_code
+                else:
+                    if "__commit_df__" not in (analysis_code or ""):
+                        analysis_code = analysis_code.rstrip() + "\n__commit_df__ = True\n"
+                analysis_code, count_err = _enforce_count_code(question, analysis_code)
+                if count_err:
+                    emit("final_answer", {"status": "invalid_code"})
+                    yield from drain()
+                    yield f"Неможливо виконати запит: {count_err}"
+                    return
+                edit_expected = current_op != "read" or is_explicit_edit or "__commit_df__" in (analysis_code or "")
+                if edit_expected:
+                    analysis_code, edit_err = _validate_edit_code(analysis_code)
+                    if edit_err:
+                        emit("final_answer", {"status": "invalid_edit"})
+                        yield from drain()
+                        yield f"Неможливо виконати edit: {edit_err}"
+                        return
 
+            analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
+            analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
             if "df_profile" in (analysis_code or ""):
                 analysis_code = f"df_profile = {profile!r}\n" + analysis_code
 
@@ -1445,8 +2033,15 @@ class Pipeline(object):
                 error = run_resp.get("error", "") or "Sandbox execution failed."
                 yield f"Не вдалося виконати аналіз у sandbox (статус: {run_status}). {error}"
                 return
-            if run_resp.get("profile"):
-                self._session_set(session_key, file_id, df_id, run_resp.get("profile") or {})
+            if ("__commit_df__" in (analysis_code or "")) and not run_resp.get("committed"):
+                emit("final_answer", {"status": "commit_failed"})
+                yield from drain()
+                yield "Edit не було закомічено в sandbox. Повторіть запит із явним __commit_df__ = True та присвоєнням у df."
+                return
+            new_profile = run_resp.get("profile") or {}
+            if new_profile:
+                profile = new_profile
+                self._session_set(session_key, file_id, df_id, profile)
             emit("final_answer", {"status": run_status})
             yield from drain()
             yield self._final_answer(
@@ -1465,5 +2060,6 @@ class Pipeline(object):
             emit("error", {"error": str(exc)})
             yield from drain()
             yield f"Pipeline error: {type(exc).__name__}: {exc}\n\n{tb}"
+
 
 pipeline = Pipeline()

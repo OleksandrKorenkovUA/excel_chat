@@ -1,0 +1,17 @@
+git remote add origin https://github.com/OleksandrKorenkovUA/excel_chat.git
+
+git status
+git add .
+git commit -m "Тут ваш коментар про те, що було зроблено"
+git push origin main
+
+
+#Docker 
+
+docker compose restart pipelines 
+docker logs -f openwebui-pipelines
+
+docker compose down --volumes --remove-orphans
+docker compose pull  
+docker compose build --no-cache 
+docker compose up -d --force-recreate      
