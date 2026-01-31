@@ -1,0 +1,72 @@
+Маршрут запиту
+
+Pipe (OpenWebUI → Pipelines)
+pipe.py
+
+Забирає останній текст користувача.
+Забирає файл(и) з WebUI і пакує в base64.
+Відправляє JSON у /v1/chat/completions сервісу pipelines зі stream=true.
+Логує статуси (start, file_fetch, stream, response).
+Pipeline стартує обробку
+spreadsheet_analyst_pipeline.py
+
+_pipe_sync / _pipe_stream беруть question, піднімають сесію, знаходять файл.
+Якщо файл вже завантажений у sandbox — бере df_id з кешу; інакше вантажить заново.
+Завантаження даних у sandbox
+spreadsheet_analyst_pipeline.py → _sandbox_load
+
+Відправляє CSV/XLSX у sandbox (/v1/dataframe/load).
+Отримує df_id і profile.
+Кешує df_id в сесію.
+Спроба retrieval (FAISS ShortcutRouter)
+shortcut_router.py
+
+Ембедить запит через /embeddings.
+Шукає найближчий intent у FAISS‑індексі.
+Якщо скоринг проходить threshold/margin → заповнює slots → компілює plan у pandas‑код.
+Якщо не пройшло або індекс відсутній → miss і йде далі.
+Шорткати (rule‑based)
+spreadsheet_analyst_pipeline.py
+
+Якщо ретривінгу не було: пробує _template_shortcut_code, _edit_shortcut_code, _stats_shortcut_code.
+Якщо нічого не підійшло — переходить до LLM‑планера.
+LLM‑планер (codegen)
+spreadsheet_analyst_pipeline.py → _plan_code
+
+Формує JSON з question + df_profile.
+LLM повертає {analysis_code, short_plan, op}.
+Далі валідація:
+нормалізація відступів;
+виправлення COMMIT_DF (знімається, якщо код не змінює df);
+якщо op == edit, то валідація/repair; якщо не проходить — деградація в read.
+Нормалізація коду перед sandbox
+spreadsheet_analyst_pipeline.py
+
+_normalize_generated_code (виправлення "unexpected indent").
+Якщо код використовує df_profile — додає префікс df_profile = {...}.
+Лог analysis_code preview=....
+Виконання у sandbox
+main.py
+
+_ast_guard блокує небезпечні вузли.
+exec(code, env, env) в одному env.
+Зчитує result, COMMIT_DF, UNDO, df.
+Якщо COMMIT_DF=True, оновлює df в store + history.
+Повернення результатів у pipeline
+spreadsheet_analyst_pipeline.py
+
+Перевіряє статус, commit_failed тільки якщо очікували edit.
+Оновлює профайл і кеш.
+Якщо потрібно — final_answer LLM.
+Якщо є явні структури — може віддати детерміновану відповідь.
+Повернення відповіді в UI
+pipe.py
+
+Стрімить/віддає фінальну відповідь користувачу.
+Рендерить статуси.
+Ключові лог‑події (для трасування)
+
+event=shortcut_router_* — FAISS/ретривінг і slots
+event=llm_json_request/response — LLM планер
+event=analysis_code — фактичний код перед sandbox
+event=llm_final_request/response — фінальна відповідь

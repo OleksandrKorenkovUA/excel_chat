@@ -37,7 +37,7 @@ def _embedding_config(catalog: Dict[str, Any]) -> Tuple[str, str, int, str]:
         os.getenv("EMB_BASE_URL")
         or os.getenv("VLLM_BASE_URL")
         or emb.get("base_url")
-        or "http://gpu-test.silly.billy:8022/v1"
+        or "http://alph-gpu.silly.billy:8022/v1"
     ).rstrip("/")
     model = os.getenv("EMB_MODEL") or os.getenv("VLLM_EMBED_MODEL") or emb.get("model") or "multilingual-embeddings"
     timeout_s = int(os.getenv("VLLM_TIMEOUT_S") or emb.get("timeout_s") or 30)

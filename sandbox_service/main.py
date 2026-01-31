@@ -239,6 +239,15 @@ def _render_result(result: Any, preview_rows: int, max_cell_chars: int, max_resu
     if isinstance(result, pd.Series):
         text = result.head(preview_rows).to_string()
         return _safe_trunc(text, max_result_chars)
+    if isinstance(result, (np.ndarray, pd.Index, pd.api.extensions.ExtensionArray)):
+        try:
+            data = result.tolist() if hasattr(result, "tolist") else list(result)
+            if isinstance(data, list) and len(data) > preview_rows:
+                data = data[:preview_rows]
+            text = json.dumps(data, ensure_ascii=False, default=str)
+            return _safe_trunc(text, max_result_chars)
+        except Exception:
+            return _safe_trunc(str(result), max_result_chars)
     if isinstance(result, (dict, list, tuple)):
         text = json.dumps(result, ensure_ascii=False, default=str)
         return _safe_trunc(text, max_result_chars)
@@ -279,13 +288,12 @@ def _run_code(
             "zip": zip,
             "print": print,
         }
-        globals_dict = {
+        env: Dict[str, Any] = {
             "df": df,
             "pd": pd,
             "np": np,
             "__builtins__": safe_builtins,
         }
-        locals_dict: Dict[str, Any] = {}
         try:
             if MAX_MEMORY_MB > 0:
                 mem_bytes = MAX_MEMORY_MB * 1024 * 1024
@@ -300,15 +308,15 @@ def _run_code(
                 except Exception:
                     pass
             with contextlib.redirect_stdout(stdout):
-                exec(compile(code, "<analysis>", "exec"), globals_dict, locals_dict)
-            result = locals_dict.get("result", globals_dict.get("result"))
+                exec(compile(code, "<analysis>", "exec"), env, env)
+            result = env.get("result")
             result_text = _render_result(result, preview_rows, max_cell_chars, max_result_chars)
             result_meta = _result_meta(result)
-            commit_flag = bool(locals_dict.get("__commit_df__") or globals_dict.get("__commit_df__"))
-            undo_flag = bool(locals_dict.get("__undo__") or globals_dict.get("__undo__"))
+            commit_flag = bool(env.get("COMMIT_DF"))
+            undo_flag = bool(env.get("UNDO"))
             df_out = None
             if commit_flag:
-                df_out = locals_dict.get("df", globals_dict.get("df"))
+                df_out = env.get("df")
             queue.put(("ok", stdout.getvalue(), result_text, result_meta, "", df_out, commit_flag, undo_flag))
         except Exception as exc:
             queue.put(("err", stdout.getvalue(), "", {}, f"{type(exc).__name__}: {exc}", None, False, False))
@@ -459,4 +467,3 @@ def run_code(req: RunRequest, request: Request) -> dict:
         "error": err,
         "profile": entry.get("profile"),
     }
-

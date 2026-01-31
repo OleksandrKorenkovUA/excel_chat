@@ -22,8 +22,8 @@ services:
       - "8081:8081"
     env_file:
       - ./config/user_params.env
+      - ./.env
     environment:
-      SANDBOX_API_KEY: ""
       DF_CACHE_TTL_S: "1800"
       MAX_DF_CACHE_ITEMS: "32"
       MAX_MEMORY_MB: "0"
@@ -44,19 +44,19 @@ services:
       - "9099:9099"
     env_file:
       - ./config/user_params.env
+      - ./.env
     environment:
       WEBUI_INTERNAL_BASE_URL: "http://localhost:8080"
       PIPELINES_BASE_URL: "http://pipelines:9099/v1"
       PIPELINES_MODEL: "spreadsheet_analyst_pipeline"
       WEBUI_BASE_URL: "http://openwebui:8080"
-      WEBUI_API_KEY: "sk-SZ55NqwNUcnJWq5PwmUCVvbXibCIigG2RL1yy81fPIAK9xWYSMaaocELVdk05ycM"
-      BASE_LLM_BASE_URL: "http://192.168.200.129:8031/v1"
-      BASE_LLM_API_KEY: "DUMMY_KEY"
+      BASE_LLM_BASE_URL: "http://alph-gpu.silly.billy:8031/v1"
       BASE_LLM_MODEL: "chat-model"
       SANDBOX_URL: "http://sandbox:8081"
-      SANDBOX_API_KEY: ""
+      PIPELINES_REQUIREMENTS_PATH: "/app/requirements.txt"
     volumes:
       - ./pipelines:/app/pipelines
+      - ./pipelines/pipeline-requirements.txt:/app/requirements.txt:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     depends_on:

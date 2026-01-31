@@ -904,7 +904,7 @@
     }
   ],
   "embedding": {
-    "base_url": "http://gpu-test.silly.billy:8022/v1",
+    "base_url": "http://alph-gpu.silly.billy:8022/v1",
     "model": "multilingual-embeddings"
   }
 }

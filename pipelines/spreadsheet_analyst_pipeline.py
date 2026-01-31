@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import base64
 import inspect
@@ -26,13 +27,16 @@ PROMPTS_PATH = _LOCAL_PROMPTS if os.path.exists(_LOCAL_PROMPTS) else os.path.joi
 
 DEFAULT_PLAN_CODE_SYSTEM = (
     "You write pandas code to answer questions about a DataFrame named df. "
-    "Return ONLY valid JSON with keys: analysis_code, short_plan, op. "
+    "Return ONLY valid JSON with keys: analysis_code, short_plan, op, commit_df. "
     "op must be 'edit' if the user asks to modify data (delete, add, rename, update values), otherwise 'read'. "
+    "commit_df must be true only when the DataFrame is actually modified, otherwise false. "
     "CRITICAL RULE FOR COUNTS: If user asks for 'count products', 'how many items', or 'quantity of brands' -> YOU MUST USE len(df) or .size(). "
     "NEVER calculate sum() of a column named 'Quantity', 'Amount' or 'Кількість' unless the user EXPLICITLY asks for 'total sum' or 'total volume'. "
     "Example: 'Count products by brand' -> df.groupby('Brand').size(). "
     "If op == 'edit', your code MUST assign the updated DataFrame back to variable df (e.g. df = df.drop(...)) "
-    "and MUST set __commit_df__ = True. "
+    "and MUST set COMMIT_DF = True (or set df_changed = True). "
+    "If op == 'read', DO NOT set COMMIT_DF. "
+    "Only set COMMIT_DF = True when df is actually modified (df assignment, df.loc/at assignment, inplace=True, or df_changed = True). "
     "If op == 'read', your code MUST NOT modify df (no column creation, no inplace ops). "
     "Compute structural facts (rows/cols/columns) from df, not from df_profile. "
     "analysis_code must be pure Python statements, no imports, no file or network access, no plotting. "
@@ -42,10 +46,19 @@ DEFAULT_PLAN_CODE_SYSTEM = (
 DEFAULT_FINAL_ANSWER_SYSTEM = (
     "You are a data analysis assistant. Answer in Ukrainian. "
     "CRITICAL: Use ONLY the data from result_text field. NEVER generate or invent numbers. "
+    "If you mention any numbers, they must appear in result_text. "
+    "Do not mention model numbers or SKUs unless they appear in result_text. "
     "If result_text contains the answer, format it clearly. "
     "If result_text is empty or has an error, explain what to change. "
     "If a keyword for grouping is not explicitly mentioned, first try to infer the grouping column from df_profile column names. "
     "DO NOT use data from df_profile to answer questions about counts or aggregations."
+)
+
+DEFAULT_FINAL_REWRITE_SYSTEM = (
+    "You rewrite a validated result into a concise, human-friendly Ukrainian answer. "
+    "Use ONLY result_text to determine facts. "
+    "Do not add any numbers or details not present in result_text. "
+    "If result_text is empty or unclear, say that the result is unclear and ask the user to уточнити запит."
 )
 
 SHORTCUT_COL_PLACEHOLDER = "__SHORTCUT_COL__"
@@ -122,9 +135,7 @@ def _last_user_message(messages: List[dict]) -> str:
             continue
         if _is_meta_task_text(s):
             extracted = _extract_user_query_from_meta(s)
-            if extracted:
-                return extracted
-            continue
+            return extracted
         return s
     return ""
 
@@ -177,6 +188,60 @@ def _safe_trunc(text: str, limit: int) -> str:
         return text
     return text[:limit] + "...(truncated)"
 
+
+def _fix_unexpected_indents(code: str) -> str:
+    lines = code.splitlines()
+    fixed: List[str] = []
+    prev_stmt: Optional[str] = None
+    open_parens = 0
+    for line in lines:
+        stripped = line.lstrip()
+        if not stripped:
+            fixed.append("")
+            continue
+        if open_parens == 0 and (prev_stmt is None or not prev_stmt.endswith(":")) and line[:1].isspace():
+            line = stripped
+        fixed.append(line)
+        open_parens += (
+            line.count("(")
+            + line.count("[")
+            + line.count("{")
+            - line.count(")")
+            - line.count("]")
+            - line.count("}")
+        )
+        prev_stmt = stripped
+    return "\n".join(fixed) + ("\n" if code.endswith("\n") else "")
+
+
+def _normalize_generated_code(code: str) -> str:
+    try:
+        ast.parse(code)
+        return code
+    except IndentationError as exc:
+        if "unexpected indent" not in str(exc):
+            return code
+        fixed = _fix_unexpected_indents(code)
+        try:
+            ast.parse(fixed)
+        except Exception:
+            return code
+        logging.warning("event=code_indent_fix applied")
+        return fixed
+    except SyntaxError:
+        return code
+
+
+def _strip_commit_flag(code: str) -> str:
+    if not code:
+        return code
+    lines = []
+    for line in code.splitlines():
+        if re.match(r"^\s*COMMIT_DF\s*=\s*True\s*$", line):
+            continue
+        lines.append(line)
+    return "\n".join(lines) + ("\n" if code.endswith("\n") else "")
+
 _EDIT_METHODS_RETURN_DF = (
     "drop",
     "rename",
@@ -211,6 +276,60 @@ def _has_df_assignment(code: str) -> bool:
 def _has_inplace_op(code: str) -> bool:
     return bool(re.search(r"inplace\s*=\s*True", code or ""))
 
+def _has_df_changed_flag(code: str) -> bool:
+    return bool(re.search(r"(^|\n)\s*df_changed\s*=\s*True\s*$", code or "", re.M))
+
+def _infer_op_from_question(question: str) -> str:
+    q = (question or "").lower()
+    if re.search(
+        r"\b(видал|додай|додати|встав|переймен|очист|заміни|замін|update|set|rename|delete|drop|insert|add|clear|fill|sort|фільтр|відфільтр|сортуй|переміст)\b",
+        q,
+    ):
+        return "edit"
+    return "read"
+
+def _should_commit_from_code(code: str) -> bool:
+    return _has_df_assignment(code) or _has_inplace_op(code) or _has_df_changed_flag(code)
+
+def _finalize_code_for_sandbox(
+    question: str, analysis_code: str, op: Optional[str] = None, commit_df: Optional[bool] = None
+) -> Tuple[str, bool]:
+    code = _normalize_generated_code(analysis_code or "")
+    op_norm = (op or "").strip().lower()
+    if op_norm not in ("read", "edit"):
+        op_norm = _infer_op_from_question(question)
+
+    if op_norm == "edit":
+        code, edit_err = _validate_edit_code(code)
+        if edit_err:
+            logging.warning("event=edit_degraded reason=%s", edit_err)
+            op_norm = "read"
+
+    has_change = _should_commit_from_code(code)
+    if commit_df is None:
+        commit_requested = op_norm == "edit"
+    else:
+        commit_requested = bool(commit_df)
+
+    if op_norm == "read":
+        commit_requested = False
+
+    if commit_requested and not has_change:
+        logging.info("event=commit_stripped reason=no_df_change")
+        commit_requested = False
+        op_norm = "read"
+
+    if commit_requested and "COMMIT_DF" not in code:
+        code = code.rstrip() + "\nCOMMIT_DF = True\n"
+    if not commit_requested:
+        code = _strip_commit_flag(code)
+
+    if op_norm == "read":
+        if not re.match(r"^\s*df\s*=\s*df\.copy", code):
+            code = "df = df.copy(deep=False)\n" + code
+
+    return code, commit_requested
+
 def _repair_edit_code(code: str) -> str:
     lines = (code or "").splitlines()
     out: List[str] = []
@@ -242,8 +361,32 @@ def _enforce_count_code(question: str, code: str) -> Tuple[str, Optional[str]]:
     if not _is_count_intent(question) or _is_sum_intent(question):
         return code, None
     if re.search(r"\.sum\s*\(\s*\)", code or ""):
-        code = re.sub(r"\.sum\s*\(\s*\)", ".size()", code)
-    if re.search(r"\.sum\s*\(", code or ""):
+        lines: List[str] = []
+        for line in (code or "").splitlines():
+            if not re.search(r"\.sum\s*\(\s*\)", line):
+                lines.append(line)
+                continue
+            # Preserve boolean null checks; sum() is the correct way to count True values.
+            if re.search(r"\.(isnull|isna|notnull|notna)\(\)\.sum\s*\(\s*\)", line):
+                lines.append(line)
+                continue
+            # Prefer GroupBy.size() when grouping; otherwise use the .size property.
+            if re.search(r"\.groupby\s*\(", line):
+                line = re.sub(r"\.sum\s*\(\s*\)", ".size()", line)
+            else:
+                line = re.sub(r"\.sum\s*\(\s*\)", ".size", line)
+            lines.append(line)
+        code = "\n".join(lines)
+        # Fix any accidental size() on boolean null checks that slipped through.
+        code = re.sub(r"\.isnull\(\)\.size\s*\(\s*\)", ".isnull().sum()", code)
+        code = re.sub(r"\.isna\(\)\.size\s*\(\s*\)", ".isna().sum()", code)
+        code = re.sub(r"\.notnull\(\)\.size\s*\(\s*\)", ".notnull().sum()", code)
+        code = re.sub(r"\.notna\(\)\.size\s*\(\s*\)", ".notna().sum()", code)
+        code = re.sub(r"\.isnull\(\)\.size\b", ".isnull().sum()", code)
+        code = re.sub(r"\.isna\(\)\.size\b", ".isna().sum()", code)
+        code = re.sub(r"\.notnull\(\)\.size\b", ".notnull().sum()", code)
+        code = re.sub(r"\.notna\(\)\.size\b", ".notna().sum()", code)
+    if re.search(r"(?<!\.isnull\(\))(?<!\.isna\(\))(?<!\.notnull\(\))(?<!\.notna\(\))\.sum\s*\(", code or ""):
         return code, "Count intent detected but code uses sum()."
     return code, None
 
@@ -520,7 +663,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append("df = df.copy()")
             code_lines.append("df = df.reset_index(drop=True)")
             code_lines.append(f"df.at[{row_idx - 1}, {col!r}] = pd.NA")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Очистити клітинку в рядку {row_idx}, колонці {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -537,7 +680,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 c1 = columns.index(cols[-1])
                 code_lines.append("df = df.copy()")
                 code_lines.append(f"df.iloc[{r0 - 1}:{r1}, {c0}:{c1 + 1}] = {_parse_literal(value)!r}")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = "Замінити значення в заданому діапазоні."
                 return "\n".join(code_lines) + "\n", plan
@@ -557,7 +700,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             if op in ("x", "×"):
                 op = "*"
             code_lines.append(f"df[{new_col!r}] = df[{a!r}] {op} df[{b!r}]")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Додати колонку {new_col} як обчислення з {a} та {b}."
             return "\n".join(code_lines) + "\n", plan
@@ -574,7 +717,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append("df = df.copy()")
             code_lines.append(f"_loc = list(df.columns).index({after_col!r}) + 1")
             code_lines.append(f"df.insert(_loc, {new_col!r}, pd.NA)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Вставити колонку {new_col} після {after_col}."
             return "\n".join(code_lines) + "\n", plan
@@ -585,7 +728,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             new_col = m.group(1).strip()
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{new_col!r}] = pd.NA")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Додати порожню колонку {new_col}."
             return "\n".join(code_lines) + "\n", plan
@@ -597,7 +740,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append("cols = list(df.columns)")
             code_lines.append(f"cols.insert(0, cols.pop(cols.index({col!r})))")
             code_lines.append("df = df[cols]")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перемістити колонку {col} на початок."
             return "\n".join(code_lines) + "\n", plan
@@ -609,7 +752,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if old and new:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df = df.rename(columns={{ {old!r}: {new!r} }})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перейменувати колонку {old} на {new}."
             return "\n".join(code_lines) + "\n", plan
@@ -617,7 +760,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
     if re.search(r"\b(нижн.*регістр|lower case)\b", q_low):
         code_lines.append("df = df.copy()")
         code_lines.append("df = df.rename(columns=lambda x: str(x).lower())")
-        code_lines.append("__commit_df__ = True")
+        code_lines.append("COMMIT_DF = True")
         code_lines.append("result = {'status': 'updated'}")
         plan = "Перейменувати колонки у нижній регістр."
         return "\n".join(code_lines) + "\n", plan
@@ -631,7 +774,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append("bot = df.iloc[_pos:]")
             code_lines.append("new_df = pd.DataFrame([{}])")
             code_lines.append("df = pd.concat([top, new_df, bot], ignore_index=True)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Вставити порожній рядок на позицію {pos}."
             return "\n".join(code_lines) + "\n", plan
@@ -644,7 +787,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append("df = df.copy()")
             code_lines.append("df = df.reset_index(drop=True)")
             code_lines.append(f"df = df.drop(index={idxs!r})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Видалити рядки з позиціями: {', '.join(str(n) for n in nums)}."
             return "\n".join(code_lines) + "\n", plan
@@ -671,7 +814,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             else:
                 code_lines.append(f"_cond = _col.astype(str).str.contains({value!r}, case=False, na=False)")
             code_lines.append("df = df.loc[~_cond].copy()")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Видалити рядки за умовою по {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -685,7 +828,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if cols:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df = df.drop(columns={cols!r})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Видалити колонки: {', '.join(cols)}."
             return "\n".join(code_lines) + "\n", plan
@@ -700,13 +843,13 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                     ascending[-1] = False
                 code_lines.append("df = df.copy()")
                 code_lines.append(f"df = df.sort_values(by={cols!r}, ascending={ascending!r})")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = f"Відсортувати за {', '.join(cols)}."
                 return "\n".join(code_lines) + "\n", plan
             code_lines.append("df = df.copy()")
             code_lines.append(f"df = df.sort_values(by=[{cols[0]!r}], ascending={not desc})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Відсортувати за {cols[0]}."
             return "\n".join(code_lines) + "\n", plan
@@ -725,7 +868,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 code_lines.append(f"df = df.loc[df[{col!r}].astype(str).str.strip() {op} {value!r}]")
             else:
                 code_lines.append(f"df = df.loc[df[{col!r}].astype(str).str.contains({value!r}, na=False)]")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Відфільтрувати за умовою по {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -736,7 +879,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 values = [v.strip().strip("\"'") for v in m.group(1).split(",") if v.strip()]
                 code_lines.append("df = df.copy()")
                 code_lines.append(f"df = df.loc[df[{col!r}].isin({values!r})]")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = f"Відфільтрувати {col} по списку значень."
                 return "\n".join(code_lines) + "\n", plan
@@ -747,7 +890,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             old = _parse_literal(m.group(1))
             code_lines.append("df = df.copy()")
             code_lines.append(f"df = df.replace({old!r}, pd.NA)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = "Замінити значення у всій таблиці."
             return "\n".join(code_lines) + "\n", plan
@@ -759,7 +902,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             old, new = m.group(1), m.group(2)
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = df[{col!r}].astype(str).str.replace({old!r}, {new!r}, regex=False)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Замінити '{old}' на '{new}' у колонці {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -769,7 +912,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = df[{col!r}].astype(str).str.strip()")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Прибрати пробіли по краях у колонці {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -779,7 +922,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = df[{col!r}].astype(str).str.lower()")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перевести значення колонки {col} у нижній регістр."
             return "\n".join(code_lines) + "\n", plan
@@ -789,14 +932,14 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col and re.search(r"\b(попередн|ffill)\b", q_low):
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = df[{col!r}].ffill()")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Заповнити пропуски в {col} попереднім значенням."
             return "\n".join(code_lines) + "\n", plan
         if col and re.search(r"\b(наступн|bfill)\b", q_low):
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = df[{col!r}].bfill()")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Заповнити пропуски в {col} наступним значенням."
             return "\n".join(code_lines) + "\n", plan
@@ -805,7 +948,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             if value is not None:
                 code_lines.append("df = df.copy()")
                 code_lines.append(f"df[{col!r}] = df[{col!r}].fillna({_parse_literal(value)!r})")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = f"Заповнити пропуски в {col} значенням {_parse_literal(value)!r}."
                 return "\n".join(code_lines) + "\n", plan
@@ -814,7 +957,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         code_lines.append("df = df.copy()")
         code_lines.append("num_cols = df.select_dtypes(include='number').columns")
         code_lines.append("df[num_cols] = df[num_cols].apply(lambda s: s.fillna(s.mean()))")
-        code_lines.append("__commit_df__ = True")
+        code_lines.append("COMMIT_DF = True")
         code_lines.append("result = {'status': 'updated'}")
         plan = "Замінити NA у числових колонках їхнім середнім."
         return "\n".join(code_lines) + "\n", plan
@@ -826,7 +969,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if cols:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{new_col!r}] = df.duplicated(subset={cols!r}, keep='first')")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Позначити дублікати у колонці {new_col}."
             return "\n".join(code_lines) + "\n", plan
@@ -836,7 +979,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if cols:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df = df.drop_duplicates(subset={cols!r}, keep='first')")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Видалити дублікати за колонками {', '.join(cols)}."
             return "\n".join(code_lines) + "\n", plan
@@ -865,7 +1008,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce')")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перетворити {col} у число."
             return "\n".join(code_lines) + "\n", plan
@@ -876,7 +1019,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = pd.to_datetime(df[{col!r}], errors='coerce', dayfirst={dayfirst})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перетворити {col} у дату."
             return "\n".join(code_lines) + "\n", plan
@@ -888,7 +1031,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce').round({n})")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Округлити {col} до {n} знаків."
             return "\n".join(code_lines) + "\n", plan
@@ -898,7 +1041,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         if col:
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce').clip(lower=0)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Обмежити {col} значеннями не менше 0."
             return "\n".join(code_lines) + "\n", plan
@@ -960,7 +1103,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 code_lines.append(f"parts = df[{col!r}].astype(str).str.split(' ', n=1, expand=True)")
                 code_lines.append(f"df[{c1!r}] = parts[0]")
                 code_lines.append(f"df[{c2!r}] = parts[1]")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = f"Розбити {col} на {c1} та {c2}."
                 return "\n".join(code_lines) + "\n", plan
@@ -974,7 +1117,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             code_lines.append(
                 f"df[{new_col!r}] = df[{cols[0]!r}].astype(str).str.cat(df[{cols[1]!r}].astype(str), sep=' ')"
             )
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Склеїти {cols[0]} та {cols[1]} у {new_col}."
             return "\n".join(code_lines) + "\n", plan
@@ -986,7 +1129,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             new_col = m.group(1).strip() if m else "domain"
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{new_col!r}] = df[{col!r}].astype(str).str.extract(r'@(.+)$', expand=False)")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Витягнути домен з {col} у {new_col}."
             return "\n".join(code_lines) + "\n", plan
@@ -998,7 +1141,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             new_col = m.group(1).strip() if m else "year"
             code_lines.append("df = df.copy()")
             code_lines.append(f"df[{new_col!r}] = pd.to_datetime(df[{col!r}], errors='coerce').dt.year")
-            code_lines.append("__commit_df__ = True")
+            code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Додати колонку {new_col} з року дати {col}."
             return "\n".join(code_lines) + "\n", plan
@@ -1016,7 +1159,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
                 code_lines.append(f"df[{date_col!r}] = pd.to_datetime(df[{date_col!r}], errors='coerce')")
                 code_lines.append(f"df = df.sort_values({date_col!r})")
                 code_lines.append(f"df[{new_col!r}] = df[{value_col!r}].rolling({window}).mean()")
-                code_lines.append("__commit_df__ = True")
+                code_lines.append("COMMIT_DF = True")
                 code_lines.append("result = {'status': 'updated'}")
                 plan = f"Обчислити ковзне середнє {window} для {value_col} по {date_col}."
                 return "\n".join(code_lines) + "\n", plan
@@ -1033,7 +1176,7 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
         code = "\n".join(
             [
                 "result = {'status': 'undo'}",
-                "__undo__ = True",
+                "UNDO = True",
             ]
         ) + "\n"
         return code, "Відкотити останню зміну таблиці."
@@ -1127,7 +1270,7 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
     else:
         return None
 
-    code_lines.append("__commit_df__ = True")
+    code_lines.append("COMMIT_DF = True")
     code_lines.append("result = {'status': 'updated'}")
     return "\n".join(code_lines) + "\n", plan
 
@@ -1327,10 +1470,10 @@ class Pipeline(object):
         webui_api_key: str = Field(default=os.getenv("WEBUI_API_KEY", ""))
 
         base_llm_base_url: str = Field(
-            default=os.getenv("BASE_LLM_BASE_URL", "http://gpu-test.silly.billy:8099/v1")
+            default=os.getenv("BASE_LLM_BASE_URL", "http://alph-gpu.silly.billy:8031/v1")
         )
         base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", ""))
-        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "glm-4.7-flash"))
+        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "chat-model"))
 
         sandbox_url: str = Field(default=os.getenv("SANDBOX_URL", "http://sandbox:8081"))
         sandbox_api_key: str = Field(default=os.getenv("SANDBOX_API_KEY", ""))
@@ -1360,7 +1503,7 @@ class Pipeline(object):
 
         vllm_base_url: str = Field(
             default=os.getenv(
-                "EMB_BASE_URL", os.getenv("VLLM_BASE_URL", "http://gpu-test.silly.billy:8022/v1")
+                "EMB_BASE_URL", os.getenv("VLLM_BASE_URL", "http://alph-gpu.silly.billy:8022/v1")
             )
         )
         vllm_embed_model: str = Field(
@@ -1378,6 +1521,17 @@ class Pipeline(object):
         logging.basicConfig(level=logging.INFO)
         self._llm = OpenAI(
             base_url=self.valves.base_llm_base_url, api_key=self.valves.base_llm_api_key or "DUMMY_KEY"
+        )
+        logging.info(
+            "event=shortcut_paths enabled=%s catalog_path=%s index_path=%s meta_path=%s "
+            "catalog_exists=%s index_exists=%s meta_exists=%s",
+            bool(self.valves.shortcut_enabled),
+            self.valves.shortcut_catalog_path,
+            self.valves.shortcut_index_path,
+            self.valves.shortcut_meta_path,
+            os.path.exists(self.valves.shortcut_catalog_path),
+            os.path.exists(self.valves.shortcut_index_path),
+            os.path.exists(self.valves.shortcut_meta_path),
         )
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._prompts = _read_prompts(PROMPTS_PATH)
@@ -1490,22 +1644,34 @@ class Pipeline(object):
             self.valves.preview_rows = new_max
 
     def _llm_json(self, system: str, user: str) -> dict:
+        logging.info(
+            "event=llm_json_request system_preview=%s user_preview=%s",
+            _safe_trunc(system, 800),
+            _safe_trunc(user, 1200),
+        )
         resp = self._llm.chat.completions.create(
             model=self.valves.base_llm_model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0,
         )
         text = (resp.choices[0].message.content or "").strip()
+        logging.info("event=llm_json_response preview=%s", _safe_trunc(text, 1200))
         m = re.search(r"\{.*\}", text, flags=re.S)
         if not m:
             raise ValueError("LLM did not return JSON")
         return json.loads(m.group(0))
 
-    def _plan_code(self, question: str, profile: dict) -> Tuple[str, str, str]:
+    def _plan_code(self, question: str, profile: dict) -> Tuple[str, str, str, Optional[bool]]:
         system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
         payload = json.dumps({"question": question, "df_profile": profile}, ensure_ascii=False)
         parsed = self._llm_json(system, payload)
-        return parsed.get("analysis_code", ""), parsed.get("short_plan", ""), (parsed.get("op") or "read")
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
 
     def _llm_pick_column_for_shortcut(self, question: str, profile: dict) -> Optional[str]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
@@ -1561,32 +1727,156 @@ class Pipeline(object):
                 items.sort(key=lambda kv: float(kv[1]) if kv[1] is not None else float("-inf"), reverse=True)
             except Exception:
                 pass
-            for k, v in items[: max(1, top_n)]:
-                lines.append(f"{k}: {v}")
+            rows = items[: max(1, top_n)]
+            if rows:
+                header = "| Ключ | Значення |"
+                sep = "|---|---|"
+                body = [f"| {k} | {v} |" for k, v in rows]
+                return "\n".join([header, sep] + body)
         elif isinstance(data, list) and data and all(isinstance(x, dict) for x in data):
             first = data[0]
             keys = [str(k) for k in first.keys()]
-            count_key = "count" if "count" in keys else None
-            if not count_key:
-                count_key = next((k for k in keys if k.lower() in ("count", "qty", "quantity", "total")), None)
-            if count_key:
-                other_keys = [k for k in keys if k != count_key]
-                label_key = other_keys[0] if other_keys else None
-                rows = data[:]
-                try:
-                    rows.sort(key=lambda r: float(r.get(count_key) or 0), reverse=True)
-                except Exception:
-                    pass
-                for row in rows[: max(1, top_n)]:
-                    label = row.get(label_key) if label_key else row
-                    lines.append(f"{label}: {row.get(count_key)}")
+            if keys:
+                header = "| " + " | ".join(keys) + " |"
+                sep = "| " + " | ".join(["---"] * len(keys)) + " |"
+                top_rows = data[: max(1, top_n)]
+                body = []
+                for row in top_rows:
+                    body.append("| " + " | ".join(str(row.get(k, "")) for k in keys) + " |")
+                return "\n".join([header, sep] + body)
         if not lines:
             return None
         header = "Топ значень:"
         return header + "\n" + "\n".join(lines)
 
+    def _format_structure_from_result(self, result_text: str) -> Optional[str]:
+        text = (result_text or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        rows = data.get("rows")
+        cols = data.get("cols")
+        if isinstance(rows, (int, float)) and isinstance(cols, (int, float)):
+            return f"У таблиці {int(rows)} рядків і {int(cols)} стовпців."
+        if isinstance(rows, (int, float)):
+            return f"У таблиці {int(rows)} рядків."
+        if isinstance(cols, (int, float)):
+            return f"У таблиці {int(cols)} стовпців."
+        return None
+
+    def _format_availability_from_result(self, result_text: str) -> Optional[str]:
+        text = (result_text or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            data = None
+
+        def _normalize_values(values: List[Any]) -> List[str]:
+            out: List[str] = []
+            for v in values:
+                if v is None:
+                    continue
+                s = str(v).strip()
+                if not s:
+                    continue
+                out.append(s)
+            return out
+
+        in_pat = re.compile(r"(в\s+наявн|наявн|in\s+stock|available)", re.I)
+        out_pat = re.compile(r"(нема|відсутн|out\s+of\s+stock|unavailable)", re.I)
+
+        if isinstance(data, list):
+            values = _normalize_values(data)
+            if not values:
+                return "Немає даних про наявність."
+            any_in = any(in_pat.search(v) for v in values)
+            any_out = any(out_pat.search(v) for v in values)
+            if any_in and not any_out:
+                return "Так, є в наявності."
+            if any_out and not any_in:
+                return "Ні, немає в наявності."
+            uniq: List[str] = []
+            seen = set()
+            for v in values:
+                if v in seen:
+                    continue
+                seen.add(v)
+                uniq.append(v)
+            return "Статуси: " + ", ".join(uniq)
+        if isinstance(data, dict):
+            keys = _normalize_values(list(data.keys()))
+            if not keys:
+                return "Немає даних про наявність."
+            stats_map = {
+                "mean": "Середнє",
+                "avg": "Середнє",
+                "average": "Середнє",
+                "min": "Мінімум",
+                "max": "Максимум",
+                "sum": "Сума",
+                "count": "Кількість",
+                "median": "Медіана",
+            }
+            stat_keys = [k for k in keys if k.lower() in stats_map]
+            if stat_keys:
+                parts: List[str] = []
+                order = ["mean", "min", "max", "median", "sum", "count"]
+                for k in order:
+                    for orig in keys:
+                        if orig.lower() == k:
+                            val = data.get(orig)
+                            if val is not None:
+                                parts.append(f"{stats_map[k]}: {val}")
+                if not parts:
+                    for orig in stat_keys:
+                        val = data.get(orig)
+                        if val is not None:
+                            parts.append(f"{stats_map[orig.lower()]}: {val}")
+                if parts:
+                    return "; ".join(parts)
+            any_in = any(in_pat.search(v) for v in keys)
+            any_out = any(out_pat.search(v) for v in keys)
+            if any_in and not any_out:
+                return "Так, є в наявності."
+            if any_out and not any_in:
+                return "Ні, немає в наявності."
+            pairs: List[str] = []
+            for k in keys:
+                v = data.get(k)
+                if v is None:
+                    pairs.append(k)
+                else:
+                    pairs.append(f"{k}: {v}")
+            return "Статуси: " + ", ".join(pairs)
+        if isinstance(data, str):
+            if in_pat.search(data) and not out_pat.search(data):
+                return "Так, є в наявності."
+            if out_pat.search(data) and not in_pat.search(data):
+                return "Ні, немає в наявності."
+            return f"Статус: {data}"
+
+        if in_pat.search(text) and not out_pat.search(text):
+            return "Так, є в наявності."
+        if out_pat.search(text) and not in_pat.search(text):
+            return "Ні, немає в наявності."
+        return None
+
     def _deterministic_answer(self, question: str, result_text: str, profile: Optional[dict]) -> Optional[str]:
         q = (question or "").lower()
+        if re.search(r"\b(рядк\w*|стовпц\w*|columns?|rows?)\b", q):
+            structural = self._format_structure_from_result(result_text)
+            if structural:
+                return structural
+        wants_availability = bool(
+            re.search(r"\b(наявн|в\s+наявності|доступн|availability|available|in\s+stock|out\s+of\s+stock)\b", q)
+        )
         wants_pairs = bool(re.search(r"\b(кожн\w*|each|per|по\s+кожн\w*|для\s+кожн\w*)\b", q))
         wants_counts = bool(re.search(r"\b(скільк\w*|кільк\w*|count|к-?ст[ьі])\b", q))
         is_grouping = bool(
@@ -1604,6 +1894,10 @@ class Pipeline(object):
             matched_col = self._llm_pick_column_for_shortcut(question, profile or {})
         if matched_col:
             is_grouping = True
+        if wants_availability:
+            availability = self._format_availability_from_result(result_text)
+            if availability:
+                return availability
         if is_grouping and (wants_counts or wants_pairs):
             return self._format_top_pairs_from_result(result_text, top_n=100)
         if not (wants_pairs and wants_counts):
@@ -1638,6 +1932,11 @@ class Pipeline(object):
             "result_meta": result_meta,
             "error": error,
         }
+        logging.info(
+            "event=llm_final_request question_preview=%s payload_preview=%s",
+            _safe_trunc(question, 400),
+            _safe_trunc(json.dumps(payload, ensure_ascii=False), 1200),
+        )
         resp = self._llm.chat.completions.create(
             model=self.valves.base_llm_model,
             messages=[
@@ -1647,6 +1946,7 @@ class Pipeline(object):
             temperature=0.2,
         )
         answer = (resp.choices[0].message.content or "").strip()
+        logging.info("event=llm_final_response preview=%s", _safe_trunc(answer, 1200))
         if result_text and re.search(r"\d+", result_text or ""):
             real_numbers = set(re.findall(r"\d+", result_text))
             llm_numbers = set(re.findall(r"\d+", answer))
@@ -1654,12 +1954,26 @@ class Pipeline(object):
                 logging.warning(
                     "event=final_answer mode=llm_hallucinated real=%s llm=%s", real_numbers, llm_numbers
                 )
-                fallback = self._format_top_pairs_from_result(result_text, top_n=100)
-                if fallback:
-                    return fallback
-                if result_text:
-                    return result_text
-                return "Не можу безпечно сформувати відповідь: числа у відповіді не збігаються з результатом."
+                rewrite_system = self._prompts.get("final_rewrite_system", DEFAULT_FINAL_REWRITE_SYSTEM)
+                rewrite_payload = {"question": question, "result_text": result_text}
+                try:
+                    rewrite_resp = self._llm.chat.completions.create(
+                        model=self.valves.base_llm_model,
+                        messages=[
+                            {"role": "system", "content": rewrite_system},
+                            {"role": "user", "content": json.dumps(rewrite_payload, ensure_ascii=False)},
+                        ],
+                        temperature=0.1,
+                    )
+                    rewrite = (rewrite_resp.choices[0].message.content or "").strip()
+                    if rewrite:
+                        rewrite_numbers = set(re.findall(r"\d+", rewrite))
+                        if not rewrite_numbers or (real_numbers & rewrite_numbers):
+                            logging.info("event=final_answer mode=rewrite preview=%s", _safe_trunc(rewrite, 300))
+                            return rewrite
+                except Exception as exc:
+                    logging.warning("event=final_rewrite_failed err=%s", str(exc))
+                return "Не можу безпечно сформувати відповідь. Спробуйте уточнити запит."
         logging.info("event=final_answer mode=llm preview=%s", _safe_trunc(answer, 300))
         return answer
 
@@ -1757,6 +2071,12 @@ class Pipeline(object):
             self._emit(event_emitter, "start", {"model_id": model_id, "has_messages": bool(messages)})
 
             question = (user_message or "").strip() or _last_user_message(messages)
+            if _is_meta_task_text(question):
+                extracted = _extract_user_query_from_meta(question)
+                if extracted:
+                    question = extracted
+                else:
+                    question = _last_user_message(messages) or question
             session_key = _session_key(body)
             session = self._session_get(session_key)
 
@@ -1796,6 +2116,9 @@ class Pipeline(object):
                 self._apply_dynamic_limits(profile)
                 self._session_set(session_key, file_id, df_id, profile)
 
+            edit_expected = False
+            op = None
+            commit_df = None
             router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
             shortcut = None
             router_meta: Dict[str, Any] = {}
@@ -1825,37 +2148,23 @@ class Pipeline(object):
             else:
                 wait = self._start_wait(event_emitter, "codegen")
                 try:
-                    analysis_code, plan, op = self._plan_code(question, profile)
+                    analysis_code, plan, op, commit_df = self._plan_code(question, profile)
                 finally:
                     self._stop_wait(wait)
                 if not (analysis_code or "").strip():
                     self._emit(event_emitter, "codegen_empty", {})
                     return "I could not generate analysis code for this question. Try rephrasing."
-                is_explicit_edit = bool(
-                    re.search(
-                        r"(^|\n)\s*df\s*=|df\[.+\]\s*=|df\.(loc|iloc|at|iat)\[.+\]\s*=|inplace=True",
-                        analysis_code or "",
-                    )
-                )
-                current_op = (op or "").strip().lower()
-                if current_op == "read" and not is_explicit_edit:
-                    analysis_code = "df = df.copy(deep=False)\n" + analysis_code
-                else:
-                    if "__commit_df__" not in (analysis_code or ""):
-                        analysis_code = analysis_code.rstrip() + "\n__commit_df__ = True\n"
-                analysis_code, count_err = _enforce_count_code(question, analysis_code)
-                if count_err:
-                    return f"Неможливо виконати запит: {count_err}"
-                edit_expected = current_op != "read" or is_explicit_edit or "__commit_df__" in (analysis_code or "")
-                if edit_expected:
-                    analysis_code, edit_err = _validate_edit_code(analysis_code)
-                    if edit_err:
-                        return f"Неможливо виконати edit: {edit_err}"
+            analysis_code, count_err = _enforce_count_code(question, analysis_code)
+            if count_err:
+                return f"Неможливо виконати запит: {count_err}"
+            analysis_code, edit_expected = _finalize_code_for_sandbox(question, analysis_code, op, commit_df)
 
             analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
             analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
             if "df_profile" in (analysis_code or ""):
                 analysis_code = f"df_profile = {profile!r}\n" + analysis_code
+            analysis_code = _normalize_generated_code(analysis_code)
+            logging.info("event=analysis_code preview=%s", _safe_trunc(analysis_code, 4000))
 
             self._emit(event_emitter, "sandbox_run", {"df_id": df_id})
             wait = self._start_wait(event_emitter, "sandbox_run")
@@ -1868,9 +2177,9 @@ class Pipeline(object):
                 self._emit(event_emitter, "final_answer", {"status": run_status})
                 error = run_resp.get("error", "") or "Sandbox execution failed."
                 return f"Не вдалося виконати аналіз у sandbox (статус: {run_status}). {error}"
-            if ("__commit_df__" in (analysis_code or "")) and not run_resp.get("committed"):
+            if edit_expected and ("COMMIT_DF" in (analysis_code or "")) and not run_resp.get("committed"):
                 self._emit(event_emitter, "final_answer", {"status": "commit_failed"})
-                return "Edit не було закомічено в sandbox. Повторіть запит із явним __commit_df__ = True та присвоєнням у df."
+                return "Edit не було закомічено в sandbox. Повторіть запит із явним COMMIT_DF = True та присвоєнням у df."
             new_profile = run_resp.get("profile") or {}
             if new_profile:
                 profile = new_profile
@@ -1916,6 +2225,12 @@ class Pipeline(object):
             yield from drain()
 
             question = (user_message or "").strip() or _last_user_message(messages)
+            if _is_meta_task_text(question):
+                extracted = _extract_user_query_from_meta(question)
+                if extracted:
+                    question = extracted
+                else:
+                    question = _last_user_message(messages) or question
             session_key = _session_key(body)
             session = self._session_get(session_key)
 
@@ -1956,6 +2271,9 @@ class Pipeline(object):
                 self._apply_dynamic_limits(profile)
                 self._session_set(session_key, file_id, df_id, profile)
 
+            edit_expected = False
+            op = None
+            commit_df = None
             router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
             shortcut = None
             router_meta: Dict[str, Any] = {}
@@ -1985,43 +2303,27 @@ class Pipeline(object):
                 yield from drain()
                 analysis_code, plan = shortcut
             else:
-                analysis_code, plan, op = self._plan_code(question, profile)
+                analysis_code, plan, op, commit_df = self._plan_code(question, profile)
                 if not (analysis_code or "").strip():
                     emit("codegen_empty", {})
                     yield from drain()
                     yield "I could not generate analysis code for this question. Try rephrasing."
                     return
-                is_explicit_edit = bool(
-                    re.search(
-                        r"(^|\n)\s*df\s*=|df\[.+\]\s*=|df\.(loc|iloc|at|iat)\[.+\]\s*=|inplace=True",
-                        analysis_code or "",
-                    )
-                )
-                current_op = (op or "").strip().lower()
-                if current_op == "read" and not is_explicit_edit:
-                    analysis_code = "df = df.copy(deep=False)\n" + analysis_code
-                else:
-                    if "__commit_df__" not in (analysis_code or ""):
-                        analysis_code = analysis_code.rstrip() + "\n__commit_df__ = True\n"
-                analysis_code, count_err = _enforce_count_code(question, analysis_code)
-                if count_err:
-                    emit("final_answer", {"status": "invalid_code"})
-                    yield from drain()
-                    yield f"Неможливо виконати запит: {count_err}"
-                    return
-                edit_expected = current_op != "read" or is_explicit_edit or "__commit_df__" in (analysis_code or "")
-                if edit_expected:
-                    analysis_code, edit_err = _validate_edit_code(analysis_code)
-                    if edit_err:
-                        emit("final_answer", {"status": "invalid_edit"})
-                        yield from drain()
-                        yield f"Неможливо виконати edit: {edit_err}"
-                        return
+
+            analysis_code, count_err = _enforce_count_code(question, analysis_code)
+            if count_err:
+                emit("final_answer", {"status": "invalid_code"})
+                yield from drain()
+                yield f"Неможливо виконати запит: {count_err}"
+                return
+            analysis_code, edit_expected = _finalize_code_for_sandbox(question, analysis_code, op, commit_df)
 
             analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
             analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
             if "df_profile" in (analysis_code or ""):
                 analysis_code = f"df_profile = {profile!r}\n" + analysis_code
+            analysis_code = _normalize_generated_code(analysis_code)
+            logging.info("event=analysis_code preview=%s", _safe_trunc(analysis_code, 4000))
 
             emit("sandbox_run", {"df_id": df_id})
             yield from drain()
@@ -2033,10 +2335,10 @@ class Pipeline(object):
                 error = run_resp.get("error", "") or "Sandbox execution failed."
                 yield f"Не вдалося виконати аналіз у sandbox (статус: {run_status}). {error}"
                 return
-            if ("__commit_df__" in (analysis_code or "")) and not run_resp.get("committed"):
+            if edit_expected and ("COMMIT_DF" in (analysis_code or "")) and not run_resp.get("committed"):
                 emit("final_answer", {"status": "commit_failed"})
                 yield from drain()
-                yield "Edit не було закомічено в sandbox. Повторіть запит із явним __commit_df__ = True та присвоєнням у df."
+                yield "Edit не було закомічено в sandbox. Повторіть запит із явним COMMIT_DF = True та присвоєнням у df."
                 return
             new_profile = run_resp.get("profile") or {}
             if new_profile:
