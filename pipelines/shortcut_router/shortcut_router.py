@@ -1,6 +1,5 @@
 import logging
 import json
-import logging
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
@@ -487,6 +486,8 @@ class ShortcutRouter:
                 if not idxs:
                     return None
                 code_lines.append(f"_idx_1b = {idxs!r}")
+                code_lines.append("_invalid_idx = [i for i in _idx_1b if i <= 0]")
+                code_lines.append("if _invalid_idx: raise ValueError('row indices must be positive 1-based integers')")
                 code_lines.append("_idx_0b = [i - 1 for i in _idx_1b if i > 0]")
                 code_lines.append("df = df.reset_index(drop=True)")
                 code_lines.append("df = df.drop(index=_idx_0b)")
@@ -505,7 +506,8 @@ class ShortcutRouter:
                 else:
                     code_lines.append("result = df.describe(include='all')")
             elif op == "export_csv":
-                return None
+                include_index = bool(slots.get("include_index", False))
+                code_lines.append(f"result = df.to_csv(index={include_index})")
             elif op == "return_df_preview":
                 rows = int(args.get("rows") or 20)
                 code_lines.append(f"result = df.head({rows})")

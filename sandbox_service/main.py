@@ -262,11 +262,12 @@ def _run_code(
     max_cell_chars: int,
     max_stdout_chars: int,
     max_result_chars: int,
-) -> Tuple[str, str, str, dict, str, Optional[pd.DataFrame], bool, bool]:
+) -> Tuple[str, str, str, dict, str, Optional[pd.DataFrame], bool, bool, bool, bool]:
     _ast_guard(code)
 
     def worker(queue: multiprocessing.Queue) -> None:
         stdout = io.StringIO()
+        df_before = df.copy(deep=True)
         safe_builtins = {
             "len": len,
             "sum": sum,
@@ -314,12 +315,48 @@ def _run_code(
             result_meta = _result_meta(result)
             commit_flag = bool(env.get("COMMIT_DF"))
             undo_flag = bool(env.get("UNDO"))
-            df_out = None
-            if commit_flag:
-                df_out = env.get("df")
-            queue.put(("ok", stdout.getvalue(), result_text, result_meta, "", df_out, commit_flag, undo_flag))
+            df_after = env.get("df")
+            auto_commit_flag = False
+            structure_changed = False
+            if isinstance(df_after, pd.DataFrame):
+                try:
+                    structure_changed = (
+                        df_after.shape[0] != df_before.shape[0]
+                        or df_after.shape[1] != df_before.shape[1]
+                    )
+                    auto_commit_flag = (
+                        df_after.shape != df_before.shape
+                        or not df_after.columns.equals(df_before.columns)
+                        or not df_after.dtypes.equals(df_before.dtypes)
+                        or not df_after.equals(df_before)
+                    )
+                except Exception:
+                    auto_commit_flag = False
+                    structure_changed = False
+
+            if structure_changed:
+                auto_commit_flag = True
+
+            effective_commit = bool(commit_flag or auto_commit_flag)
+            df_out = df_after if effective_commit and isinstance(df_after, pd.DataFrame) else None
+            queue.put(
+                (
+                    "ok",
+                    stdout.getvalue(),
+                    result_text,
+                    result_meta,
+                    "",
+                    df_out,
+                    commit_flag,
+                    undo_flag,
+                    auto_commit_flag,
+                    structure_changed,
+                )
+            )
         except Exception as exc:
-            queue.put(("err", stdout.getvalue(), "", {}, f"{type(exc).__name__}: {exc}", None, False, False))
+            queue.put(
+                ("err", stdout.getvalue(), "", {}, f"{type(exc).__name__}: {exc}", None, False, False, False, False)
+            )
 
     if hasattr(multiprocessing, "get_context"):
         try:
@@ -335,12 +372,12 @@ def _run_code(
     if proc.is_alive():
         proc.terminate()
         proc.join(1)
-        return ("timeout", "", "", {}, f"Timeout after {timeout_s}s", None, False, False)
+        return ("timeout", "", "", {}, f"Timeout after {timeout_s}s", None, False, False, False, False)
     if queue.empty():
-        return ("err", "", "", {}, "NoResult", None, False, False)
-    status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag = queue.get()
+        return ("err", "", "", {}, "NoResult", None, False, False, False, False)
+    status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = queue.get()
     stdout = _safe_trunc(stdout, max_stdout_chars)
-    return status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag
+    return status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed
 
 
 @app.get("/health")
@@ -418,7 +455,7 @@ def run_code(req: RunRequest, request: Request) -> dict:
     max_result_chars = req.max_result_chars or DEF_MAX_RESULT_CHARS
 
     try:
-        status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag = _run_code(
+        status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = _run_code(
             req.code,
             entry["df"],
             timeout_s,
@@ -435,7 +472,13 @@ def run_code(req: RunRequest, request: Request) -> dict:
             "result_text": "",
             "result_meta": {},
             "error": f"{type(exc).__name__}: {exc} | {trace}",
+            "profile": entry.get("profile"),
+            "committed": False,
+            "auto_committed": False,
+            "structure_changed": False,
         }
+
+    was_committed = False
 
     if status == "ok":
         if undo_flag:
@@ -447,10 +490,15 @@ def run_code(req: RunRequest, request: Request) -> dict:
                     "result_text": result_text,
                     "result_meta": result_meta,
                     "error": "undo_empty",
+                    "profile": entry.get("profile"),
+                    "committed": False,
+                    "auto_committed": False,
+                    "structure_changed": False,
                 }
             entry["df"] = history.pop()
             entry["profile"] = _profile_dataframe(entry["df"], preview_rows, max_cell_chars)
-        elif commit_flag and isinstance(df_out, pd.DataFrame):
+            was_committed = True
+        elif (commit_flag or auto_commit_flag or structure_changed) and isinstance(df_out, pd.DataFrame):
             history = entry.get("history") or []
             history.append(entry["df"].copy(deep=True))
             if MAX_DF_HISTORY > 0 and len(history) > MAX_DF_HISTORY:
@@ -458,6 +506,8 @@ def run_code(req: RunRequest, request: Request) -> dict:
             entry["history"] = history
             entry["df"] = df_out
             entry["profile"] = _profile_dataframe(entry["df"], preview_rows, max_cell_chars)
+            was_committed = True
+    
     entry["ts"] = time.time()
     return {
         "status": status,
@@ -466,4 +516,7 @@ def run_code(req: RunRequest, request: Request) -> dict:
         "result_meta": result_meta,
         "error": err,
         "profile": entry.get("profile"),
+        "committed": was_committed,
+        "auto_committed": bool(auto_commit_flag and was_committed),
+        "structure_changed": bool(structure_changed),
     }
