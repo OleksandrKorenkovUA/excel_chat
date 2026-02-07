@@ -1,6 +1,9 @@
+### Поточна версія коду 
+
 import ast
 import asyncio
 import base64
+import contextvars
 import inspect
 import hashlib
 import json
@@ -11,6 +14,7 @@ import textwrap
 import threading
 import time
 import traceback
+import uuid
 from typing import Any, ClassVar, Dict, Generator, Iterator, List, Optional, Tuple, Union
 from pipelines.shortcut_router.shortcut_router import ShortcutRouter, ShortcutRouterConfig
 import requests
@@ -95,6 +99,55 @@ DEFAULT_FINAL_REWRITE_SYSTEM = (
 
 SHORTCUT_COL_PLACEHOLDER = "__SHORTCUT_COL__"
 
+_REQUEST_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_request_id", default="-")
+_TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_trace_id", default="-")
+
+
+class _RequestTraceLoggingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "_request_trace_injected", False):
+            return True
+        request_id = (_REQUEST_ID_CTX.get() or "-").strip() or "-"
+        trace_id = (_TRACE_ID_CTX.get() or "-").strip() or "-"
+        record.msg = f"request_id={request_id} trace_id={trace_id} {record.msg}"
+        record._request_trace_injected = True
+        return True
+
+
+def _extract_request_trace_ids(body: Optional[dict]) -> Tuple[str, str]:
+    body = body or {}
+    headers_raw = body.get("headers")
+    headers: Dict[str, str] = {}
+    if isinstance(headers_raw, dict):
+        for k, v in headers_raw.items():
+            if v is None:
+                continue
+            headers[str(k).lower()] = str(v).strip()
+
+    request_id = str(
+        body.get("request_id")
+        or body.get("requestId")
+        or body.get("id")
+        or headers.get("x-request-id")
+        or headers.get("x-requestid")
+        or ""
+    ).strip()
+    trace_id = str(
+        body.get("trace_id")
+        or body.get("traceId")
+        or headers.get("x-trace-id")
+        or headers.get("traceparent")
+        or headers.get("x-b3-traceid")
+        or body.get("conversation_id")
+        or ""
+    ).strip()
+
+    if not trace_id:
+        trace_id = uuid.uuid4().hex[:16]
+    if not request_id:
+        request_id = trace_id
+    return request_id[:96], trace_id[:96]
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -129,6 +182,15 @@ META_TASK_HINTS = (
     "<user_query>",
 )
 
+
+SEARCH_QUERY_META_HINTS = (
+    "determine the necessity of generating search queries",
+    "prioritize generating 1-3 broad and relevant search queries",
+    "return: { \"queries\": [] }",
+    "\"queries\": [",
+)
+
+
 def _is_meta_task_text(text: str) -> bool:
     s = (text or "").strip()
     if not s:
@@ -147,6 +209,17 @@ def _is_meta_task_text(text: str) -> bool:
             return True
     return False
 
+
+def _is_search_query_meta_task(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    if not _is_meta_task_text(s):
+        return False
+    lower = s.lower()
+    return any(h in lower for h in SEARCH_QUERY_META_HINTS)
+
+
 def _extract_user_query_from_meta(text: str) -> str:
     s = (text or "").strip()
     if not s or not _is_meta_task_text(s):
@@ -157,47 +230,123 @@ def _extract_user_query_from_meta(text: str) -> str:
     m = re.search(r"###\s*User Query:\s*(.+?)(?:\n###|$)", s, re.S | re.I)
     if m:
         return (m.group(1) or "").strip()
+    m = re.search(r"###\s*User Query\s*\n+\s*(.+?)(?:\n###|\n<|$)", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    m = re.search(r"(?:^|\n)\s*user[_\s-]*query\s*:\s*(.+?)(?:\n[A-Z#][^\n]*:|$)", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    m = re.search(r"(?:^|\n)\s*user'?s?\s+query\s*:\s*(.+?)(?:\n[A-Z#][^\n]*:|$)", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    m = re.search(r"(?:\"|')?user_query(?:\"|')?\s*[:=]\s*['\"](.+?)['\"]", s, re.S | re.I)
+    if m:
+        return (m.group(1) or "").strip()
+    chat_block = re.search(r"<chat_history>\s*(.+?)\s*</chat_history>", s, re.S | re.I)
+    if chat_block:
+        chat = (chat_block.group(1) or "").strip()
+        user_lines = re.findall(r"(?:^|\n)\s*(?:user|користувач)\s*[:>-]\s*(.+)", chat, re.I)
+        if user_lines:
+            return (user_lines[-1] or "").strip()
     return ""
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, str) and part.strip():
+                parts.append(part.strip())
+            elif isinstance(part, dict):
+                text = part.get("text") or part.get("content")
+                if isinstance(text, str) and text.strip():
+                    parts.append(text.strip())
+        return "\n".join(parts).strip()
+    if isinstance(content, dict):
+        text = content.get("text") or content.get("content")
+        if isinstance(text, str):
+            return text
+    return ""
+
+
+def _normalize_query_text(text: str) -> str:
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not s.strip():
+        return ""
+    lines: List[str] = []
+    for raw_line in s.split("\n"):
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[*\-•]+", line):
+            continue
+        line = re.sub(r"^\s*[*\-•]\s+", "", line)
+        line = re.sub(r"^\s*\d+[.)]\s+", "", line)
+        line = line.strip()
+        if line:
+            lines.append(line)
+    out = " ".join(lines).strip()
+    out = re.sub(r"\s{2,}", " ", out)
+    if len(out) >= 2 and out[0] == out[-1] and out[0] in {"'", '"', "`"}:
+        out = out[1:-1].strip()
+    return out
+
 
 def _last_user_message(messages: List[dict]) -> str:
     for msg in reversed(messages or []):
         if msg.get("role") != "user":
             continue
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts: List[str] = []
-            for part in content:
-                if isinstance(part, str) and part.strip():
-                    parts.append(part.strip())
-                elif isinstance(part, dict):
-                    text = part.get("text") or part.get("content")
-                    if isinstance(text, str) and text.strip():
-                        parts.append(text.strip())
-            content = "\n".join(parts).strip()
-        
+        content = _message_text(msg.get("content", ""))
         if not isinstance(content, str):
             continue
-            
+
         s = content.strip()
         if not s:
             continue
-            
+
         if _is_meta_task_text(s):
             extracted = _extract_user_query_from_meta(s)
-            return extracted
-        return s
+            if extracted:
+                return _normalize_query_text(extracted)
+            return ""
+        return _normalize_query_text(s)
     return ""
 
+
+def _query_selection_debug(messages: List[dict], limit: int = 4) -> List[dict]:
+    out: List[dict] = []
+    for msg in reversed(messages or []):
+        if msg.get("role") != "user":
+            continue
+        raw = _message_text(msg.get("content", ""))
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        extracted = _extract_user_query_from_meta(raw) if _is_meta_task_text(raw) else ""
+        out.append(
+            {
+                "preview": _safe_trunc(_normalize_query_text(raw), 160),
+                "is_meta": bool(_is_meta_task_text(raw)),
+                "has_user_query": bool(extracted),
+                "extracted_preview": _safe_trunc(_normalize_query_text(extracted), 160) if extracted else "",
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
 def _effective_user_query(user_message: str, messages: List[dict]) -> str:
-    """
-    Витягує реальний запит користувача з user_message або messages.
-    Повертається до старої логіки, яка працювала стабільно.
-    """
-    question = (user_message or "").strip() or _last_user_message(messages)
-    if _is_meta_task_text(question):
+    question = (user_message or "").strip()
+    if question:
+        if not _is_meta_task_text(question):
+            return _normalize_query_text(question)
         extracted = _extract_user_query_from_meta(question)
-        return extracted if extracted else question
-    return question
+        if extracted:
+            return _normalize_query_text(extracted)
+        return ""
+    fallback = _last_user_message(messages)
+    return _normalize_query_text(fallback) if fallback else ""
 
 
 def _iter_file_objs(body: dict, messages: List[dict]) -> List[dict]:
@@ -247,6 +396,58 @@ def _safe_trunc(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + "...(truncated)"
+
+
+def _extract_json_candidate(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s:
+        return None
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", s, re.S | re.I)
+    if fence:
+        s = (fence.group(1) or "").strip()
+    if not s:
+        return None
+
+    if s.startswith("{") and s.endswith("}"):
+        return s
+
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        escaped = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return s[start : i + 1]
+        start = s.find("{", start + 1)
+    return None
+
+
+def _parse_json_dict_from_llm(text: str) -> dict:
+    s = (text or "").strip()
+    if not s:
+        raise ValueError("LLM did not return JSON")
+    candidate = _extract_json_candidate(s) or s
+    parsed = json.loads(candidate)
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM JSON root must be an object")
+    return parsed
 
 
 def _profile_fingerprint(profile: Optional[dict]) -> str:
@@ -684,6 +885,41 @@ def _has_edit_triggers(question: str) -> bool:
     return bool(_EDIT_TRIGGER_RE.search(question or ""))
 
 
+_ROUTER_MUTATING_INTENT_HINTS = (
+    "drop",
+    "delete",
+    "remove",
+    "add",
+    "insert",
+    "update",
+    "rename",
+    "edit",
+    "set",
+    "clear",
+    "fill",
+    "sort",
+    "concat",
+)
+
+
+def _router_intent_looks_mutating(intent_id: str) -> bool:
+    s = (intent_id or "").strip().lower()
+    if not s:
+        return False
+    return any(h in s for h in _ROUTER_MUTATING_INTENT_HINTS)
+
+
+def _should_reject_router_hit_for_read(has_edit: bool, analysis_code: str, router_meta: Optional[dict]) -> bool:
+    if has_edit:
+        return False
+    intent_id = str((router_meta or {}).get("intent_id") or "")
+    if _router_intent_looks_mutating(intent_id):
+        return True
+    if re.search(r"(?m)^\s*COMMIT_DF\s*=\s*True\s*$", analysis_code or ""):
+        return True
+    return _auto_detect_commit(analysis_code or "")
+
+
 _METRIC_CONTEXT_RE = re.compile(
     r"\b(value|price|amount|total|sum|qty|count|number|rows?|records?|items?|products?|sales?|revenue|profit)\b"
     r"|\b(значенн\w*|цін\w*|варт\w*|сум\w*|кільк\w*|рядк\w*|запис\w*|елемент\w*|товар\w*)\b",
@@ -742,36 +978,150 @@ def _rewrite_forbidden_getattr(code: str) -> str:
     pattern = r"getattr\(\s*([^\),]+?)\s*,\s*['\"](" + "|".join(_ALLOWED_SERIES_AGG) + r")['\"]\s*\)\s*\(\s*\)"
     return re.sub(pattern, r"\1.\2()", code)
 
+
+_ENTITY_COUNT_RE = re.compile(r"\b(скільк\w*|кільк\w*|count|number\s+of|nunique)\b", re.I)
+_ENTITY_UNIQUE_RE = re.compile(r"\b(унікальн\w*|distinct|different|unique|nunique)\b", re.I)
+_ENTITY_GROUP_RE = re.compile(r"\b(кожн\w*|each|per|group\w*|по\s+кожн\w*|за\s+кожн\w*)\b", re.I)
+_ENTITY_TOKEN_STOPWORDS = {
+    "скіл",
+    "кіль",
+    "coun",
+    "nuni",
+    "uniq",
+    "dist",
+    "diff",
+    "unik",
+    "унік",
+    "знач",
+    "data",
+    "tabl",
+    "табл",
+    "рядк",
+    "запи",
+    "яки",
+    "якi",
+    "для",
+    "про",
+}
+
+
+def _semantic_roots(text: str) -> List[str]:
+    parts = re.split(r"[^a-zа-яіїєґ0-9]+", (text or "").lower())
+    roots = [p[:4] for p in parts if len(p) >= 3]
+    return [r for r in roots if r not in _ENTITY_TOKEN_STOPWORDS]
+
+
+def _pick_relevant_column(question: str, columns: List[str]) -> Optional[str]:
+    direct = _find_column_in_text(question, columns)
+    if direct:
+        return direct
+    q_roots = set(_semantic_roots(question))
+    if not q_roots:
+        return None
+    best_col: Optional[str] = None
+    best_score = 0.0
+    for col in columns:
+        col_roots = set(_semantic_roots(str(col)))
+        if not col_roots:
+            continue
+        overlap = col_roots & q_roots
+        if not overlap:
+            continue
+        score = (2.0 * len(overlap)) - (0.35 * max(0, len(col_roots) - len(overlap)))
+        if score > best_score:
+            best_score = score
+            best_col = str(col)
+    return best_col
+
+
+def _is_entity_nunique_intent(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if not _ENTITY_COUNT_RE.search(q):
+        return False
+    if not _ENTITY_UNIQUE_RE.search(q):
+        return False
+    if _ENTITY_GROUP_RE.search(q):
+        return False
+    return True
+
+
+def _pick_nunique_column(question: str, df_profile: Optional[dict]) -> Optional[str]:
+    columns = [str(c) for c in ((df_profile or {}).get("columns") or [])]
+    if not columns:
+        return None
+    return _pick_relevant_column(question, columns)
+
+
+def _entity_nunique_code(column: str) -> str:
+    lines = [
+        f"_entity = df[{column!r}].dropna().astype(str)",
+        "_entity = _entity.str.strip()",
+        r"_entity = _entity.str.replace(r'[\s\xa0]+', ' ', regex=True)",
+        r"_entity = _entity.str.replace(r'^[\s\"\'`.,;:()\[\]{}]+|[\s\"\'`.,;:()\[\]{}]+$', '', regex=True)",
+        "_entity = _entity.str.lower()",
+        "_entity = _entity[_entity != '']",
+        "result = int(_entity.nunique())",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _enforce_entity_nunique_code(question: str, code: str, df_profile: Optional[dict]) -> str:
+    if not _is_entity_nunique_intent(question):
+        return code
+    col = _pick_nunique_column(question, df_profile)
+    if not col:
+        return code
+    guarded = _entity_nunique_code(col)
+    if (code or "").strip() == guarded.strip():
+        return code
+    logging.info("event=entity_nunique_guard applied column=%s", col)
+    return guarded
+
 def _finalize_code_for_sandbox(
     question: str,
     analysis_code: str,
     op: Optional[str]=None,
     commit_df: Optional[bool]=None,
     df_profile: Optional[dict]=None,
-) -> Tuple[str,bool]:
-    code=_normalize_generated_code(analysis_code or "")
-    code=_rewrite_forbidden_getattr(code)
+) -> Tuple[str, bool, Optional[str]]:
+    code = _normalize_generated_code(analysis_code or "")
+    code = _rewrite_forbidden_getattr(code)
     code, removed_imports = _strip_forbidden_imports(code)
     if removed_imports:
         logging.warning("event=auto_fix_import removed forbidden import statements from generated code")
-    inferred=_infer_op_from_question(question)
-    op_norm=(op or "").strip().lower()
-    if inferred=="edit": op_norm="edit"
-    elif op_norm not in ("read","edit"): op_norm=inferred
+
+    inferred = _infer_op_from_question(question)
+    op_norm = (op or "").strip().lower()
+    if op_norm not in ("read", "edit"):
+        op_norm = inferred
 
     if op_norm == "edit" or _has_edit_triggers(question):
         if re.search(r"(^|\n)\s*result\s*=\s*pd\.concat\(", code):
             code = re.sub(r"(^|\n)(\s*)result(\s*=\s*pd\.concat\()", r"\1\2df\3", code)
             logging.warning("event=auto_fix_concat replaced result=pd.concat(...) with df=pd.concat(...)")
-        if re.search(r"(^|\n)\s*result\s*=\s*df\[", code):
-            code = re.sub(
-                r"(^|\n)(\s*)result(\s*=\s*df\[)",
-                r"\1\2df\3",
-                code,
-            )
-            logging.warning("event=auto_fix_filter replaced result=df[...] with df=df[...]")
+        code, edit_err = _validate_edit_code(code)
+        if edit_err:
+            logging.warning("event=edit_degraded reason=%s", edit_err)
+            op_norm = "read"
 
     has_mutations = _auto_detect_commit(code)
+    if has_mutations and op_norm == "read":
+        if _has_edit_triggers(question):
+            op_norm = "edit"
+            logging.info("event=op_reclassified from=read to=edit reason=mutations_detected")
+        else:
+            logging.warning(
+                "event=read_mutation_blocked question_preview=%s code_preview=%s",
+                _safe_trunc(question, 200),
+                _safe_trunc(code, 300),
+            )
+            return (
+                code,
+                False,
+                "Згенерований код для read-запиту змінює таблицю. Уточніть запит як зміну даних або переформулюйте його як read без модифікацій.",
+            )
 
     if op_norm == "read" and not has_mutations:
         try:
@@ -779,31 +1129,35 @@ def _finalize_code_for_sandbox(
         except Exception:
             pass
 
-    commit_requested = bool(commit_df) if commit_df is not None else False
-    if has_mutations or op_norm == "edit":
-        if not commit_requested:
-            logging.info(
-                "event=force_commit_from_signal op=%s has_mutations=%s commit_df=%s code_preview=%s",
-                op_norm,
-                has_mutations,
-                commit_df,
-                _safe_trunc(code, 300),
-            )
+    commit_requested = bool(commit_df) if commit_df is not None else (op_norm == "edit")
+    if op_norm == "read":
+        commit_requested = False
+    if op_norm == "edit" and has_mutations and not commit_requested:
+        logging.info(
+            "event=force_commit_from_signal op=%s has_mutations=%s commit_df=%s",
+            op_norm,
+            has_mutations,
+            commit_df,
+        )
         commit_requested = True
+    if commit_requested and not has_mutations:
+        logging.info("event=commit_stripped reason=no_df_change")
+        commit_requested = False
+        op_norm = "read"
 
     if commit_requested:
         if "COMMIT_DF" not in code:
-            code=code.rstrip()+"\nCOMMIT_DF = True\n"
+            code = code.rstrip() + "\nCOMMIT_DF = True\n"
         if "result" not in code:
-            code=code.rstrip()+"\nresult = {'status': 'updated'}\n"
+            code = code.rstrip() + "\nresult = {'status': 'updated'}\n"
     else:
-        code=_strip_commit_flag(code)
+        code = _strip_commit_flag(code)
 
-    if op_norm=="read" and not has_mutations:
+    if op_norm == "read" and not has_mutations:
         if not re.search(r"(?m)^\s*df\s*=\s*df\.copy\s*\(", code):
-            code="df = df.copy()\n"+code
+            code = "df = df.copy(deep=False)\n" + code
 
-    return code, commit_requested
+    return code, commit_requested, None
 
 
 
@@ -853,14 +1207,6 @@ def _validate_edit_code(code: str) -> Tuple[str, Optional[str]]:
             code,
         )
         logging.info("event=auto_fix_concat_assignment fixed result=pd.concat to df=pd.concat")
-
-    if re.search(r"(^|\n)\s*result\s*=\s*df\[", code or ""):
-        code = re.sub(
-            r"(^|\n)(\s*)result(\s*=\s*df\[)",
-            r"\1\2df\3",
-            code,
-        )
-        logging.info("event=auto_fix_filter_assignment fixed result=df[...] to df=df[...]")
 
     if re.search(r"(^|\n)\s*result\s*=\s*df\.(drop|rename|assign|replace|fillna|sort_values|reset_index|set_index|astype|reindex|drop_duplicates|dropna)\s*\(", code or ""):
         code = re.sub(
@@ -1023,7 +1369,7 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
 
 
 def _parse_row_index(text: str) -> Optional[int]:
-    m = re.search(r"(?:рядок|рядка|row)[^\d]*(\d+)", text, re.I)
+    m = re.search(r"(?:рядок|рядка|рядку|рядком|рядці|row)[^\d]*(\d+)", text, re.I)
     if not m:
         return None
     idx = int(m.group(1))
@@ -1031,10 +1377,26 @@ def _parse_row_index(text: str) -> Optional[int]:
 
 
 def _parse_set_value(text: str) -> Optional[str]:
-    m = re.search(r"(?:на|=)\s*([^\n]+)$", text, re.I)
+    s = (text or "").strip()
+    if not s:
+        return None
+
+    # Prefer explicit numeric updates like "на 10 000 грн".
+    m_num = re.search(r"(?:на|=)\s*(-?\d[\d\s\xa0]*(?:[.,]\d+)?)\s*(?:грн|uah|₴)?\b", s, re.I)
+    if m_num:
+        return m_num.group(1).strip()
+
+    m_quoted = re.search(r"(?:на|=)\s*['\"]([^'\"]+)['\"]", s, re.I)
+    if m_quoted:
+        return m_quoted.group(1).strip()
+
+    m = re.search(r"(?:на|=)\s*([^\n]+)$", s, re.I)
     if not m:
         return None
-    return m.group(1).strip().strip("\"'")
+    value = m.group(1).strip().strip("\"'")
+    value = re.split(r"\s+(?:та|і|and)\s+", value, maxsplit=1, flags=re.I)[0]
+    value = re.split(r"\s*\(", value, maxsplit=1)[0]
+    return value.strip() or None
 
 
 def _parse_number_literal(raw: str) -> Optional[float]:
@@ -1184,30 +1546,23 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             plan = f"Показати значення клітинки в рядку {row_idx}, колонці {col}."
             return "\n".join(code_lines) + "\n", plan
 
-    # Read-only robust extractor for "price in row N": try row position first, then fallback to ID=N.
-    if re.search(r"\b(покажи|показати|show|яка|which)\b", q_low) and re.search(r"\b(цін\w*|price)\b", q_low):
+    # Read-only robust extractor for "value in row N": try row position first, then fallback to ID=N.
+    if (
+        not _has_edit_triggers(q)
+        and re.search(r"\b(покажи|показати|show|яка|який|яке|which|what|значенн\w*)\b", q_low)
+    ):
         row_idx = _parse_row_index(q)
         if row_idx:
-            col = _find_column_in_text(q, columns)
-            if not col:
-                for c in columns:
-                    cl = str(c).lower()
-                    if "цін" in cl or "price" in cl:
-                        col = c
-                        break
+            col = _pick_relevant_column(q, [str(c) for c in columns])
             if col:
-                code_lines.append("df = df.copy()")
-                code_lines.append("df = df.reset_index(drop=True)")
                 code_lines.append(f"_row_num = {row_idx}")
                 code_lines.append("_pos = _row_num - 1")
                 code_lines.append(f"_col = {col!r}")
                 code_lines.append("if 0 <= _pos < len(df):")
-                code_lines.append("    result = df.at[_pos, _col]")
-                code_lines.append("elif 'ID' in df.columns and (df['ID'] == _row_num).any():")
-                code_lines.append("    result = df.loc[df['ID'] == _row_num, _col].iloc[0]")
+                code_lines.append("    result = df.iloc[_pos][ _col ]")
                 code_lines.append("else:")
                 code_lines.append("    result = None")
-                plan = f"Показати значення {col} для рядка/ID {row_idx}."
+                plan = f"Показати значення {col} для рядка {row_idx}."
                 return "\n".join(code_lines) + "\n", plan
 
     if re.search(r"\b(очисти|clear)\b.*\b(клітин|комір|cell)\b", q_low):
@@ -1738,6 +2093,12 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
     is_add_col=bool(re.search(r"\b(додай|додати|add)\b.*\b(стовпец|стовпець|колонк|column)\b", q_low))
     is_del_col=bool(re.search(r"\b(видали|видалити|delete)\b.*\b(стовпец|стовпець|колонк|column)\b", q_low))
     is_edit_cell=bool(re.search(r"\b(зміни|змініть|редагуй|поміняй)\b.*\b(клітин|комір|cell)\b", q_low))
+    if not is_edit_cell and _has_edit_triggers(q):
+        row_idx_hint = _parse_row_index(q)
+        col_hint = _find_column_in_text(q, columns)
+        value_hint = _parse_set_value(q)
+        if row_idx_hint and col_hint and value_hint is not None:
+            is_edit_cell = True
 
     code_lines: List[str]=[]
     plan=""
@@ -1826,16 +2187,9 @@ def _choose_column_from_question(question: str, profile: dict) -> Optional[str]:
     cols = (profile or {}).get("columns") or []
     if not cols:
         return None
-    q = (question or "").lower()
-    for col in cols:
-        if isinstance(col, str) and col.lower() in q:
-            return col
-    price_markers = ("price", "цiн", "ціна", "uah", "грн")
-    if any(marker in q for marker in price_markers):
-        for col in cols:
-            col_l = str(col).lower()
-            if any(marker in col_l for marker in price_markers):
-                return col
+    picked = _pick_relevant_column(question, [str(c) for c in cols])
+    if picked:
+        return picked
     dtypes = (profile or {}).get("dtypes") or {}
     for col in cols:
         dtype = str(dtypes.get(str(col), "")).lower()
@@ -2067,6 +2421,9 @@ class Pipeline(object):
     def __init__(self) -> None:
         self.valves = self.Valves()
         logging.basicConfig(level=logging.INFO)
+        root_logger = logging.getLogger()
+        if not any(isinstance(f, _RequestTraceLoggingFilter) for f in root_logger.filters):
+            root_logger.addFilter(_RequestTraceLoggingFilter())
         self._llm = OpenAI(
             base_url=self.valves.base_llm_base_url, api_key=self.valves.base_llm_api_key or "DUMMY_KEY"
         )
@@ -2214,10 +2571,7 @@ class Pipeline(object):
         )
         text = (resp.choices[0].message.content or "").strip()
         logging.info("event=llm_json_response preview=%s", _safe_trunc(text, 1200))
-        m = re.search(r"\{.*\}", text, flags=re.S)
-        if not m:
-            raise ValueError("LLM did not return JSON")
-        return json.loads(m.group(0))
+        return _parse_json_dict_from_llm(text)
 
     def _plan_code(self, question: str, profile: dict) -> Tuple[str, str, str, Optional[bool]]:
         system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
@@ -2466,6 +2820,19 @@ class Pipeline(object):
                 pass
             return result_text 
 
+        scalar = (result_text or "").strip()
+        if scalar and "\n" not in scalar and not scalar.startswith(("{", "[", "|")):
+            row_idx = _parse_row_index(question or "")
+            columns = [str(c) for c in (profile or {}).get("columns") or []]
+            col = _pick_relevant_column(question, columns)
+            if row_idx and col:
+                return f"{col} в рядку {row_idx} — {scalar}."
+            if col:
+                return f"{col} — {scalar}."
+            if row_idx:
+                return f"Значення в рядку {row_idx} — {scalar}."
+            return scalar
+
         table = self._format_table_from_result(result_text)
         is_preview_request = bool(
             re.search(r"\b(перш\w*|head|first|покаж\w*|show|preview|прев'ю|превю)\b", q)
@@ -2485,8 +2852,7 @@ class Pipeline(object):
         wants_counts = bool(re.search(r"\b(скільк\w*|кільк\w*|count|к-?ст[ьі])\b", q))
         is_grouping = bool(
             re.search(
-                r"\b(бренд\w*|категорі\w*|brand|category|"
-                r"груп\w*|розбив\w*|розподіл\w*|структур\w*|"
+                r"\b(груп\w*|розбив\w*|розподіл\w*|структур\w*|"
                 r"by|group\w*|breakdown|distribution|segment\w*|"
                 r"по\s+\w+|за\s+\w+)\b",
                 q,
@@ -2510,7 +2876,89 @@ class Pipeline(object):
             return None
         return self._format_top_pairs_from_result(result_text, top_n=15)
 
-    def _edit_success_answer_from_result(self, result_text: str, profile: Optional[dict]) -> Optional[str]:
+    def _fmt_cell_value(self, value: Any) -> str:
+        if value is None:
+            return "порожньо"
+        text = str(value)
+        if len(text) > 80:
+            return text[:77] + "..."
+        return text
+
+    def _has_meaningful_mutation(self, mutation_summary: Optional[dict], mutation_flags: Optional[dict] = None) -> bool:
+        summary = mutation_summary if isinstance(mutation_summary, dict) else {}
+        try:
+            if int(summary.get("changed_cells_count", 0) or 0) > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if int(summary.get("added_rows", 0) or 0) > 0:
+                return True
+        except Exception:
+            pass
+        try:
+            if int(summary.get("removed_rows", 0) or 0) > 0:
+                return True
+        except Exception:
+            pass
+        added_cols = summary.get("added_columns")
+        removed_cols = summary.get("removed_columns")
+        if (isinstance(added_cols, list) and added_cols) or (isinstance(removed_cols, list) and removed_cols):
+            return True
+        flags = mutation_flags if isinstance(mutation_flags, dict) else {}
+        if bool(flags.get("committed")):
+            return True
+        if bool(flags.get("auto_committed")):
+            return True
+        if bool(flags.get("structure_changed")):
+            return True
+        if bool(flags.get("profile_changed")):
+            return True
+        return False
+
+    def _edit_success_answer_from_result(
+        self, result_text: str, profile: Optional[dict], mutation_summary: Optional[dict] = None
+    ) -> Optional[str]:
+        summary = mutation_summary if isinstance(mutation_summary, dict) else {}
+        changed_cells = summary.get("changed_cells") if isinstance(summary.get("changed_cells"), list) else []
+        changed_count = summary.get("changed_cells_count")
+        try:
+            changed_count_int = int(changed_count)
+        except Exception:
+            changed_count_int = len(changed_cells)
+        if changed_cells:
+            first = changed_cells[0] if isinstance(changed_cells[0], dict) else {}
+            row = first.get("row")
+            col = first.get("column")
+            old_value = self._fmt_cell_value(first.get("old_value"))
+            new_value = self._fmt_cell_value(first.get("new_value"))
+            base = "Оновлено"
+            if row is not None and col:
+                base = f"Оновлено: рядок {row}, колонка {col}, було {old_value}, стало {new_value}."
+            elif col:
+                base = f"Оновлено: колонка {col}, було {old_value}, стало {new_value}."
+            elif row is not None:
+                base = f"Оновлено: рядок {row}, було {old_value}, стало {new_value}."
+            if changed_count_int > 1:
+                return f"{base} Змінено комірок: {changed_count_int}."
+            return base
+
+        added_rows = int(summary.get("added_rows", 0) or 0)
+        removed_rows = int(summary.get("removed_rows", 0) or 0)
+        added_cols = summary.get("added_columns") if isinstance(summary.get("added_columns"), list) else []
+        removed_cols = summary.get("removed_columns") if isinstance(summary.get("removed_columns"), list) else []
+        shape_changes: List[str] = []
+        if added_rows:
+            shape_changes.append(f"додано рядків: {added_rows}")
+        if removed_rows:
+            shape_changes.append(f"видалено рядків: {removed_rows}")
+        if added_cols:
+            shape_changes.append("додано колонки: " + ", ".join(str(x) for x in added_cols[:5]))
+        if removed_cols:
+            shape_changes.append("видалено колонки: " + ", ".join(str(x) for x in removed_cols[:5]))
+        if shape_changes:
+            return "Оновлено: " + "; ".join(shape_changes) + "."
+
         text = (result_text or "").strip()
         if not text:
             return None
@@ -2549,24 +2997,52 @@ class Pipeline(object):
         profile: dict,
         plan: str,
         code: str,
+        edit_expected: bool,
         run_status: str,
         stdout: str,
         result_text: str,
         result_meta: dict,
+        mutation_summary: Optional[dict],
+        mutation_flags: Optional[dict],
         error: str,
     ) -> str:
-        if run_status == "ok" and "COMMIT_DF = True" in (code or "") and not error:
-            edit_answer = self._edit_success_answer_from_result(result_text, profile)
+        def _log_return(mode: str, text: str) -> None:
+            logging.info("event=final_answer_return mode=%s preview=%s", mode, _safe_trunc(text, 300))
+
+        if run_status == "ok" and edit_expected and "COMMIT_DF = True" in (code or "") and not error:
+            has_mutation = self._has_meaningful_mutation(mutation_summary, mutation_flags)
+            logging.info(
+                "event=edit_answer_attempt has_mutation=%s summary_preview=%s flags=%s",
+                has_mutation,
+                _safe_trunc(mutation_summary, 400),
+                _safe_trunc(mutation_flags, 400),
+            )
+            if not has_mutation:
+                msg = "Запит виконано, але фактичних змін у таблиці не виявлено."
+                _log_return("edit_no_mutation", msg)
+                return msg
+            edit_answer = self._edit_success_answer_from_result(result_text, profile, mutation_summary=mutation_summary)
+            logging.info(
+                "event=edit_answer_generated has_answer=%s preview=%s",
+                bool(edit_answer),
+                _safe_trunc(edit_answer or "", 300),
+            )
             if edit_answer:
+                _log_return("edit_success", edit_answer)
                 return edit_answer
             rows = (profile or {}).get("rows")
             cols = (profile or {}).get("cols")
             if isinstance(rows, int) and isinstance(cols, int):
-                return f"Оновлено. Тепер у таблиці {rows} рядків і {cols} стовпців."
-            return "Оновлено таблицю."
+                msg = f"Оновлено. Тепер у таблиці {rows} рядків і {cols} стовпців."
+                _log_return("edit_fallback", msg)
+                return msg
+            msg = "Оновлено таблицю."
+            _log_return("edit_fallback", msg)
+            return msg
         deterministic = self._deterministic_answer(question, result_text, profile)
         if deterministic:
             logging.info("event=final_answer mode=deterministic preview=%s", _safe_trunc(deterministic, 300))
+            _log_return("deterministic", deterministic)
             return deterministic
         system = self._prompts.get("final_answer_system", DEFAULT_FINAL_ANSWER_SYSTEM)
         payload = {
@@ -2618,11 +3094,15 @@ class Pipeline(object):
                         rewrite_numbers = set(re.findall(r"\d+", rewrite))
                         if not rewrite_numbers or (real_numbers & rewrite_numbers):
                             logging.info("event=final_answer mode=rewrite preview=%s", _safe_trunc(rewrite, 300))
+                            _log_return("rewrite", rewrite)
                             return rewrite
                 except Exception as exc:
                     logging.warning("event=final_rewrite_failed err=%s", str(exc))
-                return "Не можу безпечно сформувати відповідь. Спробуйте уточнити запит."
+                msg = "Не можу безпечно сформувати відповідь. Спробуйте уточнити запит."
+                _log_return("unsafe_numbers", msg)
+                return msg
         logging.info("event=final_answer mode=llm preview=%s", _safe_trunc(answer, 300))
+        _log_return("llm", answer)
         return answer
 
     def _emit(
@@ -2715,13 +3195,32 @@ class Pipeline(object):
     def _pipe_sync(
         self, user_message: str, model_id: str, messages: List[dict], body: dict, event_emitter: Any
     ) -> str:
+        request_id, trace_id = _extract_request_trace_ids(body)
+        request_token = _REQUEST_ID_CTX.set(request_id)
+        trace_token = _TRACE_ID_CTX.set(trace_id)
         try:
+            logging.info("event=request_context mode=sync")
             self._emit(event_emitter, "start", {"model_id": model_id, "has_messages": bool(messages)})
             
             question = _effective_user_query(user_message, messages)
+            user_preview = _safe_trunc(_normalize_query_text(user_message or ""), 200)
+            logging.info(
+                "event=query_selection incoming_preview=%s selected_preview=%s selected_empty=%s",
+                user_preview,
+                _safe_trunc(question, 200),
+                not bool(question),
+            )
+            if self.valves.debug:
+                logging.info("event=query_selection_tail payload=%s", _safe_trunc(_query_selection_debug(messages), 1200))
             if not question:
-                logging.info("event=skip_meta_task_sync reason=no_user_query_found")
+                raw_user_message = (user_message or "").strip()
+                reason = "meta_without_user_query" if _is_meta_task_text(raw_user_message) else "no_user_query_found"
+                logging.info("event=skip_meta_task_sync reason=%s", reason)
                 self._emit(event_emitter, "final_answer", {"status": "skipped_no_user_query"})
+                return ""
+            if _is_search_query_meta_task(question):
+                logging.info("event=skip_meta_task_sync reason=search_query_meta_task")
+                self._emit(event_emitter, "final_answer", {"status": "skipped_meta_task"})
                 return ""
 
             logging.info("event=question_selected source=effective_user_query preview=%s", _safe_trunc(question, 200))
@@ -2771,19 +3270,31 @@ class Pipeline(object):
             op = None
             commit_df = None
             
-            router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
+            has_edit = _has_edit_triggers(question)
+            router_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
             shortcut = None
             router_meta: Dict[str, Any] = {}
 
             if router_hit:
-                analysis_code, router_meta = router_hit
-                plan = f"retrieval_intent:{router_meta.get('intent_id')}"
-                logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
-            else:
-                logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
+                candidate_code, candidate_meta = router_hit
+                if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta):
+                    logging.warning(
+                        "event=shortcut_router status=rejected reason=mutating_for_read intent_id=%s question=%s",
+                        (candidate_meta or {}).get("intent_id"),
+                        _safe_trunc(question, 200),
+                    )
+                    router_hit = None
+                else:
+                    analysis_code, router_meta = candidate_code, candidate_meta
+                    plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+                    logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
+            if not router_hit:
+                if has_edit:
+                    logging.info("event=shortcut_router status=skipped reason=edit_intent")
+                else:
+                    logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
                 metrics = _detect_metrics(question)
                 is_meta = _is_meta_task_text(question)
-                has_edit = _has_edit_triggers(question)
                 inferred_op = _infer_op_from_question(question)
 
                 if inferred_op == "read" and not is_meta and not has_edit and len(metrics) >= 2:
@@ -2817,18 +3328,17 @@ class Pipeline(object):
             analysis_code, count_err = _enforce_count_code(question, analysis_code)
             if count_err:
                 return f"Неможливо виконати запит: {count_err}"
+            analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
             
-            analysis_code, edit_expected = _finalize_code_for_sandbox(
+            analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
                 question, analysis_code, op, commit_df, df_profile=profile
             )
+            if finalize_err:
+                self._emit(event_emitter, "final_answer", {"status": "invalid_read_mutation"})
+                return f"Неможливо виконати запит: {finalize_err}"
             if _has_forbidden_import_nodes(analysis_code):
                 self._emit(event_emitter, "final_answer", {"status": "invalid_import"})
                 return "Неможливо виконати запит: згенерований код містить заборонений import."
-            if edit_expected:
-                analysis_code, edit_err = _validate_edit_code(analysis_code)
-                if edit_err:
-                    self._emit(event_emitter, "final_answer", {"status": "invalid_edit_code"})
-                    return f"Неможливо виконати запит: {edit_err}"
             analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
             
             analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
@@ -2900,10 +3410,18 @@ class Pipeline(object):
                     profile=profile,
                     plan=plan,
                     code=analysis_code,
+                    edit_expected=edit_expected,
                     run_status=run_status,
                     stdout=run_resp.get("stdout", ""),
                     result_text=run_resp.get("result_text", ""),
                     result_meta=run_resp.get("result_meta", {}) or {},
+                    mutation_summary=run_resp.get("mutation_summary", {}) or {},
+                    mutation_flags={
+                        "committed": was_committed,
+                        "auto_committed": auto_committed,
+                        "structure_changed": structure_changed,
+                        "profile_changed": profile_changed,
+                    },
                     error=run_resp.get("error", ""),
                 )
             finally:
@@ -2917,10 +3435,33 @@ class Pipeline(object):
             except Exception:
                 pass
             return f"Сталася помилка в пайплайні: {type(exc).__name__}: {exc}\n\n{tb}"
+        finally:
+            _REQUEST_ID_CTX.reset(request_token)
+            _TRACE_ID_CTX.reset(trace_token)
 
     def _pipe_stream(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Generator[str, None, None]:
+        inner = self._pipe_stream_inner(user_message, model_id, messages, body)
+        stream_ctx = contextvars.copy_context()
+        try:
+            while True:
+                try:
+                    yield stream_ctx.run(next, inner)
+                except StopIteration:
+                    return
+        finally:
+            try:
+                stream_ctx.run(inner.close)
+            except Exception:
+                pass
+
+    def _pipe_stream_inner(
+        self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Generator[str, None, None]:
+        request_id, trace_id = _extract_request_trace_ids(body)
+        request_token = _REQUEST_ID_CTX.set(request_id)
+        trace_token = _TRACE_ID_CTX.set(trace_id)
         status_queue: List[str] = []
 
         def emit(event: str, payload: Dict[str, Any]) -> None:
@@ -2931,13 +3472,30 @@ class Pipeline(object):
                 yield status_queue.pop(0)
 
         try:
+            logging.info("event=request_context mode=stream")
             emit("start", {"model_id": model_id, "has_messages": bool(messages)})
             yield from drain()
 
             question = _effective_user_query(user_message, messages)
+            user_preview = _safe_trunc(_normalize_query_text(user_message or ""), 200)
+            logging.info(
+                "event=query_selection incoming_preview=%s selected_preview=%s selected_empty=%s",
+                user_preview,
+                _safe_trunc(question, 200),
+                not bool(question),
+            )
+            if self.valves.debug:
+                logging.info("event=query_selection_tail payload=%s", _safe_trunc(_query_selection_debug(messages), 1200))
             if not question:
-                logging.info("event=skip_meta_task_stream reason=no_user_query_found")
+                raw_user_message = (user_message or "").strip()
+                reason = "meta_without_user_query" if _is_meta_task_text(raw_user_message) else "no_user_query_found"
+                logging.info("event=skip_meta_task_stream reason=%s", reason)
                 emit("final_answer", {"status": "skipped_no_user_query"})
+                yield from drain()
+                return
+            if _is_search_query_meta_task(question):
+                logging.info("event=skip_meta_task_stream reason=search_query_meta_task")
+                emit("final_answer", {"status": "skipped_meta_task"})
                 yield from drain()
                 return
 
@@ -2993,17 +3551,28 @@ class Pipeline(object):
             op = None
             commit_df = None
             
-            router_hit = self._shortcut_router.shortcut_to_sandbox_code(question, profile)
+            has_edit = _has_edit_triggers(question)
+            router_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
             shortcut = None
             router_meta: Dict[str, Any] = {}
 
             if router_hit:
-                analysis_code, router_meta = router_hit
-                plan = f"retrieval_intent:{router_meta.get('intent_id')}"
-            else:
+                candidate_code, candidate_meta = router_hit
+                if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta):
+                    logging.warning(
+                        "event=shortcut_router status=rejected reason=mutating_for_read intent_id=%s question=%s",
+                        (candidate_meta or {}).get("intent_id"),
+                        _safe_trunc(question, 200),
+                    )
+                    router_hit = None
+                else:
+                    analysis_code, router_meta = candidate_code, candidate_meta
+                    plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+            if not router_hit:
+                if has_edit:
+                    logging.info("event=shortcut_router status=skipped reason=edit_intent")
                 metrics = _detect_metrics(question)
                 is_meta = _is_meta_task_text(question)
-                has_edit = _has_edit_triggers(question)
                 inferred_op = _infer_op_from_question(question)
 
                 if inferred_op == "read" and not is_meta and not has_edit and len(metrics) >= 2:
@@ -3040,22 +3609,21 @@ class Pipeline(object):
                 yield from drain()
                 yield f"Неможливо виконати: {count_err}"
                 return
+            analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
             
-            analysis_code, edit_expected = _finalize_code_for_sandbox(
+            analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
                 question, analysis_code, op, commit_df, df_profile=profile
             )
+            if finalize_err:
+                emit("final_answer", {"status": "invalid_read_mutation"})
+                yield from drain()
+                yield f"Неможливо виконати: {finalize_err}"
+                return
             if _has_forbidden_import_nodes(analysis_code):
                 emit("final_answer", {"status": "invalid_import"})
                 yield from drain()
                 yield "Неможливо виконати: згенерований код містить заборонений import."
                 return
-            if edit_expected:
-                analysis_code, edit_err = _validate_edit_code(analysis_code)
-                if edit_err:
-                    emit("final_answer", {"status": "invalid_edit_code"})
-                    yield from drain()
-                    yield f"Неможливо виконати: {edit_err}"
-                    return
             analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
             analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
             
@@ -3121,10 +3689,18 @@ class Pipeline(object):
                 profile=profile,
                 plan=plan,
                 code=analysis_code,
+                edit_expected=edit_expected,
                 run_status=run_status,
                 stdout=run_resp.get("stdout", ""),
                 result_text=run_resp.get("result_text", ""),
                 result_meta=run_resp.get("result_meta", {}) or {},
+                mutation_summary=run_resp.get("mutation_summary", {}) or {},
+                mutation_flags={
+                    "committed": was_committed,
+                    "auto_committed": auto_committed,
+                    "structure_changed": structure_changed,
+                    "profile_changed": profile_changed,
+                },
                 error=run_resp.get("error", ""),
             )
 
@@ -3134,6 +3710,9 @@ class Pipeline(object):
             emit("error", {"error": str(exc)})
             yield from drain()
             yield f"Pipeline error: {type(exc).__name__}: {exc}\n\n{tb}"
+        finally:
+            _REQUEST_ID_CTX.reset(request_token)
+            _TRACE_ID_CTX.reset(trace_token)
 
 
 pipeline = Pipeline()

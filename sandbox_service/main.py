@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import uuid
 import traceback
@@ -223,6 +224,80 @@ def _result_meta(result: Any) -> dict:
     return {}
 
 
+def _to_jsonable_cell(value: Any, max_len: int = 120) -> Any:
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    if hasattr(value, "item"):
+        try:
+            value = value.item()
+        except Exception:
+            pass
+    if isinstance(value, str):
+        return _safe_trunc(value, max_len)
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _safe_trunc(str(value), max_len)
+
+
+def _mutation_summary(
+    df_before: pd.DataFrame,
+    df_after: pd.DataFrame,
+    max_changes: int = 8,
+    max_cells_for_full_diff: int = 2_000_000,
+) -> dict:
+    rows_before = int(df_before.shape[0])
+    rows_after = int(df_after.shape[0])
+    cols_before = [str(c) for c in df_before.columns]
+    cols_after = [str(c) for c in df_after.columns]
+    summary = {
+        "rows_before": rows_before,
+        "rows_after": rows_after,
+        "added_rows": max(0, rows_after - rows_before),
+        "removed_rows": max(0, rows_before - rows_after),
+        "added_columns": [c for c in cols_after if c not in cols_before],
+        "removed_columns": [c for c in cols_before if c not in cols_after],
+        "changed_cells_count": 0,
+        "changed_cells": [],
+    }
+
+    cols_after_set = set(cols_after)
+    common_cols = [c for c in cols_before if c in cols_after_set]
+    common_rows = min(rows_before, rows_after)
+    if common_rows <= 0 or not common_cols:
+        return summary
+    if common_rows * len(common_cols) > max_cells_for_full_diff:
+        return summary
+
+    try:
+        left = df_before.iloc[:common_rows][common_cols]
+        right = df_after.iloc[:common_rows][common_cols]
+        neq = ~(left.eq(right) | (left.isna() & right.isna()))
+        matrix = neq.to_numpy()
+        changed_count = int(matrix.sum())
+        summary["changed_cells_count"] = changed_count
+        if changed_count <= 0:
+            return summary
+        coords = np.argwhere(matrix)
+        out = []
+        for r, c in coords[:max_changes]:
+            col = common_cols[int(c)]
+            out.append(
+                {
+                    "row": int(r) + 1,
+                    "column": str(col),
+                    "old_value": _to_jsonable_cell(left.iat[int(r), int(c)]),
+                    "new_value": _to_jsonable_cell(right.iat[int(r), int(c)]),
+                }
+            )
+        summary["changed_cells"] = out
+    except Exception:
+        return summary
+    return summary
+
+
 def _render_result(result: Any, preview_rows: int, max_cell_chars: int, max_result_chars: int) -> str:
     if result is None:
         return ""
@@ -262,7 +337,7 @@ def _run_code(
     max_cell_chars: int,
     max_stdout_chars: int,
     max_result_chars: int,
-) -> Tuple[str, str, str, dict, str, Optional[pd.DataFrame], bool, bool, bool, bool]:
+) -> Tuple[str, str, str, dict, str, dict, Optional[pd.DataFrame], bool, bool, bool, bool]:
     _ast_guard(code)
 
     def worker(queue: multiprocessing.Queue) -> None:
@@ -293,6 +368,7 @@ def _run_code(
             "df": df,
             "pd": pd,
             "np": np,
+            "re": re,
             "__builtins__": safe_builtins,
         }
         try:
@@ -339,6 +415,9 @@ def _run_code(
 
             effective_commit = bool(commit_flag or auto_commit_flag)
             df_out = df_after if effective_commit and isinstance(df_after, pd.DataFrame) else None
+            mutation_summary = {}
+            if effective_commit and isinstance(df_after, pd.DataFrame):
+                mutation_summary = _mutation_summary(df_before, df_after)
             queue.put(
                 (
                     "ok",
@@ -346,6 +425,7 @@ def _run_code(
                     result_text,
                     result_meta,
                     "",
+                    mutation_summary,
                     df_out,
                     commit_flag,
                     undo_flag,
@@ -355,7 +435,7 @@ def _run_code(
             )
         except Exception as exc:
             queue.put(
-                ("err", stdout.getvalue(), "", {}, f"{type(exc).__name__}: {exc}", None, False, False, False, False)
+                ("err", stdout.getvalue(), "", {}, f"{type(exc).__name__}: {exc}", {}, None, False, False, False, False)
             )
 
     if hasattr(multiprocessing, "get_context"):
@@ -372,12 +452,24 @@ def _run_code(
     if proc.is_alive():
         proc.terminate()
         proc.join(1)
-        return ("timeout", "", "", {}, f"Timeout after {timeout_s}s", None, False, False, False, False)
+        return ("timeout", "", "", {}, f"Timeout after {timeout_s}s", {}, None, False, False, False, False)
     if queue.empty():
-        return ("err", "", "", {}, "NoResult", None, False, False, False, False)
-    status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = queue.get()
+        return ("err", "", "", {}, "NoResult", {}, None, False, False, False, False)
+    status, stdout, result_text, result_meta, err, mutation_summary, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = queue.get()
     stdout = _safe_trunc(stdout, max_stdout_chars)
-    return status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed
+    return (
+        status,
+        stdout,
+        result_text,
+        result_meta,
+        err,
+        mutation_summary,
+        df_out,
+        commit_flag,
+        undo_flag,
+        auto_commit_flag,
+        structure_changed,
+    )
 
 
 @app.get("/health")
@@ -455,7 +547,7 @@ def run_code(req: RunRequest, request: Request) -> dict:
     max_result_chars = req.max_result_chars or DEF_MAX_RESULT_CHARS
 
     try:
-        status, stdout, result_text, result_meta, err, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = _run_code(
+        status, stdout, result_text, result_meta, err, mutation_summary, df_out, commit_flag, undo_flag, auto_commit_flag, structure_changed = _run_code(
             req.code,
             entry["df"],
             timeout_s,
@@ -514,6 +606,7 @@ def run_code(req: RunRequest, request: Request) -> dict:
         "stdout": stdout,
         "result_text": result_text,
         "result_meta": result_meta,
+        "mutation_summary": mutation_summary,
         "error": err,
         "profile": entry.get("profile"),
         "committed": was_committed,

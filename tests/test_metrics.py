@@ -1,6 +1,6 @@
 import pytest
 
-from pipelines.spreadsheet_analyst_pipeline import _detect_metrics, _has_edit_triggers
+from pipelines.spreadsheet_analyst_pipeline import _detect_metrics, _enforce_entity_nunique_code, _has_edit_triggers
 
 
 def test_detect_metrics_ukr_mean_min_max_order():
@@ -58,3 +58,25 @@ def test_metrics_log_sorted_stable():
 def test_has_edit_triggers():
     assert _has_edit_triggers("зміни значення в комірці") is True
     assert _has_edit_triggers("порахуй кількість рядків") is False
+
+
+def test_enforce_entity_nunique_prefers_model_column() -> None:
+    profile = {"columns": ["ID", "Марка машин", "Модель"]}
+    code = "result = len(df['Марка машин'].dropna().unique())\n"
+    guarded = _enforce_entity_nunique_code("Скільки унікальних моделей у таблиці?", code, profile)
+    assert "df['Модель']" in guarded
+    assert ".nunique()" in guarded
+
+
+def test_enforce_entity_nunique_matches_semantic_column() -> None:
+    profile = {"columns": ["ID", "Марка машин", "Модель"]}
+    code = "result = 0\n"
+    guarded = _enforce_entity_nunique_code("Скільки унікальних марок авто?", code, profile)
+    assert "df['Марка машин']" in guarded
+
+
+def test_enforce_entity_nunique_skips_grouped_requests() -> None:
+    profile = {"columns": ["Brand", "Model"]}
+    code = "result = df['Brand'].value_counts().to_dict()\n"
+    guarded = _enforce_entity_nunique_code("Покажи кількість для кожного бренду", code, profile)
+    assert guarded == code
