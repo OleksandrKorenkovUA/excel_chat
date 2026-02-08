@@ -64,7 +64,9 @@ class ShortcutRouter:
             return None
 
         columns = [str(c) for c in (profile or {}).get("columns") or []]
-        slots = self._fill_slots(intent, q, columns, profile)
+        intent, preset_slots = self._resolve_intent_and_slots(intent, q, columns, profile)
+        intent_id = str(intent.get("id") or intent_id)
+        slots = self._fill_slots(intent, q, columns, profile, preset_slots=preset_slots)
         if slots is None:
             return None
 
@@ -190,9 +192,14 @@ class ShortcutRouter:
         return arr
 
     def _fill_slots(
-        self, intent: Dict[str, Any], query: str, columns: List[str], profile: Dict[str, Any]
+        self,
+        intent: Dict[str, Any],
+        query: str,
+        columns: List[str],
+        profile: Dict[str, Any],
+        preset_slots: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        slots = {}
+        slots: Dict[str, Any] = dict(preset_slots or {})
         spec = intent.get("slots") or {}
         for name, cfg in spec.items():
             if name in slots:
@@ -209,6 +216,102 @@ class ShortcutRouter:
             if val is not None:
                 slots[name] = val
         return slots
+
+    def _resolve_intent_and_slots(
+        self,
+        intent: Dict[str, Any],
+        query: str,
+        columns: List[str],
+        profile: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        intent_id = str(intent.get("id") or "")
+        if intent_id not in {"groupby_count", "groupby_agg"}:
+            return intent, {}
+        llm_slots = self._llm_groupby_slots(query, columns, profile)
+        if not llm_slots:
+            return intent, {}
+
+        agg = str(llm_slots.get("agg") or "").strip().lower()
+        resolved_intent = intent
+        if agg and agg != "count" and "groupby_agg" in self._intents:
+            resolved_intent = self._intents["groupby_agg"]
+        elif agg == "count" and "groupby_count" in self._intents:
+            resolved_intent = self._intents["groupby_count"]
+
+        preset: Dict[str, Any] = {}
+        group_col = llm_slots.get("group_col")
+        target_col = llm_slots.get("target_col")
+        top_n = llm_slots.get("top_n")
+        if isinstance(group_col, str) and group_col in columns:
+            preset["group_col"] = group_col
+        if isinstance(target_col, str) and target_col in columns:
+            preset["target_col"] = target_col
+        if agg in {"sum", "mean", "min", "max"}:
+            preset["agg"] = agg
+        if isinstance(top_n, int) and top_n > 0:
+            preset["top_n"] = top_n
+        if "top_n" not in preset:
+            parsed_top = self._extract_top_n(query)
+            if parsed_top and parsed_top > 0:
+                preset["top_n"] = parsed_top
+        logging.info(
+            "event=shortcut_router_groupby_resolve intent_from=%s intent_to=%s slots=%s",
+            intent_id,
+            str(resolved_intent.get("id") or ""),
+            json.dumps(preset, ensure_ascii=False),
+        )
+        return resolved_intent, preset
+
+    def _llm_groupby_slots(self, query: str, columns: List[str], profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not self._llm_json or not columns:
+            return None
+        system = (
+            "You map spreadsheet group-by questions to execution slots. "
+            "Return ONLY JSON with keys: group_col, target_col, agg, top_n. "
+            "group_col and target_col must be exact names from columns or empty string. "
+            "agg must be one of: count, sum, mean, min, max. "
+            "Use agg='count' when user asks to count records per group. "
+            "Use agg='sum' when user asks total quantity/amount per group."
+        )
+        payload = {
+            "query": query,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "rows": (profile or {}).get("rows"),
+            "preview": (profile or {}).get("preview") or [],
+        }
+        try:
+            res = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return None
+        if not isinstance(res, dict):
+            return None
+        out: Dict[str, Any] = {}
+        group_col = res.get("group_col")
+        target_col = res.get("target_col")
+        agg = str(res.get("agg") or "").strip().lower()
+        top_n = res.get("top_n")
+        if isinstance(group_col, str):
+            out["group_col"] = group_col.strip()
+        if isinstance(target_col, str):
+            out["target_col"] = target_col.strip()
+        if agg in {"count", "sum", "mean", "min", "max"}:
+            out["agg"] = agg
+        if isinstance(top_n, (int, float)):
+            out["top_n"] = int(top_n)
+        elif isinstance(top_n, str) and top_n.strip().isdigit():
+            out["top_n"] = int(top_n.strip())
+        return out or None
+
+    def _extract_top_n(self, query: str) -> int:
+        q = (query or "").lower()
+        m = re.search(r"(?:top|топ)\s*[-–]?\s*(\d+)", q, re.I)
+        if m:
+            return int(m.group(1))
+        m = re.search(r"\b(\d+)\b", q)
+        if m and re.search(r"(?:top|топ)", q, re.I):
+            return int(m.group(1))
+        return 0
 
     def _slot_from_llm(
         self,
@@ -373,9 +476,10 @@ class ShortcutRouter:
                 if col:
                     code_lines.append(f"result = int(df[{col!r}].isna().sum())")
                 else:
-                    code_lines.append("result = df.isna().sum().to_dict()")
+                    code_lines.append("result = df.isna().sum()")
                     if top_n > 0:
-                        code_lines.append("result = dict(sorted(result.items(), key=lambda kv: kv[1], reverse=True)[:%d])" % top_n)
+                        code_lines.append(f"result = result.sort_values(ascending=False).head({top_n})")
+                    code_lines.append("result = result.to_dict()")
             elif op == "stats_nunique":
                 col = slots.get("column")
                 if col:
@@ -391,26 +495,34 @@ class ShortcutRouter:
             elif op == "groupby_count":
                 group_col = slots.get("group_col")
                 out_col = slots.get("out_col") or "count"
-                sort = bool(slots.get("sort", True))
+                sort_mode = str(slots.get("sort") or "desc").strip().lower()
                 top_n = int(slots.get("top_n") or 0)
                 if not group_col:
                     return None
                 code_lines.append(
                     f"result = df.groupby({group_col!r}).size().reset_index(name={out_col!r})"
                 )
-                if sort:
-                    code_lines.append(f"result = result.sort_values({out_col!r}, ascending=False)")
+                if sort_mode != "none":
+                    asc = "True" if sort_mode == "asc" else "False"
+                    code_lines.append(f"result = result.sort_values({out_col!r}, ascending={asc})")
                 if top_n > 0:
                     code_lines.append(f"result = result.head({top_n})")
             elif op == "groupby_agg":
                 group_col = slots.get("group_col")
                 target_col = slots.get("target_col")
                 agg = slots.get("agg") or "sum"
+                top_n = int(slots.get("top_n") or 0)
+                out_col = slots.get("out_col")
+                if not out_col:
+                    out_col = str(target_col) if target_col else "value"
                 if not group_col or not target_col:
                     return None
                 code_lines.append(
-                    f"result = df.groupby({group_col!r})[{target_col!r}].agg({agg!r}).reset_index()"
+                    f"result = df.groupby({group_col!r})[{target_col!r}].agg({agg!r}).reset_index(name={out_col!r})"
                 )
+                code_lines.append(f"result = result.sort_values({out_col!r}, ascending=False)")
+                if top_n > 0:
+                    code_lines.append(f"result = result.head({top_n})")
             elif op == "filter_equals":
                 col = slots.get("column")
                 val = slots.get("value")

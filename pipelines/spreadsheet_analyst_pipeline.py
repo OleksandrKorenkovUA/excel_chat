@@ -30,9 +30,15 @@ PROMPTS_PATH = _LOCAL_PROMPTS if os.path.exists(_LOCAL_PROMPTS) else os.path.joi
 DEFAULT_PLAN_CODE_SYSTEM = (
     "You write pandas code to answer questions about a DataFrame named df. "
     "Return ONLY valid JSON with keys: analysis_code, short_plan, op, commit_df. "
+    "CRITICAL: The FINAL value MUST be assigned to variable named 'result'. "
+    "NEVER use custom final variable names like 'total_value', 'sum_price', 'avg_qty'. "
+    "ALWAYS use: result = <your calculation>. "
+    "For read queries that compute total via product of two columns and sum (e.g., colA * colB).sum(), "
+    "ignore synthetic summary rows with missing identifiers/metadata. "
     "op must be 'edit' if the user asks to modify data (delete, add, rename, update values), otherwise 'read'. "
     "commit_df must be true when DataFrame is modified, otherwise false. "
     "CRITICAL: NO IMPORTS ALLOWED. Do NOT write any import statements (import/from). "
+    "CRITICAL: DO NOT USE lambda expressions. "
     "pd and np are already available in the execution environment. "
     "CRITICAL: For op='edit', your analysis_code MUST ALWAYS include these lines at the end:\n"
     "COMMIT_DF = True\n"
@@ -97,7 +103,11 @@ DEFAULT_FINAL_REWRITE_SYSTEM = (
     "If result_text is empty or unclear, say that the result is unclear and ask the user to уточнити запит."
 )
 
-SHORTCUT_COL_PLACEHOLDER = "__SHORTCUT_COL__"
+SHORTCUT_COL_PLACEHOLDER = "_SHORTCUT_COL_"
+GROUP_COL_PLACEHOLDER = "__GROUP_COL__"
+SUM_COL_PLACEHOLDER = "__SUM_COL__"
+AGG_COL_PLACEHOLDER = "__AGG_COL__"
+TOP_N_PLACEHOLDER = "__TOP_N__"
 
 _REQUEST_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_request_id", default="-")
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_trace_id", default="-")
@@ -576,159 +586,88 @@ def _strip_commit_flag(code: str) -> str:
         lines.append(line)
     return "\n".join(lines) + ("\n" if code.endswith("\n") else "")
 
-def _harden_common_read_patterns(code: str, df_profile: Optional[dict]) -> str:
+
+def _has_result_assignment(code: str) -> bool:
+    return bool(re.search(r"(?m)^\s*result\s*=", code or ""))
+
+
+def _ensure_result_variable(code: str) -> Tuple[str, bool, bool]:
+    """
+    Ensure final read value is assigned to `result`.
+    Returns: (new_code, was_fixed, has_result_assignment).
+    """
     if not (code or "").strip():
-        return code
+        return code, False, False
+    if _has_result_assignment(code):
+        return code, False, True
 
-    # 1) Guard ".iloc[0]" on filtered selections (avoid IndexError).
-    #    result = df.loc[COND, 'Ціна_UAH'].iloc[0]
-    #    ->
-    #    __tmp_result_series = df.loc[COND, 'Ціна_UAH']
-    #    result = __tmp_result_series.iloc[0] if len(__tmp_result_series) else None
-    try:
-        tree = ast.parse(code)
-    except Exception:
-        return code
+    lines = (code or "").splitlines()
+    last_assignment_idx = -1
+    last_var_name: Optional[str] = None
+    skip_vars = {
+        "df",
+        "COMMIT_DF",
+        "UNDO",
+        "pd",
+        "np",
+        "re",
+    }
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        m = re.match(r"^([A-Za-z_]\w*)\s*=\s*.+$", stripped)
+        if not m:
+            continue
+        var_name = m.group(1)
+        if var_name in skip_vars or var_name.startswith("_"):
+            continue
+        last_assignment_idx = i
+        last_var_name = var_name
 
-    columns = set((df_profile or {}).get("columns") or [])
-
-    def _df_column_name(node: ast.AST) -> Optional[str]:
-        if isinstance(node, ast.Subscript):
-            if isinstance(node.value, ast.Name) and node.value.id == "df":
-                sl = node.slice
-                if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
-                    return sl.value
-                if hasattr(ast, "Index") and isinstance(sl, ast.Index) and isinstance(sl.value, ast.Constant) and isinstance(sl.value.value, str):
-                    return sl.value.value
-        if isinstance(node, ast.Attribute):
-            if isinstance(node.value, ast.Name) and node.value.id == "df":
-                return node.attr
-        return None
-
-    def _is_literal(node: ast.AST) -> bool:
-        return isinstance(node, ast.Constant) and isinstance(node.value, (str, int, float, bool))
-
-    def _make_safe_eq(series_node: ast.AST, literal_node: ast.AST) -> ast.Call:
-        return ast.Call(
-            func=ast.Name(id="__safe_eq", ctx=ast.Load()),
-            args=[series_node, literal_node],
-            keywords=[],
+    if last_assignment_idx >= 0 and last_var_name:
+        old_line = lines[last_assignment_idx]
+        new_line = re.sub(
+            rf"^(\s*){re.escape(last_var_name)}\s*=",
+            r"\1result =",
+            old_line,
+            count=1,
         )
+        lines[last_assignment_idx] = new_line
+        logging.warning(
+            "event=auto_fix_result_variable old_var=%s line_idx=%d old=%s new=%s",
+            last_var_name,
+            last_assignment_idx,
+            _safe_trunc(old_line, 120),
+            _safe_trunc(new_line, 120),
+        )
+        out = "\n".join(lines) + ("\n" if code.endswith("\n") else "")
+        return out, True, True
 
-    class _IlocZeroGuard(ast.NodeTransformer):
-        def __init__(self) -> None:
-            super().__init__()
-            self.used_safe_eq = False
+    warning_line = "# WARNING: missing result assignment; regenerate with `result = <calculation>`"
+    if warning_line not in lines:
+        lines.append(warning_line)
+    logging.warning(
+        "event=missing_result_assignment_no_fix code_preview=%s",
+        _safe_trunc(code, 400),
+    )
+    out = "\n".join(lines) + ("\n" if code.endswith("\n") else "")
+    return out, False, False
 
-        def visit_Compare(self, node: ast.Compare) -> ast.AST:
-            self.generic_visit(node)
-            if len(node.ops) != 1 or len(node.comparators) != 1:
-                return node
-            op = node.ops[0]
-            if not isinstance(op, (ast.Eq, ast.NotEq)):
-                return node
-            left = node.left
-            right = node.comparators[0]
 
-            left_col = _df_column_name(left)
-            right_col = _df_column_name(right)
+def _validate_has_result_assignment(code: str, op_norm: str) -> Optional[str]:
+    if op_norm != "read":
+        return None
+    if _has_result_assignment(code):
+        return None
+    return (
+        "missing_result_assignment: Generated code does not assign final value to 'result'. "
+        "Please regenerate with: result = <calculation>."
+    )
 
-            if left_col and _is_literal(right):
-                if columns and left_col not in columns:
-                    return node
-                call = _make_safe_eq(left, right)
-            elif right_col and _is_literal(left):
-                if columns and right_col not in columns:
-                    return node
-                call = _make_safe_eq(right, left)
-            else:
-                return node
-
-            self.used_safe_eq = True
-            if isinstance(op, ast.NotEq):
-                return ast.UnaryOp(op=ast.Invert(), operand=call)
-            return call
-
-        def visit_Assign(self, node: ast.Assign) -> ast.AST:
-            self.generic_visit(node)
-            if len(node.targets) != 1:
-                return node
-            tgt = node.targets[0]
-            if not isinstance(tgt, ast.Name) or tgt.id != "result":
-                return node
-            v = node.value
-            if not (isinstance(v, ast.Subscript) and isinstance(v.value, ast.Attribute)):
-                return node
-            if v.value.attr != "iloc":
-                return node
-            sl = v.slice
-            idx0 = False
-            if isinstance(sl, ast.Constant) and sl.value == 0:
-                idx0 = True
-            elif hasattr(ast, "Index") and isinstance(sl, ast.Index) and isinstance(sl.value, ast.Constant) and sl.value.value == 0:
-                idx0 = True
-            if not idx0:
-                return node
-
-            tmp_name = "__tmp_result_series"
-            tmp_assign = ast.Assign(
-                targets=[ast.Name(id=tmp_name, ctx=ast.Store())],
-                value=v.value.value,
-            )
-            guarded = ast.Assign(
-                targets=[ast.Name(id="result", ctx=ast.Store())],
-                value=ast.IfExp(
-                    test=ast.Call(
-                        func=ast.Name(id="len", ctx=ast.Load()),
-                        args=[ast.Name(id=tmp_name, ctx=ast.Load())],
-                        keywords=[],
-                    ),
-                    body=ast.Subscript(
-                        value=ast.Attribute(value=ast.Name(id=tmp_name, ctx=ast.Load()), attr="iloc", ctx=ast.Load()),
-                        slice=ast.Constant(value=0),
-                        ctx=ast.Load(),
-                    ),
-                    orelse=ast.Constant(value=None),
-                ),
-            )
-            return [ast.copy_location(tmp_assign, node), ast.copy_location(guarded, node)]
-
-    transformer = _IlocZeroGuard()
-    new_tree = transformer.visit(tree)
-    ast.fix_missing_locations(new_tree)
-
-    try:
-        if transformer.used_safe_eq:
-            has_helper = any(
-                isinstance(n, ast.FunctionDef) and n.name == "__safe_eq" for n in getattr(new_tree, "body", [])
-            )
-            if not has_helper and isinstance(new_tree, ast.Module):
-                helper_src = (
-                    "def __safe_eq(series, value):\n"
-                    "    try:\n"
-                    "        if pd.api.types.is_numeric_dtype(series):\n"
-                    "            try:\n"
-                    "                return series == pd.to_numeric(value)\n"
-                    "            except Exception:\n"
-                    "                return series.astype(str) == str(value)\n"
-                    "        if pd.api.types.is_datetime64_any_dtype(series):\n"
-                    "            try:\n"
-                    "                return series == pd.to_datetime(value, errors='coerce')\n"
-                    "            except Exception:\n"
-                    "                return series.astype(str) == str(value)\n"
-                    "        return series.astype(str) == str(value)\n"
-                    "    except Exception:\n"
-                    "        return series.astype(str) == str(value)\n"
-                )
-                helper_tree = ast.parse(helper_src)
-                new_tree.body = helper_tree.body + new_tree.body
-
-        unparsed = ast.unparse(new_tree)
-        if (code or "").endswith("\n") and not unparsed.endswith("\n"):
-            unparsed += "\n"
-        return unparsed
-    except Exception:
-        return code
+def _harden_common_read_patterns(code: str, df_profile: Optional[dict]) -> str:
+    """Disabled due to AST transformation conflicts in read-path hardening."""
+    return code
 
 _EDIT_METHODS_RETURN_DF = (
     "drop",
@@ -778,6 +717,127 @@ def _is_count_intent(question: str) -> bool:
 def _is_sum_intent(question: str) -> bool:
     q = (question or "").lower()
     return bool(re.search(r"\b(sum|сума|total|загальн\w*|обсяг|volume|units|залишк\w*)\b", q))
+
+
+def _detect_result_sum_of_product_columns(code: str) -> Optional[Tuple[str, str]]:
+    m = re.search(
+        r"(?m)^\s*result\s*=\s*\(\s*df\[(?P<q1>['\"])(?P<c1>.+?)(?P=q1)\]\s*\*\s*df\[(?P<q2>['\"])(?P<c2>.+?)(?P=q2)\]\s*\)\.sum\(\s*\)\s*$",
+        code or "",
+    )
+    if not m:
+        return None
+    return str(m.group("c1")), str(m.group("c2"))
+
+
+def _detect_result_single_column_sum(code: str) -> Optional[str]:
+    m = re.search(
+        r"(?m)^\s*result\s*=\s*(?:\(\s*)?df\[(?P<q>['\"])(?P<c>.+?)(?P=q)\](?:\s*\))?\.sum\(\s*\)\s*$",
+        code or "",
+    )
+    if not m:
+        return None
+    return str(m.group("c"))
+
+
+def _id_like_columns(profile_cols: List[str], excluded: set[str]) -> List[str]:
+    return [
+        c
+        for c in profile_cols
+        if c not in excluded and re.search(r"(?:^|_)(id|sku|код|артикул)(?:$|_)", c.lower())
+    ][:6]
+
+
+def _rewrite_sum_of_product_code(code: str, df_profile: Optional[dict]) -> str:
+    """
+    Universal guard for read queries of form:
+        result = (df[col_a] * df[col_b]).sum()
+    Excludes synthetic summary rows that have product columns populated but identifiers/metadata missing.
+    """
+    cols = _detect_result_sum_of_product_columns(code or "")
+    if not cols:
+        return code
+    left_col, right_col = cols
+    profile_cols = [str(c) for c in ((df_profile or {}).get("columns") or [])]
+    id_like_cols = _id_like_columns(profile_cols, {left_col, right_col})
+
+    lines = [
+        f"_left_col = {left_col!r}",
+        f"_right_col = {right_col!r}",
+        "_valid = pd.Series(True, index=df.index)",
+        "_meta_cols = [c for c in df.columns if c not in {_left_col, _right_col}]",
+        "if _meta_cols:",
+        "    _valid = _valid & (df[_meta_cols].notna().sum(axis=1) > 0)",
+        f"_id_like = {id_like_cols!r}",
+        "if _id_like:",
+        "    _id_like = [c for c in _id_like if c in df.columns]",
+        "    if _id_like:",
+        "        _valid = _valid & df[_id_like].notna().any(axis=1)",
+        "_left_raw = df.loc[_valid, _left_col].astype(str)",
+        r"_left_clean = _left_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"_left_mask = _left_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "_left = _left_clean.where(_left_mask, np.nan).astype(float)",
+        "_right_raw = df.loc[_valid, _right_col].astype(str)",
+        r"_right_clean = _right_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"_right_mask = _right_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "_right = _right_clean.where(_right_mask, np.nan).astype(float)",
+        "result = float((_left * _right).sum())",
+        "print(f\"sum_of_product_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
+    ]
+    logging.info(
+        "event=sum_of_product_rewrite applied left_col=%s right_col=%s id_like=%s",
+        left_col,
+        right_col,
+        id_like_cols,
+    )
+    return "\n".join(lines) + ("\n" if (code or "").endswith("\n") else "")
+
+
+def _rewrite_single_column_sum_code(code: str, df_profile: Optional[dict]) -> str:
+    """
+    Universal guard for read queries of form:
+        result = df[col].sum()
+    Excludes synthetic summary rows that have summed column populated but identifiers/metadata missing.
+    """
+    value_col = _detect_result_single_column_sum(code or "")
+    if not value_col:
+        return code
+    profile_cols = [str(c) for c in ((df_profile or {}).get("columns") or [])]
+    id_like_cols = _id_like_columns(profile_cols, {value_col})
+
+    lines = [
+        f"_value_col = {value_col!r}",
+        "_valid = pd.Series(True, index=df.index)",
+        "_meta_cols = [c for c in df.columns if c != _value_col]",
+        "if _meta_cols:",
+        "    _valid = _valid & (df[_meta_cols].notna().sum(axis=1) > 0)",
+        f"_id_like = {id_like_cols!r}",
+        "if _id_like:",
+        "    _id_like = [c for c in _id_like if c in df.columns]",
+        "    if _id_like:",
+        "        _valid = _valid & df[_id_like].notna().any(axis=1)",
+        "_raw = df.loc[_valid, _value_col].astype(str)",
+        r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"_num_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "_values = _clean.where(_num_mask, np.nan).astype(float)",
+        "result = float(_values.sum())",
+        "print(f\"single_sum_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
+    ]
+    logging.info(
+        "event=single_sum_rewrite applied value_col=%s id_like=%s",
+        value_col,
+        id_like_cols,
+    )
+    return "\n".join(lines) + ("\n" if (code or "").endswith("\n") else "")
+
+
+def _is_total_value_scalar_question(question: str, profile: Optional[dict]) -> bool:
+    q = (question or "").lower()
+    has_value = bool(re.search(r"\b(варт\w*|value|cost|цін\w*|price|кошту\w*)\b", q))
+    has_total = bool(re.search(r"\b(всього|загальн\w*|total|sum|сума)\b", q))
+    has_mul = ("×" in q) or ("*" in q) or bool(re.search(r"\b(x|mul|помнож|добут)\w*\b", q))
+    columns = [str(c) for c in (profile or {}).get("columns") or []]
+    mentioned_cols = _find_columns_in_text(question or "", columns)
+    return has_value and (has_total or has_mul or len(mentioned_cols) >= 2)
 
 def _has_df_assignment(code: str) -> bool:
     return bool(re.search(r"(^|\n)\s*df\s*=", code or "")) or bool(
@@ -1026,12 +1086,92 @@ def _pick_relevant_column(question: str, columns: List[str]) -> Optional[str]:
             continue
         overlap = col_roots & q_roots
         if not overlap:
+            # Fuzzy fallback for inflections: match by 3-char root prefix.
+            fuzzy = set()
+            for cr in col_roots:
+                for qr in q_roots:
+                    if len(cr) >= 3 and len(qr) >= 3 and cr[:3] == qr[:3]:
+                        fuzzy.add(cr)
+                        break
+            overlap = fuzzy
+        if not overlap:
             continue
         score = (2.0 * len(overlap)) - (0.35 * max(0, len(col_roots) - len(overlap)))
         if score > best_score:
             best_score = score
             best_col = str(col)
     return best_col
+
+
+_AVAILABILITY_VALUE_RE = re.compile(r"\b(в\s+наявн|наявн|in\s+stock|available)\b", re.I)
+_AVAILABILITY_COL_RE = re.compile(
+    r"\b(статус\w*|наявн\w*|доступн\w*|availability|available|in_stock|stock|status)\b", re.I
+)
+_AVAILABILITY_NEG_RE = re.compile(r"\b(нема|відсутн|out\s+of\s+stock|unavailable|not\s+available)\b", re.I)
+_AVAILABILITY_WAREHOUSE_RE = re.compile(r"\b(склад\w*|warehouse|inventory)\b", re.I)
+
+
+def _is_availability_count_intent(question: str) -> bool:
+    q = (question or "").lower()
+    if not _is_count_intent(q):
+        return False
+    return bool(
+        _AVAILABILITY_VALUE_RE.search(q)
+        or _AVAILABILITY_NEG_RE.search(q)
+        or _AVAILABILITY_COL_RE.search(q)
+        or _AVAILABILITY_WAREHOUSE_RE.search(q)
+    )
+
+
+def _availability_target_mode(question: str) -> str:
+    q = (question or "").lower()
+    has_in = bool(_AVAILABILITY_VALUE_RE.search(q))
+    has_out = bool(_AVAILABILITY_NEG_RE.search(q))
+    # Explicit "not in stock" should prefer out-of-stock branch.
+    if re.search(r"(не\s+в\s+наявн|not\s+in\s+stock|нема\w*\s+в\s+наявн)", q):
+        return "out"
+    if has_out and not has_in:
+        return "out"
+    if has_in and not has_out:
+        return "in"
+    if _AVAILABILITY_WAREHOUSE_RE.search(q):
+        return "in"
+    return "any"
+
+
+def _pick_availability_column(question: str, profile: Optional[dict]) -> Optional[str]:
+    columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+    preview = (profile or {}).get("preview") or []
+    direct = _find_column_in_text(question, columns)
+    if direct and _AVAILABILITY_COL_RE.search(str(direct)):
+        return direct
+    for col in columns:
+        c = str(col)
+        if _AVAILABILITY_COL_RE.search(c):
+            return c
+    # Fallback: infer a status-like column by value patterns in preview rows.
+    if isinstance(preview, list):
+        best_col: Optional[str] = None
+        best_hits = 0
+        for col in columns:
+            hits = 0
+            for row in preview[:200]:
+                if not isinstance(row, dict):
+                    continue
+                val = row.get(col)
+                if val is None:
+                    continue
+                s = str(val).strip().lower()
+                if not s:
+                    continue
+                if _AVAILABILITY_VALUE_RE.search(s) or _AVAILABILITY_NEG_RE.search(s):
+                    hits += 1
+            if hits > best_hits:
+                best_hits = hits
+                best_col = col
+        if best_col and best_hits > 0:
+            return best_col
+    return direct
 
 
 def _is_entity_nunique_intent(question: str) -> bool:
@@ -1087,6 +1227,8 @@ def _finalize_code_for_sandbox(
     df_profile: Optional[dict]=None,
 ) -> Tuple[str, bool, Optional[str]]:
     code = _normalize_generated_code(analysis_code or "")
+    code = _rewrite_sum_of_product_code(code, df_profile)
+    code = _rewrite_single_column_sum_code(code, df_profile)
     code = _rewrite_forbidden_getattr(code)
     code, removed_imports = _strip_forbidden_imports(code)
     if removed_imports:
@@ -1156,6 +1298,20 @@ def _finalize_code_for_sandbox(
     if op_norm == "read" and not has_mutations:
         if not re.search(r"(?m)^\s*df\s*=\s*df\.copy\s*\(", code):
             code = "df = df.copy(deep=False)\n" + code
+
+    # Ensure read-mode code always provides `result`.
+    if op_norm == "read":
+        code, fixed_result, _ = _ensure_result_variable(code)
+        if fixed_result:
+            logging.info("event=result_assignment_auto_fixed")
+        validation_err = _validate_has_result_assignment(code, op_norm)
+        if validation_err:
+            logging.error(
+                "event=code_validation_failed error=%s code_preview=%s",
+                validation_err,
+                _safe_trunc(code, 500),
+            )
+            return code, commit_requested, validation_err
 
     return code, commit_requested, None
 
@@ -1338,7 +1494,8 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
     col = _match_column_by_index(text, columns)
     if col:
         return col
-    best = None
+    best_raw: Optional[str] = None
+    best_len = 0
     for name in columns:
         if not isinstance(name, str):
             continue
@@ -1346,10 +1503,11 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
         if not n:
             continue
         if n.lower() in lower:
-            if not best or len(n) > len(best):
-                best = n
-    if best:
-        return best
+            if len(n) > best_len:
+                best_raw = name
+                best_len = len(n)
+    if best_raw is not None:
+        return best_raw
 
     _STOP_ROOTS = {"кіль", "скіл", "count", "coun", "each", "per"}
 
@@ -1359,12 +1517,31 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
         return roots
 
     q_roots = set(_root_tokens(lower))
+    best_name: Optional[str] = None
+    best_score = 0.0
     for name in columns:
         if not isinstance(name, str):
             continue
         roots = _root_tokens(name)
-        if roots and all(r in q_roots for r in roots):
-            return name
+        if not roots or not q_roots:
+            continue
+        exact_hits = sum(1 for r in roots if r in q_roots)
+        fuzzy_hits = 0
+        for r in roots:
+            if len(r) < 3:
+                continue
+            if any(len(qr) >= 3 and qr[:3] == r[:3] for qr in q_roots):
+                fuzzy_hits += 1
+        overlap = max(exact_hits, fuzzy_hits)
+        if overlap <= 0:
+            continue
+        # Reward overlap, slightly penalize unmatched roots (e.g., *_UAH suffix tokens).
+        score = (2.0 * overlap) - (0.35 * max(0, len(roots) - overlap))
+        if score > best_score:
+            best_score = score
+            best_name = name
+    if best_name:
+        return best_name
     return None
 
 
@@ -1386,14 +1563,19 @@ def _parse_set_value(text: str) -> Optional[str]:
     if m_num:
         return m_num.group(1).strip()
 
-    m_quoted = re.search(r"(?:на|=)\s*['\"]([^'\"]+)['\"]", s, re.I)
+    m_quoted = re.search(
+        r"(?:на|=)\s*(?:(?:статус|status|значенн\w*|value)\s*)?(?:[:=-]\s*)?(?:['\"“”«»„`])([^'\"“”«»„`]+)(?:['\"“”«»„`])",
+        s,
+        re.I,
+    )
     if m_quoted:
         return m_quoted.group(1).strip()
 
     m = re.search(r"(?:на|=)\s*([^\n]+)$", s, re.I)
     if not m:
         return None
-    value = m.group(1).strip().strip("\"'")
+    value = m.group(1).strip().strip("\"'“”«»„`")
+    value = re.sub(r"^\s*(?:статус|status|значенн\w*|value)\s*[:=-]?\s*", "", value, flags=re.I)
     value = re.split(r"\s+(?:та|і|and)\s+", value, maxsplit=1, flags=re.I)[0]
     value = re.split(r"\s*\(", value, maxsplit=1)[0]
     return value.strip() or None
@@ -1446,7 +1628,15 @@ def _parse_condition(text: str, columns: List[str]) -> Optional[Tuple[str, str, 
 def _find_columns_in_text(text: str, columns: List[str]) -> List[str]:
     if not text or not columns:
         return []
+    lower = text.lower()
     hits: List[Tuple[int, str]] = []
+    def _roots_no_stopwords(s: str) -> set[str]:
+        parts = re.split(r"[^a-zа-яіїєґ0-9]+", (s or "").lower())
+        return {p[:4] for p in parts if len(p) >= 3}
+
+    text_roots = _roots_no_stopwords(text)
+
+    # 1) Exact mention first.
     for col in columns:
         if not isinstance(col, str):
             continue
@@ -1455,9 +1645,122 @@ def _find_columns_in_text(text: str, columns: List[str]) -> List[str]:
             continue
         m = re.search(re.escape(name), text, re.I)
         if m:
-            hits.append((m.start(), col))
+            hits.append((m.start(), str(col)))
+
+    # 2) Fallback by semantic root overlap.
+    if not hits and text_roots:
+        for i, col in enumerate(columns):
+            if not isinstance(col, str):
+                continue
+            name = col.strip()
+            if not name:
+                continue
+            col_roots = _roots_no_stopwords(name)
+            overlap = len(col_roots & text_roots)
+            if overlap <= 0:
+                continue
+            # Keep stable order after exact matches.
+            approx_pos = lower.find(name[:4].lower())
+            if approx_pos < 0:
+                approx_pos = 1000 + i
+            hits.append((approx_pos, str(col)))
+
     hits.sort(key=lambda x: x[0])
-    return [col for _, col in hits]
+    seen: set[str] = set()
+    out: List[str] = []
+    for _, col in hits:
+        if col in seen:
+            continue
+        seen.add(col)
+        out.append(col)
+    return out
+
+
+def _extract_top_n_from_question(question: str, default: int = 10) -> int:
+    q = (question or "").lower()
+    m = re.search(r"(?:top|топ)\s*[-–]?\s*(\d+)", q, re.I)
+    if m:
+        return max(1, int(m.group(1)))
+    return default
+
+
+def _classify_columns_by_role(
+    question: str,
+    found_columns: List[str],
+    df_profile: Optional[dict],
+) -> Dict[str, Optional[str]]:
+    if not found_columns:
+        return {"group_by": None, "aggregate": None}
+
+    q_low = (question or "").lower()
+    dtypes = (df_profile or {}).get("dtypes") or {}
+    has_sum_context = bool(re.search(r"\b(сум\w*|загальн\w*|total|sum|обсяг|volume)\b", q_low))
+    has_count_context = bool(re.search(r"\b(кільк\w*|скільк\w*|count|number|к-?ст)\b", q_low))
+
+    aggregate_keywords = (
+        "кільк",
+        "qty",
+        "amount",
+        "sum",
+        "сума",
+        "price",
+        "ціна",
+        "варт",
+        "total",
+        "обсяг",
+        "volume",
+    )
+    group_keywords = (
+        "категор",
+        "category",
+        "бренд",
+        "brand",
+        "тип",
+        "type",
+        "status",
+        "статус",
+        "group",
+        "груп",
+        "клас",
+    )
+
+    numeric_cols: List[str] = []
+    categorical_cols: List[str] = []
+    for col in found_columns:
+        dtype = str(dtypes.get(str(col), "")).lower()
+        col_low = str(col).lower()
+        is_numeric = dtype.startswith(("int", "float", "uint"))
+        if any(k in col_low for k in aggregate_keywords):
+            numeric_cols.append(col)
+            continue
+        if any(k in col_low for k in group_keywords):
+            categorical_cols.append(col)
+            continue
+        if is_numeric:
+            numeric_cols.append(col)
+        else:
+            categorical_cols.append(col)
+
+    group_by = categorical_cols[0] if categorical_cols else None
+    aggregate = numeric_cols[0] if numeric_cols else None
+
+    if not group_by and found_columns:
+        # Prefer first mentioned for grouping.
+        group_by = found_columns[0]
+    if not aggregate:
+        # For sum/count-like asks choose another column, preferably numeric.
+        if (has_sum_context or has_count_context) and len(found_columns) > 1:
+            aggregate = next((c for c in found_columns if c != group_by), found_columns[0])
+        elif has_sum_context or has_count_context:
+            aggregate = found_columns[0]
+
+    if aggregate == group_by:
+        # Avoid same column for both roles if alternatives exist.
+        alt = next((c for c in found_columns if c != group_by), None)
+        if alt:
+            aggregate = alt
+
+    return {"group_by": group_by, "aggregate": aggregate}
 
 
 def _excel_col_index(token: str) -> Optional[int]:
@@ -1537,6 +1840,57 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
 
     code_lines: List[str] = []
     plan = ""
+
+    if _is_availability_count_intent(q):
+        target_mode = _availability_target_mode(q)
+        code_lines.append(
+            r"_pos_re = r'(?:в\s*наявн|наявн|in\s*stock|available|доступн)'"
+        )
+        code_lines.append(
+            r"_neg_re = r'(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available|не\s*доступн)'"
+        )
+        code_lines.append(f"_mode = {target_mode!r}")
+        # Placeholder is resolved in _resolve_shortcut_placeholders() with LLM-first logic.
+        code_lines.append(f"_col = {SHORTCUT_COL_PLACEHOLDER!r}")
+        code_lines.append("if _col not in df.columns:")
+        code_lines.append("    _col = None")
+        code_lines.append("if _col is None:")
+        code_lines.append("    _candidates = []")
+        code_lines.append("    for _c in df.columns:")
+        code_lines.append("        _s = df[_c].astype(str).str.strip().str.lower()")
+        code_lines.append("        _hits = int((_s.str.contains(_pos_re, regex=True, na=False) | _s.str.contains(_neg_re, regex=True, na=False)).sum())")
+        code_lines.append("        if _hits <= 0:")
+        code_lines.append("            continue")
+        code_lines.append("        _bonus = 1 if re.search(r'(статус|наявн|availability|available|stock|доступн)', str(_c).lower()) else 0")
+        code_lines.append("        _candidates.append((_hits + _bonus, str(_c)))")
+        code_lines.append("    if _candidates:")
+        code_lines.append("        _candidates.sort(reverse=True)")
+        code_lines.append("        _col = _candidates[0][1]")
+        code_lines.append("if _col is not None:")
+        code_lines.append("    _status = df[_col].astype(str).str.strip().str.lower()")
+        code_lines.append("    _in = _status.str.contains(_pos_re, regex=True, na=False)")
+        code_lines.append("    _out = _status.str.contains(_neg_re, regex=True, na=False)")
+        code_lines.append("    if _mode == 'out':")
+        code_lines.append("        result = int(df.loc[_out & ~_in].shape[0])")
+        code_lines.append("    elif _mode == 'any':")
+        code_lines.append("        result = int(df.loc[_in | _out].shape[0])")
+        code_lines.append("    else:")
+        code_lines.append("        result = int(df.loc[_in & ~_out].shape[0])")
+        code_lines.append("else:")
+        code_lines.append("    _row_text = df.astype(str).agg(' '.join, axis=1).str.lower()")
+        code_lines.append("    _in_row = _row_text.str.contains(_pos_re, regex=True, na=False)")
+        code_lines.append("    _out_row = _row_text.str.contains(_neg_re, regex=True, na=False)")
+        code_lines.append("    if _mode == 'out':")
+        code_lines.append("        result = int((_out_row & ~_in_row).sum())")
+        code_lines.append("    elif _mode == 'any':")
+        code_lines.append("        result = int((_in_row | _out_row).sum())")
+        code_lines.append("    else:")
+        code_lines.append("        result = int((_in_row & ~_out_row).sum())")
+        plan = (
+            "Порахувати кількість товарів за ознаками наявності "
+            f"у колонці {SHORTCUT_COL_PLACEHOLDER} або по значеннях рядка."
+        )
+        return "\n".join(code_lines) + "\n", plan
 
     if re.search(r"\b(покажи|показати|show)\b.*\b(клітин|комір|cell)\b", q_low):
         row_idx = _parse_row_index(q)
@@ -1668,7 +2022,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
 
     if re.search(r"\b(нижн.*регістр|lower case)\b", q_low):
         code_lines.append("df = df.copy()")
-        code_lines.append("df = df.rename(columns=lambda x: str(x).lower())")
+        code_lines.append("df.columns = [str(x).lower() for x in df.columns]")
         code_lines.append("COMMIT_DF = True")
         code_lines.append("result = {'status': 'updated'}")
         plan = "Перейменувати колонки у нижній регістр."
@@ -1865,7 +2219,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
     if re.search(r"\b(замін|імпут)\b.*\b(усіх числових|numeric)\b.*\b(середн|mean)\b", q_low):
         code_lines.append("df = df.copy()")
         code_lines.append("num_cols = df.select_dtypes(include='number').columns")
-        code_lines.append("df[num_cols] = df[num_cols].apply(lambda s: s.fillna(s.mean()))")
+        code_lines.append("df[num_cols] = df[num_cols].fillna(df[num_cols].mean())")
         code_lines.append("COMMIT_DF = True")
         code_lines.append("result = {'status': 'updated'}")
         plan = "Замінити NA у числових колонках їхнім середнім."
@@ -2087,6 +2441,34 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
 
     columns=(profile or {}).get("columns") or []
     if not columns: return None
+
+    # Edit by ID: "зміни ... для ID 1003 на ..."
+    if _has_edit_triggers(q):
+        m_id = re.search(r"\bID\s*[:=]?\s*(\d+)\b", q, re.I)
+        if m_id:
+            item_id = int(m_id.group(1))
+            col = _find_column_in_text(q, columns)
+            raw_value = _parse_set_value(q)
+            value = _parse_literal(raw_value) if raw_value is not None else None
+            if col and value is not None and str(col).lower() != "id":
+                code_lines: List[str] = []
+                code_lines.append("df = df.copy()")
+                code_lines.append(f"_id = {item_id}")
+                code_lines.append("if 'ID' in df.columns:")
+                code_lines.append("    _id_target = str(_id).strip()")
+                code_lines.append("    _id_col = df['ID'].astype(str).str.strip()")
+                code_lines.append("    _id_col_norm = _id_col.str.replace(r'\\.0+$', '', regex=True)")
+                code_lines.append("    _mask = (_id_col == _id_target) | (_id_col_norm == _id_target)")
+                code_lines.append("    if _mask.any():")
+                code_lines.append(f"        df.loc[_mask, {col!r}] = {value!r}")
+                code_lines.append("        COMMIT_DF = True")
+                code_lines.append(f"        result = {{'status': 'updated', 'id': _id, 'column': {col!r}, 'new_value': {value!r}}}")
+                code_lines.append("    else:")
+                code_lines.append("        result = {'status': 'not_found', 'id': _id}")
+                code_lines.append("else:")
+                code_lines.append("    result = {'status': 'no_id_column'}")
+                plan = f"Змінити {col} для ID {item_id}."
+                return "\n".join(code_lines) + "\n", plan
 
     is_add_row=bool(re.search(r"\b(додай|додати|add)\b.*\b(рядок|row)\b", q_low))
     is_del_row=bool(re.search(r"\b(видали|видалити|delete)\b.*\b(рядок|row)\b", q_low))
@@ -2326,6 +2708,8 @@ def _status_message(event: str, payload: Optional[dict]) -> str:
         return "Генерую план та код аналізу."
     if event == "codegen_shortcut":
         return "Використовую швидкий режим для генерації коду."
+    if event == "codegen_retry":
+        return "Повторно генерую код: у попередній версії не було присвоєння в result."
     if event == "codegen_empty":
         return "Не вдалося згенерувати код аналізу."
     if event == "sandbox_run":
@@ -2585,6 +2969,37 @@ class Pipeline(object):
             commit_df if isinstance(commit_df, bool) else None,
         )
 
+    def _plan_code_retry_missing_result(
+        self,
+        question: str,
+        profile: dict,
+        previous_code: str,
+        reason: str,
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        payload = json.dumps(
+            {
+                "question": question,
+                "df_profile": profile,
+                "retry_reason": reason,
+                "previous_analysis_code": previous_code,
+                "retry_constraints": [
+                    "CRITICAL: final answer must be assigned to variable `result`.",
+                    "If previous code used another variable, rewrite to `result = ...`.",
+                    "Do not return code without `result =` assignment for read operations.",
+                ],
+            },
+            ensure_ascii=False,
+        )
+        parsed = self._llm_json(system, payload)
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
+
     def _llm_pick_column_for_shortcut(self, question: str, profile: dict) -> Optional[str]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
         if not columns:
@@ -2608,20 +3023,125 @@ class Pipeline(object):
             return None
         return col
 
+    def _llm_pick_columns_by_role_for_shortcut(self, question: str, profile: dict) -> Dict[str, Any]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return {}
+        system = (
+            "Map the user query to dataframe column roles. "
+            "Return ONLY JSON with keys: group_by, aggregate, top_n. "
+            "group_by and aggregate must be exact names from columns or empty string. "
+            "top_n must be an integer or null. "
+            "Use group_by for categorical grouping dimension and aggregate for numeric value to sum/count/average."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "df_profile": profile or {},
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return {}
+        out: Dict[str, Any] = {}
+        group_by = str((parsed or {}).get("group_by") or "").strip()
+        aggregate = str((parsed or {}).get("aggregate") or "").strip()
+        top_n_raw = (parsed or {}).get("top_n")
+        if group_by and group_by in columns:
+            out["group_by"] = group_by
+        if aggregate and aggregate in columns:
+            out["aggregate"] = aggregate
+        if isinstance(top_n_raw, (int, float)):
+            out["top_n"] = max(1, int(top_n_raw))
+        elif isinstance(top_n_raw, str) and top_n_raw.strip().isdigit():
+            out["top_n"] = max(1, int(top_n_raw.strip()))
+        return out
+
     def _resolve_shortcut_placeholders(
         self, analysis_code: str, plan: str, question: str, profile: dict
     ) -> Tuple[str, str]:
-        if SHORTCUT_COL_PLACEHOLDER not in (analysis_code or "") and SHORTCUT_COL_PLACEHOLDER not in (plan or ""):
-            return analysis_code, plan
-        columns = (profile or {}).get("columns") or []
-        col = _find_column_in_text(question, columns)
-        if not col:
-            col = self._llm_pick_column_for_shortcut(question, profile)
-        if not col:
-            return analysis_code, plan
-        return (analysis_code or "").replace(SHORTCUT_COL_PLACEHOLDER, col), (plan or "").replace(
-            SHORTCUT_COL_PLACEHOLDER, col
+        legacy_placeholder = "__SHORTCUT_COL__"
+        has_single_col_ph = (
+            SHORTCUT_COL_PLACEHOLDER in (analysis_code or "")
+            or SHORTCUT_COL_PLACEHOLDER in (plan or "")
+            or legacy_placeholder in (analysis_code or "")
+            or legacy_placeholder in (plan or "")
         )
+        has_group_ph = (
+            GROUP_COL_PLACEHOLDER in (analysis_code or "")
+            or GROUP_COL_PLACEHOLDER in (plan or "")
+        )
+        has_agg_ph = (
+            SUM_COL_PLACEHOLDER in (analysis_code or "")
+            or SUM_COL_PLACEHOLDER in (plan or "")
+            or AGG_COL_PLACEHOLDER in (analysis_code or "")
+            or AGG_COL_PLACEHOLDER in (plan or "")
+        )
+        has_top_n_ph = (
+            TOP_N_PLACEHOLDER in (analysis_code or "")
+            or TOP_N_PLACEHOLDER in (plan or "")
+        )
+        if (
+            not has_single_col_ph
+            and not has_group_ph
+            and not has_agg_ph
+            and not has_top_n_ph
+        ):
+            return analysis_code, plan
+        columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+
+        found_columns = _find_columns_in_text(question, columns)
+        role_map: Dict[str, Any] = {}
+        if has_group_ph or has_agg_ph or has_top_n_ph:
+            role_map.update(self._llm_pick_columns_by_role_for_shortcut(question, profile))
+            fallback_roles = _classify_columns_by_role(question, found_columns, profile)
+            if not role_map.get("group_by"):
+                role_map["group_by"] = fallback_roles.get("group_by")
+            if not role_map.get("aggregate"):
+                role_map["aggregate"] = fallback_roles.get("aggregate")
+            if not role_map.get("top_n"):
+                role_map["top_n"] = _extract_top_n_from_question(question, default=10)
+
+        llm_question = question
+        if _is_availability_count_intent(question):
+            llm_question = (
+                f"{question}\n"
+                "Intent: choose the column that stores availability/in-stock/out-of-stock status."
+            )
+        # LLM-first for semantic column resolution.
+        col = self._llm_pick_column_for_shortcut(llm_question, profile) if has_single_col_ph else None
+        if not col:
+            col = role_map.get("group_by") or _find_column_in_text(question, columns)
+        if not col and _is_availability_count_intent(question):
+            col = _pick_availability_column(question, profile)
+        replacements: Dict[str, str] = {}
+        if col:
+            replacements[SHORTCUT_COL_PLACEHOLDER] = col
+            replacements[legacy_placeholder] = col
+        group_by_col = role_map.get("group_by")
+        aggregate_col = role_map.get("aggregate")
+        top_n = role_map.get("top_n") or _extract_top_n_from_question(question, default=10)
+        if group_by_col:
+            replacements[GROUP_COL_PLACEHOLDER] = str(group_by_col)
+        if aggregate_col:
+            replacements[SUM_COL_PLACEHOLDER] = str(aggregate_col)
+            replacements[AGG_COL_PLACEHOLDER] = str(aggregate_col)
+        if top_n:
+            replacements[TOP_N_PLACEHOLDER] = str(int(top_n))
+
+        if not replacements:
+            return analysis_code, plan
+        for ph, val in replacements.items():
+            analysis_code = (analysis_code or "").replace(ph, val)
+            plan = (plan or "").replace(ph, val)
+        logging.info(
+            "event=placeholder_resolution found_cols=%s role_map=%s replacements=%s",
+            _safe_trunc(found_columns, 300),
+            _safe_trunc(role_map, 300),
+            _safe_trunc(replacements, 300),
+        )
+        return analysis_code or "", plan or ""
 
     def _format_top_pairs_from_result(self, result_text: str, top_n: int = 15) -> Optional[str]:
         text = (result_text or "").strip()
@@ -2822,6 +3342,10 @@ class Pipeline(object):
 
         scalar = (result_text or "").strip()
         if scalar and "\n" not in scalar and not scalar.startswith(("{", "[", "|")):
+            if _is_total_value_scalar_question(question, profile):
+                if re.search(r"\b(uah|грн|₴)\b", scalar, re.I):
+                    return f"Загальна вартість — {scalar}."
+                return f"Загальна вартість — {scalar} UAH."
             row_idx = _parse_row_index(question or "")
             columns = [str(c) for c in (profile or {}).get("columns") or []]
             col = _pick_relevant_column(question, columns)
@@ -3329,12 +3853,35 @@ class Pipeline(object):
             if count_err:
                 return f"Неможливо виконати запит: {count_err}"
             analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
-            
+
             analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
                 question, analysis_code, op, commit_df, df_profile=profile
             )
+            if finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit:
+                self._emit(event_emitter, "codegen_retry", {"reason": "missing_result_assignment"})
+                wait = self._start_wait(event_emitter, "codegen")
+                try:
+                    analysis_code, plan, op, commit_df = self._plan_code_retry_missing_result(
+                        question=question,
+                        profile=profile,
+                        previous_code=analysis_code,
+                        reason=finalize_err,
+                    )
+                finally:
+                    self._stop_wait(wait)
+                if not (analysis_code or "").strip():
+                    self._emit(event_emitter, "codegen_empty", {})
+                    return "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше."
+                analysis_code, count_err = _enforce_count_code(question, analysis_code)
+                if count_err:
+                    return f"Неможливо виконати запит: {count_err}"
+                analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
+                analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
+                    question, analysis_code, op, commit_df, df_profile=profile
+                )
             if finalize_err:
-                self._emit(event_emitter, "final_answer", {"status": "invalid_read_mutation"})
+                status = "invalid_missing_result" if "missing_result_assignment" in finalize_err else "invalid_read_mutation"
+                self._emit(event_emitter, "final_answer", {"status": status})
                 return f"Неможливо виконати запит: {finalize_err}"
             if _has_forbidden_import_nodes(analysis_code):
                 self._emit(event_emitter, "final_answer", {"status": "invalid_import"})
@@ -3610,12 +4157,37 @@ class Pipeline(object):
                 yield f"Неможливо виконати: {count_err}"
                 return
             analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
-            
+
             analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
                 question, analysis_code, op, commit_df, df_profile=profile
             )
+            if finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit:
+                emit("codegen_retry", {"reason": "missing_result_assignment"})
+                yield from drain()
+                analysis_code, plan, op, commit_df = self._plan_code_retry_missing_result(
+                    question=question,
+                    profile=profile,
+                    previous_code=analysis_code,
+                    reason=finalize_err,
+                )
+                if not (analysis_code or "").strip():
+                    emit("codegen_empty", {})
+                    yield from drain()
+                    yield "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання."
+                    return
+                analysis_code, count_err = _enforce_count_code(question, analysis_code)
+                if count_err:
+                    emit("final_answer", {"status": "invalid_code"})
+                    yield from drain()
+                    yield f"Неможливо виконати: {count_err}"
+                    return
+                analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
+                analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
+                    question, analysis_code, op, commit_df, df_profile=profile
+                )
             if finalize_err:
-                emit("final_answer", {"status": "invalid_read_mutation"})
+                status = "invalid_missing_result" if "missing_result_assignment" in finalize_err else "invalid_read_mutation"
+                emit("final_answer", {"status": status})
                 yield from drain()
                 yield f"Неможливо виконати: {finalize_err}"
                 return

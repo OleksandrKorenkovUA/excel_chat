@@ -7,7 +7,11 @@ Rules:
 - commit_df must be true only when DataFrame is modified.
 - analysis_code must be pure Python statements, no imports, no file/network access, no plotting.
 - CRITICAL: NO IMPORTS. pd and np are already available.
-- Put final answer into variable result.
+- Do not use lambda expressions.
+- CRITICAL: The FINAL value MUST be assigned to variable named `result`.
+- NEVER use custom final variable names like `total_value`, `sum_price`, `avg_qty`.
+- ALWAYS use: result = <your calculation>
+- For read queries that compute total via product of two columns and sum (e.g., colA * colB).sum(), ignore synthetic summary rows with missing identifiers/metadata.
 - Do not use try/except, with, def, class.
 - Do not use DataFrame.append; use pd.concat.
 - For op="edit", always persist changes in df and include:
