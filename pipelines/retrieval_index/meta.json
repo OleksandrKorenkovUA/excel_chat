@@ -863,6 +863,110 @@
       "text": "Rows where name contains ann"
     },
     {
+      "intent_id": "filter_contains",
+      "text": "Покажи товари, де бренд містить NVIDIA"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Знайди позиції де модель містить RTX"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Покажи записи, де опис містить GeForce"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Виведи товари, де категорія містить миш"
+    },
+    {
+      "intent_id": "filter_contains",
+      "text": "Пошук по Intel у назві товару"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Яка максимальна ціна серед мишей?"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Покажи мінімальну ціну серед клавіатур"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Середня ціна для ноутбуків"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Сума quantity серед категорії відеокарт"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Медіана ціни серед товарів з категорією монітор"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Максимальна вартість серед бренду ASUS"
+    },
+    {
+      "intent_id": "filtered_metric_aggregation",
+      "text": "Яка середня ціна серед товарів з RTX"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Скільки товарів NVIDIA"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Порахуй позиції з RTX"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Скільки записів містять GeForce"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Кількість товарів з Intel"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Порахуй рядки де є слово wireless"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Скільки товарів із SSD"
+    },
+    {
+      "intent_id": "keyword_search_count",
+      "text": "Скільки позицій з AMD"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Покажи товари з NVIDIA"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Знайди позиції з GeForce"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Виведи записи де є RTX"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Покажи товари з Intel"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Знайди рядки зі словом wireless"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Покажи позиції з SSD"
+    },
+    {
+      "intent_id": "keyword_search_rows",
+      "text": "Виведи товари з AMD"
+    },
+    {
       "intent_id": "filter_range_numeric",
       "text": "Покажи ціни між 100 і 200"
     },

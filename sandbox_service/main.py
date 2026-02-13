@@ -203,8 +203,13 @@ def _ast_guard(code: str) -> None:
             if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                 raise ValueError(f"forbidden_call:{node.func.id}")
             if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
-                if node.func.value.id == "pd" and node.func.attr.startswith(("read_", "to_")):
-                    raise ValueError("forbidden_pandas_io")
+                if node.func.value.id == "pd":
+                    # Block pandas I/O APIs, but allow safe conversion helpers.
+                    safe_pd_to = {"to_numeric", "to_datetime", "to_timedelta"}
+                    if node.func.attr.startswith("read_"):
+                        raise ValueError("forbidden_pandas_io")
+                    if node.func.attr.startswith("to_") and node.func.attr not in safe_pd_to:
+                        raise ValueError("forbidden_pandas_io")
                 if node.func.value.id == "df" and node.func.attr.startswith("to_"):
                     raise ValueError("forbidden_dataframe_io")
 
@@ -363,6 +368,9 @@ def _run_code(
             "bool": bool,
             "zip": zip,
             "print": print,
+            # Needed for internal lazy imports used by pandas/numpy runtime paths.
+            # User code still cannot call __import__ directly due AST guard.
+            "__import__": __import__,
         }
         env: Dict[str, Any] = {
             "df": df,

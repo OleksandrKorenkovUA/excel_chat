@@ -29,6 +29,11 @@ _LOCAL_PROMPTS = os.path.join(os.path.dirname(__file__), "prompts.txt")
 PROMPTS_PATH = _LOCAL_PROMPTS if os.path.exists(_LOCAL_PROMPTS) else os.path.join(PIPELINES_DIR, "prompts.txt")
 DEFAULT_PLAN_CODE_SYSTEM = (
     "You write pandas code to answer questions about a DataFrame named df. "
+    "CRITICAL SUBSET RULE: When user asks about a subset (e.g., among/for/with/where/тільки/лише/серед), "
+    "you MUST filter DataFrame first, then compute metric on filtered rows only. "
+    "Do NOT compute metric on full df when subset is requested. "
+    "Example: 'max price among mice' => "
+    "result = df[df['Категорія'].astype(str).str.contains('миш', case=False, na=False)]['Ціна_UAH'].max(). "
     "Return ONLY valid JSON with keys: analysis_code, short_plan, op, commit_df. "
     "CRITICAL: The FINAL value MUST be assigned to variable named 'result'. "
     "NEVER use custom final variable names like 'total_value', 'sum_price', 'avg_qty'. "
@@ -359,7 +364,7 @@ def _effective_user_query(user_message: str, messages: List[dict]) -> str:
     return _normalize_query_text(fallback) if fallback else ""
 
 
-def _iter_file_objs(body: dict, messages: List[dict]) -> List[dict]:
+def _iter_all_file_objs(body: dict, messages: List[dict]) -> List[dict]:
     out: List[dict] = []
     body = body or {}
     for k in ("files", "attachments"):
@@ -383,8 +388,33 @@ def _iter_file_objs(body: dict, messages: List[dict]) -> List[dict]:
     return out
 
 
-def _pick_file_ref(body: dict, messages: List[dict]) -> Tuple[Optional[str], Optional[dict]]:
-    for obj in reversed(_iter_file_objs(body, messages)):
+def _iter_message_file_objs(message: Optional[dict]) -> List[dict]:
+    out: List[dict] = []
+    if not isinstance(message, dict):
+        return out
+    for k in ("files", "attachments"):
+        for it in (message.get(k) or []):
+            if isinstance(it, dict):
+                out.append(it)
+    c = message.get("content")
+    if isinstance(c, list):
+        for part in c:
+            if isinstance(part, dict) and (
+                part.get("type") in ("file", "input_file") or part.get("kind") == "file"
+            ):
+                out.append(part)
+    return out
+
+
+def _last_user_message_obj(messages: List[dict]) -> Optional[dict]:
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return msg
+    return None
+
+
+def _pick_file_ref_from_history(body: dict, messages: List[dict]) -> Tuple[Optional[str], Optional[dict]]:
+    for obj in reversed(_iter_all_file_objs(body, messages)):
         fid = obj.get("id") or obj.get("file_id")
         if fid:
             return fid, obj
@@ -392,6 +422,61 @@ def _pick_file_ref(body: dict, messages: List[dict]) -> Tuple[Optional[str], Opt
     if fid:
         return fid, {"id": fid}
     return None, None
+
+
+def _pick_file_ref(body: dict, messages: List[dict]) -> Tuple[Optional[str], Optional[dict]]:
+    """
+    Pick explicit file reference from the current turn only:
+    - body.files/body.attachments/body.file_id
+    - last user message file parts
+    This avoids accidental switches from stale files in older chat history.
+    """
+    body = body or {}
+    last_user = _last_user_message_obj(messages)
+    current_objs: List[dict] = []
+    for k in ("files", "attachments"):
+        for it in (body.get(k) or []):
+            if isinstance(it, dict):
+                current_objs.append(it)
+    current_objs.extend(_iter_message_file_objs(last_user))
+    for obj in reversed(current_objs):
+        fid = obj.get("id") or obj.get("file_id")
+        if fid:
+            return fid, obj
+    fid = body.get("file_id")
+    if fid:
+        return fid, {"id": fid}
+    return None, None
+
+
+def _resolve_active_file_ref(
+    body: dict,
+    messages: List[dict],
+    session: Optional[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[dict], str, Optional[str]]:
+    """
+    Resolve active file with guard against silent history-based file switching.
+    Priority:
+      1) Explicit current-turn file ref
+      2) Session file_id
+      3) History fallback (only when no session and no explicit file)
+    Returns: (file_id, file_obj, source, ignored_history_file_id)
+    """
+    explicit_file_id, explicit_file_obj = _pick_file_ref(body, messages)
+    session_file_id = str((session or {}).get("file_id") or "").strip() or None
+
+    if explicit_file_id:
+        return explicit_file_id, explicit_file_obj, "explicit", None
+
+    history_file_id, history_file_obj = _pick_file_ref_from_history(body, messages)
+    if session_file_id:
+        ignored_history = history_file_id if history_file_id and history_file_id != session_file_id else None
+        return session_file_id, None, "session", ignored_history
+
+    if history_file_id:
+        return history_file_id, history_file_obj, "history", None
+
+    return None, None, "none", None
 
 
 def _session_key(body: dict) -> str:
@@ -591,6 +676,18 @@ def _has_result_assignment(code: str) -> bool:
     return bool(re.search(r"(?m)^\s*result\s*=", code or ""))
 
 
+def _is_retryable_import_keyerror(error: str) -> bool:
+    low = (error or "").strip().lower()
+    if not low:
+        return False
+    return (
+        ("keyerror: 'import'" in low)
+        or ('keyerror: "import"' in low)
+        or ("keyerror: '__import__'" in low)
+        or ('keyerror: "__import__"' in low)
+    )
+
+
 def _ensure_result_variable(code: str) -> Tuple[str, bool, bool]:
     """
     Ensure final read value is assigned to `result`.
@@ -719,24 +816,71 @@ def _is_sum_intent(question: str) -> bool:
     return bool(re.search(r"\b(sum|сума|total|загальн\w*|обсяг|volume|units|залишк\w*)\b", q))
 
 
-def _detect_result_sum_of_product_columns(code: str) -> Optional[Tuple[str, str]]:
-    m = re.search(
-        r"(?m)^\s*result\s*=\s*\(\s*df\[(?P<q1>['\"])(?P<c1>.+?)(?P=q1)\]\s*\*\s*df\[(?P<q2>['\"])(?P<c2>.+?)(?P=q2)\]\s*\)\.sum\(\s*\)\s*$",
-        code or "",
-    )
-    if not m:
+def _extract_df_subscript_col(node: ast.AST) -> Optional[str]:
+    if not isinstance(node, ast.Subscript):
         return None
-    return str(m.group("c1")), str(m.group("c2"))
+    if not isinstance(node.value, ast.Name) or node.value.id != "df":
+        return None
+    sl = node.slice
+    if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+        return str(sl.value)
+    if hasattr(ast, "Index") and isinstance(sl, ast.Index):  # pragma: no cover (py<3.9 compatibility path)
+        inner = sl.value
+        if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+            return str(inner.value)
+    return None
+
+
+def _detect_result_sum_of_product_columns(code: str) -> Optional[Tuple[str, str]]:
+    try:
+        tree = ast.parse(code or "")
+    except Exception:
+        return None
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        t = node.targets[0]
+        if not isinstance(t, ast.Name) or t.id != "result":
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        if value.args or value.keywords:
+            continue
+        if not isinstance(value.func, ast.Attribute) or value.func.attr != "sum":
+            continue
+        prod = value.func.value
+        if not isinstance(prod, ast.BinOp) or not isinstance(prod.op, ast.Mult):
+            continue
+        c1 = _extract_df_subscript_col(prod.left)
+        c2 = _extract_df_subscript_col(prod.right)
+        if c1 and c2:
+            return c1, c2
+    return None
 
 
 def _detect_result_single_column_sum(code: str) -> Optional[str]:
-    m = re.search(
-        r"(?m)^\s*result\s*=\s*(?:\(\s*)?df\[(?P<q>['\"])(?P<c>.+?)(?P=q)\](?:\s*\))?\.sum\(\s*\)\s*$",
-        code or "",
-    )
-    if not m:
+    try:
+        tree = ast.parse(code or "")
+    except Exception:
         return None
-    return str(m.group("c"))
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        t = node.targets[0]
+        if not isinstance(t, ast.Name) or t.id != "result":
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        if value.args or value.keywords:
+            continue
+        if not isinstance(value.func, ast.Attribute) or value.func.attr != "sum":
+            continue
+        col = _extract_df_subscript_col(value.func.value)
+        if col:
+            return col
+    return None
 
 
 def _id_like_columns(profile_cols: List[str], excluded: set[str]) -> List[str]:
@@ -747,47 +891,51 @@ def _id_like_columns(profile_cols: List[str], excluded: set[str]) -> List[str]:
     ][:6]
 
 
-def _rewrite_sum_of_product_code(code: str, df_profile: Optional[dict]) -> str:
+def _rewrite_sum_of_product_code(code: str, df_profile: Optional[dict], question: str = "") -> str:
     """
     Universal guard for read queries of form:
         result = (df[col_a] * df[col_b]).sum()
     Excludes synthetic summary rows that have product columns populated but identifiers/metadata missing.
     """
+    if re.search(
+        r"\b(mean|avg|average|median|max(?:imum)?|min(?:imum)?|середн\w*|медіан\w*|макс\w*|мін\w*)\b",
+        question or "",
+        re.I,
+    ):
+        logging.info(
+            "event=sum_of_product_rewrite skipped reason=non_sum_aggregation question=%s",
+            _safe_trunc(question, 200),
+        )
+        return code
+    if _code_has_subset_filter_ops(code or ""):
+        logging.info(
+            "event=sum_of_product_rewrite skipped reason=code_has_filter question=%s",
+            _safe_trunc(question, 200),
+        )
+        return code
+
     cols = _detect_result_sum_of_product_columns(code or "")
     if not cols:
         return code
     left_col, right_col = cols
-    profile_cols = [str(c) for c in ((df_profile or {}).get("columns") or [])]
-    id_like_cols = _id_like_columns(profile_cols, {left_col, right_col})
 
     lines = [
         f"_left_col = {left_col!r}",
         f"_right_col = {right_col!r}",
-        "_valid = pd.Series(True, index=df.index)",
-        "_meta_cols = [c for c in df.columns if c not in {_left_col, _right_col}]",
-        "if _meta_cols:",
-        "    _valid = _valid & (df[_meta_cols].notna().sum(axis=1) > 0)",
-        f"_id_like = {id_like_cols!r}",
-        "if _id_like:",
-        "    _id_like = [c for c in _id_like if c in df.columns]",
-        "    if _id_like:",
-        "        _valid = _valid & df[_id_like].notna().any(axis=1)",
-        "_left_raw = df.loc[_valid, _left_col].astype(str)",
-        r"_left_clean = _left_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
-        r"_left_mask = _left_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
-        "_left = _left_clean.where(_left_mask, np.nan).astype(float)",
-        "_right_raw = df.loc[_valid, _right_col].astype(str)",
-        r"_right_clean = _right_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
-        r"_right_mask = _right_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
-        "_right = _right_clean.where(_right_mask, np.nan).astype(float)",
-        "result = float((_left * _right).sum())",
-        "print(f\"sum_of_product_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
+        "_cols_ok = (_left_col in df.columns) and (_right_col in df.columns)",
+        "if not _cols_ok:",
+        "    result = None",
+        "else:",
+        "    _left = pd.to_numeric(df[_left_col], errors='coerce')",
+        "    _right = pd.to_numeric(df[_right_col], errors='coerce')",
+        "    _valid = _left.notna() & _right.notna()",
+        "    result = float((_left[_valid] * _right[_valid]).sum())",
+        "    print(f\"sum_of_product_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
     ]
     logging.info(
-        "event=sum_of_product_rewrite applied left_col=%s right_col=%s id_like=%s",
+        "event=sum_of_product_rewrite applied left_col=%s right_col=%s",
         left_col,
         right_col,
-        id_like_cols,
     )
     return "\n".join(lines) + ("\n" if (code or "").endswith("\n") else "")
 
@@ -806,21 +954,25 @@ def _rewrite_single_column_sum_code(code: str, df_profile: Optional[dict]) -> st
 
     lines = [
         f"_value_col = {value_col!r}",
-        "_valid = pd.Series(True, index=df.index)",
-        "_meta_cols = [c for c in df.columns if c != _value_col]",
-        "if _meta_cols:",
-        "    _valid = _valid & (df[_meta_cols].notna().sum(axis=1) > 0)",
-        f"_id_like = {id_like_cols!r}",
-        "if _id_like:",
-        "    _id_like = [c for c in _id_like if c in df.columns]",
+        "_col_ok = _value_col in df.columns",
+        "if not _col_ok:",
+        "    result = None",
+        "else:",
+        "    _valid = pd.Series(True, index=df.index)",
+        "    _meta_cols = [c for c in df.columns if c != _value_col]",
+        "    if _meta_cols:",
+        "        _valid = _valid & (df[_meta_cols].notna().sum(axis=1) > 0)",
+        f"    _id_like = {id_like_cols!r}",
         "    if _id_like:",
-        "        _valid = _valid & df[_id_like].notna().any(axis=1)",
-        "_raw = df.loc[_valid, _value_col].astype(str)",
-        r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
-        r"_num_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
-        "_values = _clean.where(_num_mask, np.nan).astype(float)",
-        "result = float(_values.sum())",
-        "print(f\"single_sum_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
+        "        _id_like = [c for c in _id_like if c in df.columns]",
+        "        if _id_like:",
+        "            _valid = _valid & df[_id_like].notna().any(axis=1)",
+        "    _raw = df.loc[_valid, _value_col].astype(str)",
+        r"    _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"    _num_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "    _values = _clean.where(_num_mask, np.nan).astype(float)",
+        "    result = float(_values.sum())",
+        "    print(f\"single_sum_guard rows_total={len(df)} rows_used={int(_valid.sum())} rows_excluded={int((~_valid).sum())}\")",
     ]
     logging.info(
         "event=single_sum_rewrite applied value_col=%s id_like=%s",
@@ -832,12 +984,180 @@ def _rewrite_single_column_sum_code(code: str, df_profile: Optional[dict]) -> st
 
 def _is_total_value_scalar_question(question: str, profile: Optional[dict]) -> bool:
     q = (question or "").lower()
-    has_value = bool(re.search(r"\b(варт\w*|value|cost|цін\w*|price|кошту\w*)\b", q))
+    # Do not treat non-sum aggregations as total inventory value.
+    if re.search(r"\b(mean|average|avg|median|max(?:imum)?|min(?:imum)?|середн\w*|медіан\w*|макс\w*|мін\w*)\b", q):
+        return False
+    has_value = bool(re.search(r"\b(варт\w*|value|cost|цін\w*|price|кошту\w*|вируч\w*|дохід\w*)\b", q))
     has_total = bool(re.search(r"\b(всього|загальн\w*|total|sum|сума)\b", q))
     has_mul = ("×" in q) or ("*" in q) or bool(re.search(r"\b(x|mul|помнож|добут)\w*\b", q))
-    columns = [str(c) for c in (profile or {}).get("columns") or []]
-    mentioned_cols = _find_columns_in_text(question or "", columns)
-    return has_value and (has_total or has_mul or len(mentioned_cols) >= 2)
+    # Require explicit total/multiply intent to avoid false positives from noisy context.
+    return has_value and (has_total or has_mul)
+
+
+def _is_top_expensive_available_intent(question: str) -> bool:
+    q = (question or "").lower()
+    has_top = bool(re.search(r"\b(top|топ|найдорожч\w*|найвищ\w*\s+цін\w*|max\s+price)\b", q))
+    has_price = bool(re.search(r"\b(цін\w*|price|варт\w*|cost)\b", q))
+    has_entity = bool(re.search(r"\b(товар\w*|модел\w*|product\w*|item\w*)\b", q))
+    has_available = bool(re.search(r"\b(наявн\w*|in\s+stock|available|склад\w*)\b", q))
+    return has_top and (has_price or has_top) and has_entity and has_available
+
+
+def _has_ranking_cues(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(
+        re.search(
+            r"\b("
+            r"top|топ|найдорож\w*|найдешев\w*|найбіль\w*|наймен\w*|"
+            r"highest|lowest|largest|smallest|most\s+expensive|cheapest|"
+            r"max(?:imum)?|min(?:imum)?|rank(?:ing)?"
+            r")\b",
+            q,
+            re.I,
+        )
+    )
+
+
+def _looks_like_value_filter_query(question: str) -> bool:
+    q = (question or "").lower()
+    has_number = bool(re.search(r"\d", q))
+    if not has_number:
+        return False
+    return bool(
+        re.search(
+            r"(=|==|<=|>=|<|>)"
+            r"|\b(дорівн\w*|рівн\w*|equal(?:s)?|exact(?:ly)?)\b"
+            r"|\b(де|where|має|мають|with|having|price\s+of|ціною)\b",
+            q,
+            re.I,
+        )
+    )
+
+
+def _has_explicit_status_constraint(question: str) -> bool:
+    q = (question or "").lower()
+    return bool(re.search(r"\b(статус\w*|status)\b", q))
+
+
+def _rewrite_top_expensive_available_code(code: str, question: str, df_profile: Optional[dict]) -> str:
+    """
+    For intents like "top-N most expensive available products", avoid strict equality
+    to one status value (e.g. only 'В наявності') and use inventory-oriented availability.
+    """
+    if not _is_top_expensive_available_intent(question):
+        return code
+    profile = df_profile or {}
+    price_col = _pick_price_like_column(profile)
+    qty_col = _pick_quantity_like_column(profile)
+    if not price_col:
+        return code
+    cols = [str(c) for c in (profile.get("columns") or [])]
+    status_col = _pick_availability_column(question, profile) if cols else None
+    top_n = _extract_top_n_from_question(question, default=5)
+    explicit_status = _has_explicit_status_constraint(question)
+
+    out_cols: List[str] = []
+    for c in ("ID", "Категорія", "Бренд", "Модель", price_col):
+        if c in cols and c not in out_cols:
+            out_cols.append(c)
+    if not out_cols:
+        out_cols = [price_col]
+
+    lines = [
+        f"_price_col = {price_col!r}",
+        f"_qty_col = {qty_col!r}" if qty_col else "_qty_col = None",
+        f"_status_col = {status_col!r}" if status_col else "_status_col = None",
+        f"_top_n = {int(top_n)}",
+        f"_strict_status = {bool(explicit_status)!r}",
+        "_df_src = df.copy(deep=False)",
+        "_avail = pd.Series(True, index=_df_src.index)",
+        "if _qty_col and (_qty_col in _df_src.columns):",
+        "    _qty_raw = _df_src[_qty_col].astype(str)",
+        r"    _qty_clean = _qty_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"    _qty_mask = _qty_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "    _qty = _qty_clean.where(_qty_mask, np.nan).astype(float)",
+        "    _avail = _avail & (_qty > 0)",
+        "if _status_col and (_status_col in _df_src.columns):",
+        "    _status = _df_src[_status_col].astype(str).str.strip().str.lower()",
+        r"    _pos_re = r'(?:в\s*наявн|наявн|in\s*stock|available|доступн|закінч\w*|резерв\w*)'",
+        r"    _neg_re = r'(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)'",
+        r"    _order_re = r'(?:під\s*замовлення|under\s*order|backorder)'",
+        "    if _strict_status:",
+        "        _in = _status.str.contains(_pos_re, regex=True, na=False)",
+        "        _out = _status.str.contains(_neg_re, regex=True, na=False)",
+        "        _avail = _avail & _in & ~_out",
+        "    else:",
+        "        _under_order = _status.str.contains(_order_re, regex=True, na=False)",
+        "        _avail = _avail & (~_under_order)",
+        "_top_df = _df_src.loc[_avail].copy()",
+        "if _price_col not in _top_df.columns:",
+        "    result = []",
+        "else:",
+        "    _top_df = _top_df.nlargest(_top_n, _price_col)",
+        f"    result = _top_df[{out_cols!r}]",
+    ]
+    logging.info(
+        "event=top_expensive_available_rewrite applied top_n=%s price_col=%s qty_col=%s status_col=%s strict_status=%s",
+        top_n,
+        price_col,
+        qty_col,
+        status_col,
+        explicit_status,
+    )
+    return "\n".join(lines) + ("\n" if (code or "").endswith("\n") else "")
+
+
+def _is_numeric_dtype_text(dtype: str) -> bool:
+    d = str(dtype or "").lower()
+    return d.startswith(("int", "float", "uint"))
+
+
+def _is_id_like_col_name(col: str) -> bool:
+    return bool(re.search(r"(?:^|_)(id|sku|код|артикул)(?:$|_)", str(col).lower()))
+
+
+def _pick_price_like_column(profile: dict) -> Optional[str]:
+    cols = [str(c) for c in ((profile or {}).get("columns") or [])]
+    dtypes = (profile or {}).get("dtypes") or {}
+    numeric = [c for c in cols if _is_numeric_dtype_text(dtypes.get(c, ""))]
+    if not numeric:
+        return None
+    pref = [
+        c for c in numeric
+        if re.search(r"(цін|price|варт|cost|amount|total|revenue|вируч)", c.lower())
+    ]
+    if pref:
+        return pref[0]
+    non_id = [c for c in numeric if not _is_id_like_col_name(c)]
+    return non_id[0] if non_id else numeric[0]
+
+
+def _pick_quantity_like_column(profile: dict) -> Optional[str]:
+    cols = [str(c) for c in ((profile or {}).get("columns") or [])]
+    dtypes = (profile or {}).get("dtypes") or {}
+    numeric = [c for c in cols if _is_numeric_dtype_text(dtypes.get(c, ""))]
+    if not numeric:
+        return None
+    pref = [
+        c for c in numeric
+        if re.search(r"(кільк|qty|quantity|units|stock|залишк)", c.lower())
+    ]
+    if pref:
+        return pref[0]
+    non_id = [c for c in numeric if not _is_id_like_col_name(c)]
+    return non_id[0] if non_id else numeric[0]
+
+
+def _total_inventory_value_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
+    if not _is_total_value_scalar_question(question, profile):
+        return None
+    price_col = _pick_price_like_column(profile)
+    qty_col = _pick_quantity_like_column(profile)
+    if not price_col or not qty_col or price_col == qty_col:
+        return None
+    code = f"result = (df[{price_col!r}] * df[{qty_col!r}]).sum()\n"
+    plan = f"Порахувати загальну вартість як суму добутків {qty_col} × {price_col}."
+    return code, plan
 
 def _has_df_assignment(code: str) -> bool:
     return bool(re.search(r"(^|\n)\s*df\s*=", code or "")) or bool(
@@ -868,6 +1188,27 @@ def _call_has_inplace_true(call: ast.Call) -> bool:
             return True
     return False
 
+
+def _expr_references_df(node: ast.AST) -> bool:
+    try:
+        return any(isinstance(n, ast.Name) and n.id == "df" for n in ast.walk(node))
+    except Exception:
+        return False
+
+
+def _is_non_mutating_df_copy_call(call: ast.Call) -> bool:
+    # Allow read-mode prelude: df = df.copy(deep=False/True)
+    if not isinstance(call, ast.Call):
+        return False
+    func = call.func
+    if not isinstance(func, ast.Attribute):
+        return False
+    if func.attr != "copy":
+        return False
+    if not isinstance(func.value, ast.Name) or func.value.id != "df":
+        return False
+    return True
+
 def _auto_detect_commit(code: str) -> bool:
     if not (code or "").strip():
         return False
@@ -881,6 +1222,8 @@ def _auto_detect_commit(code: str) -> bool:
         return bool(
             re.search(r"df\.(loc|iloc|at|iat)\[.+?\]\s*=", code or "", re.S)
             or re.search(r"df\[[^\]]+\]\s*=", code or "")
+            or re.search(r"df\s*=\s*df\s*\[", code or "", re.I)
+            or re.search(r"df\s*=\s*df\.(loc|iloc)\s*\[", code or "", re.I)
             or re.search(r"df\s*=\s*df\.(drop|rename|assign|replace|fillna|sort_values|reset_index|set_index|astype|reindex|drop_duplicates|dropna|mask|where|convert_dtypes|sort_index)\s*\(", code or "", re.I)
             or re.search(r"df\s*=\s*pd\.concat\s*\(", code or "", re.I)
         )
@@ -892,6 +1235,12 @@ def _auto_detect_commit(code: str) -> bool:
                 if any(isinstance(t, (ast.Subscript, ast.Attribute)) for t in targets):
                     return True
                 value = node.value
+                # Any assignment back into `df` that derives from `df` is a mutation signal,
+                # except a plain defensive copy (`df = df.copy(...)`) used in read code.
+                if isinstance(value, ast.Call) and _is_non_mutating_df_copy_call(value):
+                    continue
+                if _expr_references_df(value):
+                    return True
                 if isinstance(value, ast.Call):
                     # Handle chained calls like:
                     # df = df.drop(...).reset_index(...)
@@ -961,6 +1310,39 @@ _ROUTER_MUTATING_INTENT_HINTS = (
     "concat",
 )
 
+_ROUTER_FILTER_CONTEXT_RE = re.compile(
+    r"\b(серед|among|within|where|де|тільки|only|лише|having)\b"
+    r"|(?:що|які)\s+мають"
+    r"|(?:with|for)\s+[a-zа-яіїєґ0-9_]{2,}",
+    re.I,
+)
+
+_AVAILABILITY_FILTER_CUE_RE = re.compile(
+    r"\b(на\s+склад\w*|в\s+наявн\w*|наявн\w*|в\s+запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн\w*)\b",
+    re.I,
+)
+
+_ROUTER_METRIC_CUE_RE = re.compile(
+    r"\b("
+    r"max(?:imum)?|minimum|min|mean|average|avg|median|sum|total|count|"
+    r"макс\w*|мін\w*|середн\w*|сума|підсум\w*|кільк\w*|скільк\w*"
+    r")\b",
+    re.I,
+)
+
+_ROUTER_ENTITY_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{2,}\b")
+_GROUPING_CUE_RE = re.compile(
+    r"\b("
+    r"group\s*by|"
+    r"by\s+\w+|"
+    r"by\s+(?:category|categories|brand|brands|model|models|type|types)|"
+    r"per\s+\w+|"
+    r"по\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)|"
+    r"за\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)"
+    r")\b",
+    re.I,
+)
+
 
 def _router_intent_looks_mutating(intent_id: str) -> bool:
     s = (intent_id or "").strip().lower()
@@ -969,11 +1351,137 @@ def _router_intent_looks_mutating(intent_id: str) -> bool:
     return any(h in s for h in _ROUTER_MUTATING_INTENT_HINTS)
 
 
-def _should_reject_router_hit_for_read(has_edit: bool, analysis_code: str, router_meta: Optional[dict]) -> bool:
+def _question_has_filter_context_for_router_guard(question: str) -> bool:
+    q = (question or "").strip()
+    if not q:
+        return False
+    has_metric = bool(_ROUTER_METRIC_CUE_RE.search(q))
+    has_filter_words = bool(_ROUTER_FILTER_CONTEXT_RE.search(q))
+    has_availability_cue = bool(_AVAILABILITY_FILTER_CUE_RE.search(q))
+    has_value_filter = _looks_like_value_filter_query(q)
+    has_entity_token = bool(_ROUTER_ENTITY_TOKEN_RE.search(q))
+    has_grouping_cue = bool(_GROUPING_CUE_RE.search(q))
+    if has_grouping_cue and not (has_filter_words or has_availability_cue or has_value_filter or has_entity_token):
+        # Grouped aggregations ("by/per/по/за ...") should not be treated as subset
+        # unless we have an explicit filter signal.
+        return False
+    if has_filter_words or has_availability_cue or has_value_filter or (has_metric and has_entity_token):
+        return True
+    if not has_metric:
+        return False
+    metric_roots = {
+        "max",
+        "min",
+        "mea",
+        "avg",
+        "sum",
+        "tot",
+        "cou",
+        "кіл",
+        "скі",
+        "мак",
+        "мін",
+        "сер",
+        "сум",
+        "під",
+        "цін",
+        "вар",
+    }
+    tokens = [t for t in _subset_word_tokens(q) if t[:3] not in metric_roots]
+    # Conservative fallback: trigger only when query has likely entity token
+    # (ASCII brand/model token or mixed alnum token), e.g. "відеокарт nvidia".
+    has_entity_like = any(re.search(r"[a-z0-9]", t) for t in tokens)
+    return has_entity_like and len(tokens) >= 2
+
+
+def _router_code_has_filter_ops(analysis_code: str) -> bool:
+    code = analysis_code or ""
+    if not code.strip():
+        return False
+    if re.search(r"\.query\s*\(", code):
+        return True
+    if re.search(r"\.str\.contains\s*\(", code):
+        return True
+    if re.search(r"\.str\.match\s*\(", code):
+        return True
+    if re.search(r"(?m)^\s*(?:df|_work)\s*=\s*(?:df|_work)\.loc\s*\[", code):
+        return True
+    if re.search(r"(?m)^\s*(?:df|_work)\s*=\s*(?:df|_work)\s*\[\s*_[A-Za-z]\w*\s*\]", code):
+        return True
+    if re.search(r"(?m)^\s*(?:df|_work)\s*=\s*(?:df|_work)\s*\[.*(?:==|!=|>=|<=|>|<|\.isin\s*\()", code):
+        return True
+    return False
+
+
+def _question_requires_subset_filter(question: str, profile: Optional[dict] = None) -> bool:
+    q = (question or "").strip()
+    if not q:
+        return False
+    has_grouping_cue = bool(_GROUPING_CUE_RE.search(q))
+    if has_grouping_cue:
+        # "по категоріях/брендах" is usually a grouped aggregation over all rows,
+        # not a subset filter. Keep subset mode only when we can detect an actual entity term.
+        if not profile:
+            return False
+        try:
+            maybe_terms = _extract_subset_terms_from_question(q, profile, limit=2)
+            if not maybe_terms:
+                return False
+        except Exception:
+            return False
+    has_metric = bool(_ROUTER_METRIC_CUE_RE.search(q))
+    if not has_metric:
+        return False
+    if _question_has_filter_context_for_router_guard(q):
+        return True
+    # Profile-aware fallback: if query contains entity-like term present in table preview,
+    # treat it as subset request even without explicit words like "серед/where/for".
+    if profile:
+        try:
+            terms = _extract_subset_terms_from_question(q, profile, limit=2)
+            if terms:
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _code_has_subset_filter_ops(code: str) -> bool:
+    s = code or ""
+    if not s.strip():
+        return False
+    # Strong filter signals for subset-style questions.
+    if re.search(r"\.str\.(contains|match)\s*\(", s):
+        return True
+    if re.search(r"\.query\s*\(", s):
+        return True
+    if re.search(r"\.isin\s*\(", s):
+        return True
+    if re.search(r"\[\s*['\"][^'\"]+['\"]\s*\].*?(==|!=)\s*['\"][^'\"]+['\"]", s):
+        return True
+    if re.search(r"(?m)^\s*(?:df|_work)\s*=\s*(?:df|_work)\s*\[\s*_[A-Za-z]\w*\s*\]", s):
+        return True
+    return False
+
+
+def _should_reject_router_hit_for_read(
+    has_edit: bool,
+    analysis_code: str,
+    router_meta: Optional[dict],
+    question: str = "",
+) -> bool:
     if has_edit:
         return False
     intent_id = str((router_meta or {}).get("intent_id") or "")
     if _router_intent_looks_mutating(intent_id):
+        return True
+    if _question_has_filter_context_for_router_guard(question) and not _router_code_has_filter_ops(analysis_code):
+        logging.warning(
+            "event=shortcut_router_guard status=rejected reason=missing_filter intent_id=%s question_preview=%s code_preview=%s",
+            intent_id,
+            _safe_trunc(question, 200),
+            _safe_trunc(analysis_code, 300),
+        )
         return True
     if re.search(r"(?m)^\s*COMMIT_DF\s*=\s*True\s*$", analysis_code or ""):
         return True
@@ -1027,6 +1535,369 @@ def _detect_metrics(question: str) -> List[str]:
     # stable order
     order = ["mean", "min", "max", "median", "sum", "count"]
     return [m for m in order if m in found]
+
+
+_SUBSET_TOKEN_STOPWORDS = {
+    "the",
+    "and",
+    "with",
+    "for",
+    "from",
+    "that",
+    "this",
+    "where",
+    "only",
+    "among",
+    "within",
+    "count",
+    "price",
+    "prices",
+    "value",
+    "total",
+    "sum",
+    "avg",
+    "mean",
+    "median",
+    "min",
+    "max",
+    "maximum",
+    "minimum",
+    "rows",
+    "items",
+    "products",
+    "data",
+    "table",
+    "порах",
+    "раху",
+    "підра",
+    "скіл",
+    "кіль",
+    "сума",
+    "суму",
+    "ціна",
+    "цін",
+    "варт",
+    "загал",
+    "сере",
+    "меді",
+    "мін",
+    "макс",
+    "макси",
+    "мінім",
+    "рядк",
+    "запи",
+    "това",
+    "дани",
+    "табл",
+    "яка",
+    "який",
+    "яке",
+    "сере",
+    "серед",
+    "для",
+    "з",
+    "та",
+    "і",
+}
+
+
+def _subset_word_tokens(text: str) -> List[str]:
+    if not text:
+        return []
+    raw = re.findall(r"[A-Za-zА-Яа-яІіЇїЄєҐґ0-9_/-]{2,}", text.lower())
+    out: List[str] = []
+    for tok in raw:
+        tok = tok.strip("_-/")
+        if len(tok) < 3:
+            continue
+        if re.fullmatch(r"\d+", tok):
+            continue
+        out.append(tok)
+    return out
+
+
+def _preview_value_roots(profile: Optional[dict], limit_rows: int = 150) -> set[str]:
+    preview = (profile or {}).get("preview") or []
+    roots: set[str] = set()
+    if not isinstance(preview, list):
+        return roots
+    for row in preview[:limit_rows]:
+        if not isinstance(row, dict):
+            continue
+        for val in row.values():
+            if val is None:
+                continue
+            sval = str(val).strip().lower()
+            if not sval:
+                continue
+            if re.fullmatch(r"[\d\s.,:%\-]+", sval):
+                continue
+            for tok in _subset_word_tokens(sval):
+                roots.add(tok[:5])
+    return roots
+
+
+def _extract_subset_terms_from_question(question: str, profile: Optional[dict], limit: int = 4) -> List[str]:
+    q_tokens = _subset_word_tokens(question or "")
+    if not q_tokens:
+        return []
+    preview_roots = _preview_value_roots(profile)
+    if not preview_roots:
+        return []
+
+    keep: List[str] = []
+    seen: set[str] = set()
+    for tok in q_tokens:
+        root = tok[:5]
+        if root in _SUBSET_TOKEN_STOPWORDS:
+            continue
+        if root in seen:
+            continue
+        # Accept terms that are likely entities/features present in table values.
+        if root in preview_roots:
+            keep.append(tok)
+            seen.add(root)
+            if len(keep) >= limit:
+                break
+            continue
+        # Fuzzy inflection fallback (e.g. "мишей" vs preview "миша").
+        root3 = root[:3]
+        if root3 and any(pr[:3] == root3 for pr in preview_roots):
+            keep.append(tok)
+            seen.add(root)
+            if len(keep) >= limit:
+                break
+    return keep
+
+
+def _fallback_subset_terms_from_question(question: str, limit: int = 3) -> List[str]:
+    tokens = _subset_word_tokens(question or "")
+    if not tokens:
+        return []
+    generic_roots = set(_SUBSET_TOKEN_STOPWORDS) | {
+        "товар",
+        "склад",
+        "наяв",
+        "досту",
+        "стату",
+        "катег",
+        "бренд",
+        "модел",
+        "group",
+        "row",
+        "colum",
+    }
+    out: List[str] = []
+    seen: set[str] = set()
+    for tok in tokens:
+        root = tok[:5]
+        if root in generic_roots:
+            continue
+        if root in seen:
+            continue
+        out.append(tok)
+        seen.add(root)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _subset_term_pattern(term: str) -> str:
+    t = str(term or "").strip().lower()
+    if not t:
+        return ""
+    # For mixed alnum tokens (e.g. rtx4090) keep exact token matching.
+    if re.search(r"\d", t):
+        return re.escape(t)
+    # Cyrillic orthography tolerance (uk/ru variants).
+    # Example: "миша" should also match "мышь".
+    cyr_equiv = {
+        "и": "иіы",
+        "і": "иіы",
+        "ы": "иіы",
+        "е": "еєёэ",
+        "є": "еєёэ",
+        "ё": "еєёэ",
+        "э": "еєёэ",
+        "г": "гґ",
+        "ґ": "гґ",
+    }
+    # Universal fuzzy prefix:
+    # - Cyrillic terms: 3-char stem captures inflections ("миша/миші/мишка")
+    # - Latin terms: 4-char stem keeps precision for brands/models
+    is_cyr = bool(re.search(r"[а-яіїєґ]", t, re.I))
+    root_len = 3 if is_cyr else 4
+    root_len = max(2, min(root_len, len(t)))
+    root = t[:root_len]
+    if is_cyr:
+        root_re = "".join(
+            f"[{re.escape(cyr_equiv[ch])}]" if ch in cyr_equiv else re.escape(ch)
+            for ch in root
+        )
+        return r"\b" + root_re + r"\w*"
+    return r"\b" + re.escape(root) + r"\w*"
+
+
+def _subset_keyword_metric_shortcut_code(
+    question: str,
+    profile: dict,
+    preferred_col: Optional[str] = None,
+    terms_hint: Optional[List[str]] = None,
+    slots_hint: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[str, str]]:
+    if not (question or "").strip():
+        return None
+    if _has_edit_triggers(question):
+        return None
+
+    metrics = _detect_metrics(question)
+    if not metrics and not _is_count_intent(question):
+        return None
+    if not metrics and _is_count_intent(question):
+        metrics = ["count"]
+
+    terms = [str(t).strip() for t in (terms_hint or []) if str(t).strip()]
+    if not terms:
+        terms = _extract_subset_terms_from_question(question, profile)
+    if not terms:
+        terms = _fallback_subset_terms_from_question(question, limit=2)
+    if not terms:
+        return None
+
+    requires_subset = _question_requires_subset_filter(question)
+    if not requires_subset and not _is_count_intent(question):
+        return None
+
+    columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+    if not columns:
+        return None
+    dtypes = (profile or {}).get("dtypes") or {}
+    text_cols = [
+        c for c in columns if not str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))
+    ]
+    if not text_cols:
+        text_cols = columns[:]
+
+    q_low = (question or "").lower()
+    has_availability_cue = bool(
+        re.search(r"\b(на\s+складі|в\s+наявн|у\s+наявн|in\s+stock|available|наявн|склад\w*|залишк\w*)\b", q_low)
+    )
+    availability_mode = _availability_target_mode(question) if has_availability_cue else ""
+    availability_col = _pick_availability_column(question, profile) if availability_mode else None
+    qty_like_col = _pick_quantity_like_column(profile)
+    llm_agg = str((slots_hint or {}).get("agg") or "").strip().lower()
+    llm_metric_col = str((slots_hint or {}).get("metric_col") or "").strip()
+    llm_avail_mode = str((slots_hint or {}).get("availability_mode") or "").strip().lower()
+    llm_avail_col = str((slots_hint or {}).get("availability_col") or "").strip()
+
+    metric_order = ["count", "max", "min", "mean", "median", "sum"]
+    metric = next((m for m in metric_order if m in metrics), "count")
+    if llm_agg in {"count", "sum", "mean", "min", "max", "median"}:
+        metric = llm_agg
+    # Disambiguate "загальна кількість ... на складі": sum stock units, not row count.
+    if metric == "count" and qty_like_col and (_is_sum_intent(question) or availability_mode):
+        metric = "sum"
+    if llm_avail_mode in {"in", "out", "any"}:
+        availability_mode = llm_avail_mode
+    if availability_mode and llm_avail_col in columns:
+        availability_col = llm_avail_col
+
+    metric_col: Optional[str] = None
+    if metric != "count":
+        if llm_metric_col in columns and str(dtypes.get(llm_metric_col, "")).lower().startswith(("int", "float", "uint")):
+            metric_col = llm_metric_col
+        if metric == "sum" and qty_like_col in columns:
+            metric_col = metric_col or qty_like_col
+        if not metric_col and preferred_col and preferred_col in columns:
+            metric_col = preferred_col
+        if not metric_col:
+            metric_col = _choose_column_from_question(question, profile)
+        if not metric_col and metric == "sum" and qty_like_col in columns:
+            metric_col = qty_like_col
+        if not metric_col:
+            return None
+
+    patterns = [p for p in (_subset_term_pattern(t) for t in terms) if p]
+    if not patterns:
+        return None
+
+    code_lines: List[str] = [
+        "_work = df.copy(deep=False)",
+        f"_text_cols = {text_cols!r}",
+        "if not _text_cols:",
+        "    _text_cols = list(_work.columns)",
+        "_text = _work[_text_cols].fillna('').astype(str).apply(' '.join, axis=1).str.lower()",
+        f"_patterns = {patterns!r}",
+        "_mask_and = pd.Series(True, index=_work.index)",
+        "for _pat in _patterns:",
+        "    _mask_and = _mask_and & _text.str.contains(_pat, regex=True, na=False)",
+        "_mask_or = pd.Series(False, index=_work.index)",
+        "for _pat in _patterns:",
+        "    _mask_or = _mask_or | _text.str.contains(_pat, regex=True, na=False)",
+        "_mask = _mask_and if _mask_and.any() else _mask_or",
+        "_work = _work.loc[_mask].copy()",
+    ]
+    if availability_mode:
+        code_lines.extend(
+            [
+                f"_avail_mode = {availability_mode!r}",
+                f"_avail_col = {availability_col!r}" if availability_col else "_avail_col = None",
+                f"_qty_col = {qty_like_col!r}" if qty_like_col else "_qty_col = None",
+                r"_in_re = r'(?:в\s*наявн|наявн|in\s*stock|available|доступн|резерв\w*|закінч\w*)'",
+                r"_out_re = r'(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)'",
+                "if _avail_col and (_avail_col in _work.columns):",
+                "    _st = _work[_avail_col].astype(str).str.strip().str.lower()",
+                "    _in = _st.str.contains(_in_re, regex=True, na=False)",
+                "    _out = _st.str.contains(_out_re, regex=True, na=False)",
+                "elif _qty_col and (_qty_col in _work.columns):",
+                "    _q = pd.to_numeric(_work[_qty_col], errors='coerce')",
+                "    _in = _q > 0",
+                "    _out = _q <= 0",
+                "else:",
+                "    _in = pd.Series(True, index=_work.index)",
+                "    _out = pd.Series(False, index=_work.index)",
+                "if _avail_mode == 'out':",
+                "    _work = _work.loc[_out & ~_in].copy()",
+                "elif _avail_mode == 'any':",
+                "    _work = _work.loc[_in | _out].copy()",
+                "else:",
+                "    _work = _work.loc[_in & ~_out].copy()",
+            ]
+        )
+
+    if metric == "count":
+        code_lines.append("result = int(len(_work))")
+    else:
+        code_lines.extend(
+            [
+                f"_metric_col = {metric_col!r}",
+                "if _metric_col not in _work.columns:",
+                "    result = None",
+                "else:",
+                "    _raw = _work[_metric_col].astype(str)",
+                r"    _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+                r"    _num_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+                "    _num = _clean.where(_num_mask, np.nan).astype(float)",
+                f"    _metric = {metric!r}",
+                "    if _metric == 'max':",
+                "        _v = _num.max()",
+                "    elif _metric == 'min':",
+                "        _v = _num.min()",
+                "    elif _metric == 'mean':",
+                "        _v = _num.mean()",
+                "    elif _metric == 'median':",
+                "        _v = _num.median()",
+                "    else:",
+                "        _v = _num.sum()",
+                "    result = None if pd.isna(_v) else float(_v)",
+            ]
+        )
+
+    plan = (
+        "Виділити підмножину рядків за ключовими словами запиту "
+        f"({', '.join(terms)}) і порахувати метрику {metric}."
+    )
+    return "\n".join(code_lines) + "\n", plan
 
 
 _ALLOWED_SERIES_AGG = {"mean", "min", "max", "sum", "median", "count"}
@@ -1103,12 +1974,16 @@ def _pick_relevant_column(question: str, columns: List[str]) -> Optional[str]:
     return best_col
 
 
-_AVAILABILITY_VALUE_RE = re.compile(r"\b(в\s+наявн|наявн|in\s+stock|available)\b", re.I)
+_AVAILABILITY_VALUE_RE = re.compile(
+    r"\b(в\s+наявн|наявн|в\s+запас\w*|запас\w*|залишк\w*|in\s+stock|available|inventory|warehouse)\b",
+    re.I,
+)
 _AVAILABILITY_COL_RE = re.compile(
-    r"\b(статус\w*|наявн\w*|доступн\w*|availability|available|in_stock|stock|status)\b", re.I
+    r"\b(статус\w*|наявн\w*|доступн\w*|запас\w*|залишк\w*|availability|available|in_stock|stock|inventory|warehouse|status)\b",
+    re.I,
 )
 _AVAILABILITY_NEG_RE = re.compile(r"\b(нема|відсутн|out\s+of\s+stock|unavailable|not\s+available)\b", re.I)
-_AVAILABILITY_WAREHOUSE_RE = re.compile(r"\b(склад\w*|warehouse|inventory)\b", re.I)
+_AVAILABILITY_WAREHOUSE_RE = re.compile(r"\b(склад\w*|запас\w*|залишк\w*|warehouse|inventory)\b", re.I)
 
 
 def _is_availability_count_intent(question: str) -> bool:
@@ -1227,17 +2102,35 @@ def _finalize_code_for_sandbox(
     df_profile: Optional[dict]=None,
 ) -> Tuple[str, bool, Optional[str]]:
     code = _normalize_generated_code(analysis_code or "")
-    code = _rewrite_sum_of_product_code(code, df_profile)
+    inferred = _infer_op_from_question(question)
+    op_norm = (op or "").strip().lower()
+    if op_norm not in ("read", "edit"):
+        op_norm = inferred
+
+    requires_subset_filter = (
+        op_norm == "read"
+        and not _has_edit_triggers(question)
+        and _question_requires_subset_filter(question, df_profile)
+    )
+    if requires_subset_filter and not _code_has_subset_filter_ops(code):
+        logging.warning(
+            "event=skip_rewrites reason=subset_filter_missing question_preview=%s code_preview=%s",
+            _safe_trunc(question, 200),
+            _safe_trunc(code, 300),
+        )
+        return (
+            code,
+            False,
+            "missing_subset_filter: Generated code does not filter data for requested subset. Please add subset filter before aggregation.",
+        )
+
+    code = _rewrite_top_expensive_available_code(code, question, df_profile)
+    code = _rewrite_sum_of_product_code(code, df_profile, question=question)
     code = _rewrite_single_column_sum_code(code, df_profile)
     code = _rewrite_forbidden_getattr(code)
     code, removed_imports = _strip_forbidden_imports(code)
     if removed_imports:
         logging.warning("event=auto_fix_import removed forbidden import statements from generated code")
-
-    inferred = _infer_op_from_question(question)
-    op_norm = (op or "").strip().lower()
-    if op_norm not in ("read", "edit"):
-        op_norm = inferred
 
     if op_norm == "edit" or _has_edit_triggers(question):
         if re.search(r"(^|\n)\s*result\s*=\s*pd\.concat\(", code):
@@ -1486,6 +2379,35 @@ def _match_column_by_index(text: str, columns: List[str]) -> Optional[str]:
     return None
 
 
+def _column_mention_pos(text: str, column_name: str) -> int:
+    """Return first mention position of a column name, avoiding short-token false positives like ID in NVIDIA."""
+    if not text or not column_name:
+        return -1
+    hay = str(text)
+    lower = hay.lower()
+    needle = str(column_name).strip().lower()
+    if not needle:
+        return -1
+
+    # For short token-like names, require strict token boundaries.
+    if re.fullmatch(r"[a-zа-яіїєґ0-9_]+", needle, re.I) and len(needle) <= 3:
+        m = re.search(
+            rf"(?<![a-zа-яіїєґ0-9_]){re.escape(needle)}(?![a-zа-яіїєґ0-9_])",
+            lower,
+            re.I,
+        )
+        return m.start() if m else -1
+
+    # Try bounded match first for token-like names.
+    if re.fullmatch(r"[a-zа-яіїєґ0-9_]+", needle, re.I):
+        m = re.search(rf"\b{re.escape(needle)}\b", lower, re.I)
+        if m:
+            return m.start()
+
+    m = re.search(re.escape(needle), lower, re.I)
+    return m.start() if m else -1
+
+
 def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
     if not text or not columns:
         return None
@@ -1502,7 +2424,7 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
         n = name.strip()
         if not n:
             continue
-        if n.lower() in lower:
+        if _column_mention_pos(lower, n) >= 0:
             if len(n) > best_len:
                 best_raw = name
                 best_len = len(n)
@@ -1543,6 +2465,31 @@ def _find_column_in_text(text: str, columns: List[str]) -> Optional[str]:
     if best_name:
         return best_name
     return None
+
+
+def _find_explicit_column_in_text(text: str, columns: List[str]) -> Optional[str]:
+    """
+    Return a column only when it is explicitly mentioned in the query
+    (or referenced by 1-based positional wording like "3rd column").
+    """
+    if not text or not columns:
+        return None
+    by_idx = _match_column_by_index(text, columns)
+    if by_idx:
+        return by_idx
+
+    best_raw: Optional[str] = None
+    best_len = 0
+    for name in columns:
+        if not isinstance(name, str):
+            continue
+        stripped = name.strip()
+        if not stripped:
+            continue
+        if _column_mention_pos(text, stripped) >= 0 and len(stripped) > best_len:
+            best_raw = name
+            best_len = len(stripped)
+    return best_raw
 
 
 def _parse_row_index(text: str) -> Optional[int]:
@@ -1643,9 +2590,9 @@ def _find_columns_in_text(text: str, columns: List[str]) -> List[str]:
         name = col.strip()
         if not name:
             continue
-        m = re.search(re.escape(name), text, re.I)
-        if m:
-            hits.append((m.start(), str(col)))
+        pos = _column_mention_pos(text, name)
+        if pos >= 0:
+            hits.append((pos, str(col)))
 
     # 2) Fallback by semantic root overlap.
     if not hits and text_roots:
@@ -1829,7 +2776,11 @@ def _parse_position_index(text: str) -> Optional[int]:
     return idx if idx > 0 else None
 
 
-def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
+def _template_shortcut_code(
+    question: str,
+    profile: dict,
+    allow_availability_shortcut: bool = True,
+) -> Optional[Tuple[str, str]]:
     q = (question or "").strip()
     q_low = q.lower()
     if q.startswith("### Task:") and "<user_query>" not in q_low and "user query:" not in q_low:
@@ -1841,7 +2792,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
     code_lines: List[str] = []
     plan = ""
 
-    if _is_availability_count_intent(q):
+    if allow_availability_shortcut and _is_availability_count_intent(q):
         target_mode = _availability_target_mode(q)
         code_lines.append(
             r"_pos_re = r'(?:в\s*наявн|наявн|in\s*stock|available|доступн)'"
@@ -1877,7 +2828,7 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         code_lines.append("    else:")
         code_lines.append("        result = int(df.loc[_in & ~_out].shape[0])")
         code_lines.append("else:")
-        code_lines.append("    _row_text = df.astype(str).agg(' '.join, axis=1).str.lower()")
+        code_lines.append("    _row_text = df.fillna('').astype(str).apply(' '.join, axis=1).str.lower()")
         code_lines.append("    _in_row = _row_text.str.contains(_pos_re, regex=True, na=False)")
         code_lines.append("    _out_row = _row_text.str.contains(_neg_re, regex=True, na=False)")
         code_lines.append("    if _mode == 'out':")
@@ -2125,7 +3076,12 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
             if op in (">", "<", ">=", "<="):
                 if num is None:
                     return None
-                code_lines.append(f"_col = pd.to_numeric(df[{col!r}], errors='coerce')")
+                code_lines.append(f"_raw = df[{col!r}].astype(str)")
+                code_lines.append(
+                    r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
+                code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+                code_lines.append("_col = _clean.where(_mask, np.nan).astype(float)")
                 code_lines.append(f"df = df.loc[_col {op} {num!r}]")
             elif op in ("=", "!="):
                 code_lines.append(f"df = df.loc[df[{col!r}].astype(str).str.strip() {op} {value!r}]")
@@ -2270,7 +3226,12 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         col = _find_column_in_text(q, columns)
         if col:
             code_lines.append("df = df.copy()")
-            code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce')")
+            code_lines.append(f"_raw = df[{col!r}].astype(str)")
+            code_lines.append(
+                r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+            )
+            code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+            code_lines.append(f"df[{col!r}] = _clean.where(_mask, np.nan).astype(float)")
             code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Перетворити {col} у число."
@@ -2293,7 +3254,12 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         n = int(m.group(1)) if m else 2
         if col:
             code_lines.append("df = df.copy()")
-            code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce').round({n})")
+            code_lines.append(f"_raw = df[{col!r}].astype(str)")
+            code_lines.append(
+                r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+            )
+            code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+            code_lines.append(f"df[{col!r}] = _clean.where(_mask, np.nan).astype(float).round({n})")
             code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Округлити {col} до {n} знаків."
@@ -2303,7 +3269,12 @@ def _template_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str,
         col = _find_column_in_text(q, columns)
         if col:
             code_lines.append("df = df.copy()")
-            code_lines.append(f"df[{col!r}] = pd.to_numeric(df[{col!r}], errors='coerce').clip(lower=0)")
+            code_lines.append(f"_raw = df[{col!r}].astype(str)")
+            code_lines.append(
+                r"_clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+            )
+            code_lines.append(r"_mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+            code_lines.append(f"df[{col!r}] = _clean.where(_mask, np.nan).astype(float).clip(lower=0)")
             code_lines.append("COMMIT_DF = True")
             code_lines.append("result = {'status': 'updated'}")
             plan = f"Обмежити {col} значеннями не менше 0."
@@ -2569,10 +3540,24 @@ def _choose_column_from_question(question: str, profile: dict) -> Optional[str]:
     cols = (profile or {}).get("columns") or []
     if not cols:
         return None
+    q = (question or "").lower()
+    # Intent-aware bias for common numeric semantics.
+    if re.search(r"\b(варт|price|cost|amount|вируч|сума)\w*", q):
+        pref = _pick_price_like_column(profile)
+        if pref:
+            return pref
+    if re.search(r"\b(кільк|qty|quantity|units|stock|залишк)\w*", q):
+        pref = _pick_quantity_like_column(profile)
+        if pref:
+            return pref
     picked = _pick_relevant_column(question, [str(c) for c in cols])
     if picked:
         return picked
     dtypes = (profile or {}).get("dtypes") or {}
+    for col in cols:
+        dtype = str(dtypes.get(str(col), "")).lower()
+        if dtype.startswith(("int", "float", "uint")) and not _is_id_like_col_name(str(col)):
+            return col
     for col in cols:
         dtype = str(dtypes.get(str(col), "")).lower()
         if dtype.startswith(("int", "float", "uint")):
@@ -2580,19 +3565,34 @@ def _choose_column_from_question(question: str, profile: dict) -> Optional[str]:
     return cols[0]
 
 
-def _stats_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str]]:
+def _stats_shortcut_code(
+    question: str,
+    profile: dict,
+    preferred_col: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
     q = (question or "").lower()
     if (question or "").lstrip().startswith("### Task:") and "<user_query>" not in q and "user query:" not in q:
         return None
     wants_min = bool(re.search(r"\b(min|мінімал|мінімум)\b", q))
     wants_max = bool(re.search(r"\b(max|максимал|максимум)\b", q))
-    wants_mean = bool(re.search(r"\b(mean|average|avg|середн)\b", q))
+    wants_mean = bool(re.search(r"\b(mean|average|avg|середн\w*)\b", q))
     wants_sum = bool(re.search(r"\b(sum|сума)\b", q))
     wants_count = bool(re.search(r"\b(count|кільк|кількість)\b", q))
     wants_median = bool(re.search(r"\b(median|медіан)\b", q))
+    # Total inventory shortcut is only valid for plain total/sum intent.
+    if not (wants_min or wants_max or wants_mean or wants_count or wants_median):
+        total_value_shortcut = _total_inventory_value_shortcut_code(question, profile)
+        if total_value_shortcut:
+            return total_value_shortcut
     if not (wants_min or wants_max or wants_mean or wants_sum or wants_count or wants_median):
         return None
-    col = _choose_column_from_question(question, profile)
+    cols = [str(c) for c in ((profile or {}).get("columns") or [])]
+    col: Optional[str] = None
+    if preferred_col and preferred_col in cols:
+        # Prefer numeric target from LLM sloting; fallback logic handles non-numeric safely.
+        col = preferred_col
+    if not col:
+        col = _choose_column_from_question(question, profile)
     if not col:
         return None
     plan_parts = []
@@ -2709,6 +3709,11 @@ def _status_message(event: str, payload: Optional[dict]) -> str:
     if event == "codegen_shortcut":
         return "Використовую швидкий режим для генерації коду."
     if event == "codegen_retry":
+        reason = str((payload or {}).get("reason") or "").strip()
+        if reason == "missing_subset_filter":
+            return "Повторно генерую код: додам обов'язкову фільтрацію підмножини."
+        if reason == "runtime_keyerror_import":
+            return "Повторно генерую код: виправляю помилку виконання."
         return "Повторно генерую код: у попередній версії не було присвоєння в result."
     if event == "codegen_empty":
         return "Не вдалося згенерувати код аналізу."
@@ -2957,9 +3962,21 @@ class Pipeline(object):
         logging.info("event=llm_json_response preview=%s", _safe_trunc(text, 1200))
         return _parse_json_dict_from_llm(text)
 
-    def _plan_code(self, question: str, profile: dict) -> Tuple[str, str, str, Optional[bool]]:
+    def _plan_code(
+        self,
+        question: str,
+        profile: dict,
+        lookup_hints: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, str, Optional[bool]]:
         system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
-        payload = json.dumps({"question": question, "df_profile": profile}, ensure_ascii=False)
+        payload_obj: Dict[str, Any] = {"question": question, "df_profile": profile}
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            system += (
+                " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
+                "in analysis_code and combine them with any additional constraints from the question."
+            )
+            payload_obj["lookup_hints"] = lookup_hints
+        payload = json.dumps(payload_obj, ensure_ascii=False)
         parsed = self._llm_json(system, payload)
         commit_df = parsed.get("commit_df")
         return (
@@ -2975,19 +3992,100 @@ class Pipeline(object):
         profile: dict,
         previous_code: str,
         reason: str,
+        lookup_hints: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, str, Optional[bool]]:
         system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        payload_obj: Dict[str, Any] = {
+            "question": question,
+            "df_profile": profile,
+            "retry_reason": reason,
+            "previous_analysis_code": previous_code,
+            "retry_constraints": [
+                "CRITICAL: final answer must be assigned to variable `result`.",
+                "If previous code used another variable, rewrite to `result = ...`.",
+                "Do not return code without `result =` assignment for read operations.",
+            ],
+        }
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            system += (
+                " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
+                "in analysis_code and combine them with any additional constraints from the question."
+            )
+            payload_obj["lookup_hints"] = lookup_hints
+        payload = json.dumps(payload_obj, ensure_ascii=False)
+        parsed = self._llm_json(system, payload)
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
+
+    def _plan_code_retry_missing_filter(
+        self,
+        question: str,
+        profile: dict,
+        previous_code: str,
+        reason: str,
+        lookup_hints: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        payload_obj: Dict[str, Any] = {
+            "question": question,
+            "df_profile": profile,
+            "retry_reason": reason,
+            "previous_analysis_code": previous_code,
+            "retry_constraints": [
+                "CRITICAL: for subset questions (among/for/with/where/тільки/лише/серед), filter df first and only then aggregate.",
+                "Use explicit pandas filter (e.g., str.contains, query, boolean mask) before min/max/mean/sum/count.",
+                "CRITICAL: final answer must be assigned to variable `result`.",
+                "No import/from statements.",
+            ],
+        }
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            system += (
+                " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
+                "in analysis_code and combine them with any additional constraints from the question."
+            )
+            payload_obj["lookup_hints"] = lookup_hints
+        payload = json.dumps(payload_obj, ensure_ascii=False)
+        parsed = self._llm_json(system, payload)
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
+
+    def _plan_code_retry_runtime_error(
+        self,
+        question: str,
+        profile: dict,
+        previous_code: str,
+        runtime_error: str,
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        retry_constraints = [
+            "CRITICAL: final answer must be assigned to variable `result`.",
+            "No import/from statements.",
+            "Use exact column names from df_profile only.",
+            "Do not access dict key 'import' directly.",
+            "Prefer robust pandas code that handles missing/invalid values safely.",
+        ]
+        if _question_requires_subset_filter(question):
+            retry_constraints.insert(
+                0,
+                "CRITICAL: this is a subset query; apply explicit pandas filtering before aggregation/count.",
+            )
         payload = json.dumps(
             {
                 "question": question,
                 "df_profile": profile,
-                "retry_reason": reason,
+                "retry_reason": runtime_error,
                 "previous_analysis_code": previous_code,
-                "retry_constraints": [
-                    "CRITICAL: final answer must be assigned to variable `result`.",
-                    "If previous code used another variable, rewrite to `result = ...`.",
-                    "Do not return code without `result =` assignment for read operations.",
-                ],
+                "retry_constraints": retry_constraints,
             },
             ensure_ascii=False,
         )
@@ -3022,6 +4120,949 @@ class Pipeline(object):
         if not col or col not in columns:
             return None
         return col
+
+    def _llm_pick_semantic_lookup_column(
+        self,
+        question: str,
+        alias: str,
+        profile: dict,
+        role: str = "filter",
+    ) -> Optional[str]:
+        alias = str(alias or "").strip()
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not alias or not columns:
+            return None
+
+        # Fast local heuristic before spending an extra LLM call.
+        heuristic = _pick_relevant_column(alias, columns)
+        if not heuristic and role != "output_column":
+            heuristic = _pick_relevant_column(f"{question} {alias}", columns)
+        if heuristic and heuristic in columns:
+            logging.info(
+                "event=lookup_semantic_column_resolve source=heuristic role=%s alias=%s column=%s",
+                role,
+                _safe_trunc(alias, 80),
+                heuristic,
+            )
+            return heuristic
+
+        system = (
+            "Resolve a semantic alias from a user request to the closest dataframe column name. "
+            "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\", \"confidence\": 0..1}. "
+            "Use semantic similarity from question, alias, column names, dtypes, and preview values. "
+            "If uncertain, return empty column and confidence 0."
+        )
+        payload = {
+            "question": question,
+            "alias": alias,
+            "role": role,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "preview": ((profile or {}).get("preview") or [])[:20],
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return None
+
+        col = str((parsed or {}).get("column") or "").strip()
+        if col not in columns:
+            return None
+
+        confidence: Optional[float] = None
+        conf_raw = (parsed or {}).get("confidence")
+        if isinstance(conf_raw, (int, float)):
+            confidence = float(conf_raw)
+        elif isinstance(conf_raw, str):
+            try:
+                confidence = float(conf_raw.strip())
+            except Exception:
+                confidence = None
+        if confidence is not None:
+            confidence = max(0.0, min(1.0, confidence))
+            if confidence < 0.35:
+                logging.info(
+                    "event=lookup_semantic_column_resolve source=llm role=%s alias=%s column=%s confidence=%.2f accepted=false",
+                    role,
+                    _safe_trunc(alias, 80),
+                    col,
+                    confidence,
+                )
+                return None
+
+        logging.info(
+            "event=lookup_semantic_column_resolve source=llm role=%s alias=%s column=%s confidence=%s accepted=true",
+            role,
+            _safe_trunc(alias, 80),
+            col,
+            "n/a" if confidence is None else f"{confidence:.2f}",
+        )
+        return col
+
+    def _llm_pick_numeric_metric_column(self, question: str, profile: dict) -> Optional[str]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return None
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [
+            c for c in columns if str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))
+        ]
+        if not numeric_cols:
+            return None
+        system = (
+            "Pick the best numeric column for the user's aggregation question. "
+            "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\"}. "
+            "Choose only from numeric_columns."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "numeric_columns": numeric_cols[:200],
+            "dtypes": dtypes,
+            "df_profile": profile or {},
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return None
+        col = str((parsed or {}).get("column") or "").strip()
+        if not col or col not in numeric_cols:
+            return None
+        return col
+
+    def _llm_pick_ranking_slots(self, question: str, profile: dict) -> Dict[str, Any]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return {}
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [
+            c for c in columns if str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))
+        ]
+        system = (
+            "Analyze the query and map it to ranking slots over DataFrame columns. "
+            "Return ONLY JSON with keys: query_mode, metric_col, group_col, target_col, agg, top_n, order, require_available, availability_col, entity_cols. "
+            "query_mode must be one of: row_ranking, group_ranking, other. "
+            "metric_col, group_col, target_col and availability_col must be exact names from columns or empty string. "
+            "agg must be one of: count, sum, mean, min, max, median. "
+            "entity_cols must be a list of exact column names from columns (can be empty). "
+            "top_n must be integer or null. order must be desc or asc. "
+            "Use row_ranking only when user asks for top/bottom rows/items/models by a metric. "
+            "Use group_ranking when ranking grouped entities (e.g., categories by sum/count). "
+            "For group_ranking: use group_col as grouping dimension and target_col+agg as metric; "
+            "for agg='count' target_col may be empty. "
+            "IMPORTANT: If query_mode is row_ranking/group_ranking, top_n MUST be an integer "
+            "(use defaults: 5 for row_ranking, 10 for group_ranking when user did not specify). "
+            "If the query is not ranking (e.g., exact match/filter lookup), set query_mode='other' and top_n=null."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "numeric_columns": numeric_cols[:200],
+            "dtypes": dtypes,
+            "preview": ((profile or {}).get("preview") or [])[:20],
+            "rows": (profile or {}).get("rows"),
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return {}
+
+        out: Dict[str, Any] = {}
+        mode = str((parsed or {}).get("query_mode") or "").strip().lower()
+        if mode not in {"row_ranking", "group_ranking", "other"}:
+            mode = "other"
+        out["query_mode"] = mode
+
+        metric_col = str((parsed or {}).get("metric_col") or "").strip()
+        if metric_col in numeric_cols:
+            out["metric_col"] = metric_col
+
+        group_col = str((parsed or {}).get("group_col") or "").strip()
+        if group_col in columns:
+            out["group_col"] = group_col
+
+        target_col = str((parsed or {}).get("target_col") or "").strip()
+        if target_col in numeric_cols:
+            out["target_col"] = target_col
+
+        agg = str((parsed or {}).get("agg") or "").strip().lower()
+        if agg in {"count", "sum", "mean", "min", "max", "median"}:
+            out["agg"] = agg
+
+        availability_col = str((parsed or {}).get("availability_col") or "").strip()
+        if availability_col in columns:
+            out["availability_col"] = availability_col
+
+        order = str((parsed or {}).get("order") or "").strip().lower()
+        out["order"] = "asc" if order in {"asc", "ascending", "lowest", "smallest"} else "desc"
+
+        top_n_raw = (parsed or {}).get("top_n")
+        top_n: Optional[int] = None
+        if isinstance(top_n_raw, (int, float)):
+            top_n = max(1, int(top_n_raw))
+        elif isinstance(top_n_raw, str) and top_n_raw.strip().isdigit():
+            top_n = max(1, int(top_n_raw.strip()))
+        if top_n is not None:
+            out["top_n"] = top_n
+
+        out["require_available"] = bool((parsed or {}).get("require_available"))
+
+        entity_cols_raw = (parsed or {}).get("entity_cols")
+        entity_cols: List[str] = []
+        if isinstance(entity_cols_raw, list):
+            for c in entity_cols_raw:
+                s = str(c).strip()
+                if s and s in columns and s not in entity_cols:
+                    entity_cols.append(s)
+        out["entity_cols"] = entity_cols[:4]
+        return out
+
+    def _lookup_has_explicit_eq_cue(self, question: str) -> bool:
+        q_low = (question or "").lower()
+        return bool(
+            re.search(
+                r"(?:==|=)"
+                r"|\b(дорівн\w*|рівн\w*|exact(?:ly)?|точно|саме)\b"
+                r"|\b(?:id|sku|код|артикул)\s*[:=]?\s*\d+\b",
+                q_low,
+                re.I,
+            )
+        )
+
+    def _lookup_filter_is_exact_field(self, column: str) -> bool:
+        c = str(column or "").strip().lower()
+        if not c:
+            return False
+        if re.search(r"(?:^|_)(id|uuid|uid|sku|код|артикул)(?:$|_)", c):
+            return True
+        return bool(re.search(r"(status|статус|available|наявн|flag|is_|active|enabled|disabled|bool)", c))
+
+    def _lookup_is_status_like_column(self, column: str) -> bool:
+        c = str(column or "").strip().lower()
+        if not c:
+            return False
+        return bool(re.search(r"(status|статус|available|наявн|stock|склад|доступн|inventory|warehouse|запас|залишк)", c))
+
+    def _lookup_status_pattern(self, value: Any) -> Optional[str]:
+        s = str(value or "").strip().lower()
+        if not s:
+            return None
+        # Positive availability intent.
+        if re.search(r"(на\s+склад|в\s+наявн|наявн|в\s+запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|резерв|закінч\w*)", s):
+            return r"(?:в\s*наявн|наявн|в\s*запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|на\s*склад|резерв\w*|закінч\w*)"
+        # Negative availability intent.
+        if re.search(r"(нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)", s):
+            return r"(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)"
+        return None
+
+    def _lookup_filter_value_is_entity_like(self, value: Any) -> bool:
+        if value is None:
+            return False
+        s = str(value).strip()
+        if len(s) < 2:
+            return False
+        if re.fullmatch(r"[\d\s.,:%\-]+", s):
+            return False
+        return bool(re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", s))
+
+    def _normalize_lookup_filters(
+        self,
+        question: str,
+        filters: List[Dict[str, Any]],
+        dtypes: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        explicit_eq = self._lookup_has_explicit_eq_cue(question)
+        out: List[Dict[str, Any]] = []
+        for f in filters:
+            cur = dict(f)
+            col = str(cur.get("column") or "").strip()
+            op = str(cur.get("op") or "").strip().lower()
+            val = cur.get("value")
+            dtype = str((dtypes or {}).get(col, "")).lower()
+            is_numeric = dtype.startswith(("int", "float", "uint"))
+            is_status_like = self._lookup_is_status_like_column(col)
+
+            if (
+                op == "eq"
+                and not explicit_eq
+                and is_status_like
+                and self._lookup_filter_value_is_entity_like(val)
+            ):
+                cur["op"] = "contains"
+                logging.info(
+                    "event=lookup_filter_operator_adjust column=%s from=eq to=contains reason=status_semantic value_preview=%s",
+                    col,
+                    _safe_trunc(val, 80),
+                )
+                out.append(cur)
+                continue
+
+            if (
+                op == "eq"
+                and not explicit_eq
+                and not is_numeric
+                and not self._lookup_filter_is_exact_field(col)
+                and self._lookup_filter_value_is_entity_like(val)
+            ):
+                cur["op"] = "contains"
+                logging.info(
+                    "event=lookup_filter_operator_adjust column=%s from=eq to=contains value_preview=%s",
+                    col,
+                    _safe_trunc(val, 80),
+                )
+            out.append(cur)
+        return out
+
+    def _lookup_requires_multicol_fallback(
+        self,
+        question: str,
+        filters: List[Dict[str, Any]],
+        columns: List[str],
+        dtypes: Dict[str, Any],
+    ) -> bool:
+        if not filters:
+            return False
+        explicit_col = _find_explicit_column_in_text(question, columns)
+        q_low = (question or "").lower()
+        metric_context = bool(
+            re.search(
+                r"\b(max|min|mean|average|avg|median|sum|total|макс\w*|мін\w*|середн\w*|сума|підсум\w*)\b",
+                q_low,
+                re.I,
+            )
+        )
+        has_entity_filter = False
+        search_like_cols = [
+            c
+            for c in columns
+            if not str((dtypes or {}).get(c, "")).lower().startswith(("int", "float", "uint"))
+            and re.search(r"(бренд|brand|model|name|назв|опис|desc|spec|характер|категор|category|type|тип)", c.lower())
+        ]
+        for f in filters:
+            col = str(f.get("column") or "").strip()
+            op = str(f.get("op") or "").strip().lower()
+            val = f.get("value")
+            dtype = str((dtypes or {}).get(col, "")).lower()
+            is_numeric = dtype.startswith(("int", "float", "uint"))
+            if op not in {"eq", "contains"}:
+                continue
+            if is_numeric:
+                continue
+            if not self._lookup_filter_value_is_entity_like(val):
+                continue
+            has_entity_filter = True
+            if explicit_col and explicit_col == col:
+                continue
+            if metric_context or len(search_like_cols) >= 2:
+                if has_entity_filter and not metric_context:
+                    logging.info(
+                        "event=lookup_fallback_skip reason=entity_filter_present question=%s",
+                        _safe_trunc(question, 200),
+                    )
+                    return False
+                return True
+        return False
+
+    def _llm_pick_lookup_slots(self, question: str, profile: dict) -> Dict[str, Any]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return {}
+        dtypes = (profile or {}).get("dtypes") or {}
+        system = (
+            "Map the query to table lookup slots. "
+            "Return ONLY JSON with keys: mode, filters, output_columns, limit. "
+            "mode must be 'lookup' or 'other'. "
+            "filters must be a list of objects with keys: column, op, value. "
+            "column must be exact from columns. op must be one of: eq, ne, gt, ge, lt, le, contains. "
+            "output_columns must be a list of exact column names from columns. "
+            "limit must be integer or null. "
+            "CRITICAL FILTER RULES: "
+            "Use 'eq' for exact IDs/status/boolean flags and explicit exact-match asks. "
+            "Use 'contains' for brand/model/product names, features/materials, colors, categories/types. "
+            "When in doubt between 'eq' and 'contains' for text values, prefer 'contains'. "
+            "If query likely needs search across multiple text columns, set mode='other'. "
+            "Use mode='lookup' when query asks to find/show rows by conditions (e.g., where price equals X). "
+            "For single-value questions like 'яка модель ...', set limit=1."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "dtypes": dtypes,
+            "preview": ((profile or {}).get("preview") or [])[:20],
+            "rows": (profile or {}).get("rows"),
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return {}
+
+        out: Dict[str, Any] = {}
+        mode = str((parsed or {}).get("mode") or "").strip().lower()
+        if mode not in {"lookup", "other"}:
+            mode = "other"
+        out["mode"] = mode
+
+        filters_raw = (parsed or {}).get("filters")
+        filters: List[Dict[str, Any]] = []
+        if isinstance(filters_raw, list):
+            for f in filters_raw:
+                if not isinstance(f, dict):
+                    continue
+                raw_col = str(f.get("column") or "").strip()
+                col = raw_col
+                if col and col not in columns:
+                    mapped = self._llm_pick_semantic_lookup_column(
+                        question=question,
+                        alias=col,
+                        profile=profile,
+                        role="filter_column",
+                    )
+                    if mapped:
+                        col = mapped
+                op = str(f.get("op") or "").strip().lower()
+                if col not in columns:
+                    continue
+                if op not in {"eq", "ne", "gt", "ge", "lt", "le", "contains"}:
+                    continue
+                val = f.get("value")
+                filters.append({"column": col, "op": op, "value": val})
+        filters = self._normalize_lookup_filters(question, filters, dtypes)
+        out["filters"] = filters
+
+        out_cols: List[str] = []
+        out_cols_raw = (parsed or {}).get("output_columns")
+        if isinstance(out_cols_raw, list):
+            for c in out_cols_raw:
+                s = str(c).strip()
+                if s and s not in columns:
+                    mapped = self._llm_pick_semantic_lookup_column(
+                        question=question,
+                        alias=s,
+                        profile=profile,
+                        role="output_column",
+                    )
+                    if mapped:
+                        s = mapped
+                if s in columns and s not in out_cols:
+                    out_cols.append(s)
+        out["output_columns"] = out_cols
+
+        limit_raw = (parsed or {}).get("limit")
+        if isinstance(limit_raw, (int, float)):
+            out["limit"] = max(1, int(limit_raw))
+        elif isinstance(limit_raw, str) and limit_raw.strip().isdigit():
+            out["limit"] = max(1, int(limit_raw.strip()))
+
+        if mode == "lookup" and self._lookup_requires_multicol_fallback(question, filters, columns, dtypes):
+            logging.info("event=lookup_slots_fallback mode=other reason=multi_column_keyword_search")
+            out["mode"] = "other"
+            out["fallback_reason"] = "multi_column_keyword_search"
+
+        return out
+
+    def _lookup_hints_from_slots(self, slots: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(slots, dict):
+            return None
+        filters = [dict(f) for f in ((slots or {}).get("filters") or []) if isinstance(f, dict)]
+        out_cols = [str(c) for c in ((slots or {}).get("output_columns") or []) if str(c).strip()]
+        limit = (slots or {}).get("limit")
+        fallback_reason = str((slots or {}).get("fallback_reason") or "").strip()
+        mode = str((slots or {}).get("mode") or "").strip().lower()
+        if not filters and not out_cols:
+            return None
+        hints: Dict[str, Any] = {
+            "mode": mode or "other",
+            "filters": filters,
+        }
+        if out_cols:
+            hints["output_columns"] = out_cols
+        if isinstance(limit, int) and limit > 0:
+            hints["limit"] = limit
+        if fallback_reason:
+            hints["reason"] = fallback_reason
+        return hints
+
+    def _lookup_shortcut_code_from_slots(
+        self,
+        question: str,
+        profile: dict,
+        slots: Dict[str, Any],
+    ) -> Optional[Tuple[str, str]]:
+        if str((slots or {}).get("mode") or "") != "lookup":
+            return None
+        filters = [f for f in ((slots or {}).get("filters") or []) if isinstance(f, dict)]
+        if not filters:
+            return None
+
+        columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+        output_columns = [str(c) for c in ((slots or {}).get("output_columns") or []) if str(c) in columns]
+        if not output_columns:
+            mentioned = _find_columns_in_text(question, columns)
+            output_columns = [c for c in mentioned if c not in [str(f.get("column")) for f in filters]]
+        if not output_columns:
+            dtypes = (profile or {}).get("dtypes") or {}
+            text_cols = [c for c in columns if not str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))]
+            output_columns = text_cols[:2] if text_cols else columns[:1]
+
+        limit = (slots or {}).get("limit")
+        lines: List[str] = [
+            "_work = df.copy(deep=False)",
+        ]
+        for i, f in enumerate(filters):
+            col = str(f.get("column"))
+            op = str(f.get("op")).lower()
+            val = f.get("value")
+            mask_name = f"_m{i}"
+            lines.append(f"_c{i} = {col!r}")
+            if op in {"gt", "ge", "lt", "le"}:
+                try:
+                    num_val = float(val)
+                except Exception:
+                    continue
+                lines.append(f"_raw{i} = _work[_c{i}].astype(str)")
+                lines.append(
+                    rf"_clean{i} = _raw{i}.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
+                lines.append(rf"_masknum{i} = _clean{i}.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+                lines.append(f"_num{i} = _clean{i}.where(_masknum{i}, np.nan).astype(float)")
+                op_map = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}
+                lines.append(f"{mask_name} = _num{i} {op_map[op]} {num_val!r}")
+            elif op == "contains":
+                sval = "" if val is None else str(val)
+                status_pat = self._lookup_status_pattern(val) if self._lookup_is_status_like_column(col) else None
+                if status_pat:
+                    lines.append(f"_pat{i} = {status_pat!r}")
+                    lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.contains(_pat{i}, case=False, regex=True, na=False)")
+                else:
+                    lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.contains({sval!r}, case=False, na=False)")
+            else:
+                # eq/ne: decide numeric or string compare by value shape
+                if isinstance(val, (int, float)):
+                    lines.append(f"_raw{i} = _work[_c{i}].astype(str)")
+                    lines.append(
+                        rf"_clean{i} = _raw{i}.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                    )
+                    lines.append(rf"_masknum{i} = _clean{i}.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+                    lines.append(f"_num{i} = _clean{i}.where(_masknum{i}, np.nan).astype(float)")
+                    eq_op = "==" if op == "eq" else "!="
+                    lines.append(f"{mask_name} = _num{i} {eq_op} {float(val)!r}")
+                else:
+                    sval = "" if val is None else str(val)
+                    cmp_op = "==" if op == "eq" else "!="
+                    status_pat = self._lookup_status_pattern(val) if self._lookup_is_status_like_column(col) else None
+                    if status_pat:
+                        lines.append(f"_pat{i} = {status_pat!r}")
+                        lines.append(f"_hit{i} = _work[_c{i}].astype(str).str.contains(_pat{i}, case=False, regex=True, na=False)")
+                        if op == "eq":
+                            lines.append(f"{mask_name} = _hit{i}")
+                        else:
+                            lines.append(f"{mask_name} = ~_hit{i}")
+                    else:
+                        lines.append(
+                            f"{mask_name} = _work[_c{i}].astype(str).str.strip().str.lower() {cmp_op} {sval!r}.strip().lower()"
+                        )
+            lines.append(f"_work = _work.loc[{mask_name}].copy()")
+
+        lines.append(f"_out_cols = {output_columns!r}")
+        lines.append("_out_cols = [c for c in _out_cols if c in _work.columns]")
+        if isinstance(limit, int) and limit > 0:
+            lines.append(f"_work = _work.head({limit})")
+        lines.append("if _out_cols:")
+        lines.append("    _out = _work[_out_cols]")
+        lines.append("else:")
+        lines.append("    _out = _work")
+        lines.append("if len(_out) == 0:")
+        lines.append("    result = []")
+        lines.append("elif len(_out.columns) == 1 and len(_out) == 1:")
+        lines.append("    result = _out.iloc[0, 0]")
+        lines.append("else:")
+        lines.append("    result = _out")
+
+        plan = "Виконати пошук рядків за умовами та повернути релевантні колонки."
+        logging.info("event=lookup_shortcut_llm slots=%s", _safe_trunc(slots, 600))
+        return "\n".join(lines) + "\n", plan
+
+    def _lookup_shortcut_code(self, question: str, profile: dict) -> Optional[Tuple[str, str]]:
+        slots = self._llm_pick_lookup_slots(question, profile)
+        return self._lookup_shortcut_code_from_slots(question, profile, slots)
+
+    def _ranking_shortcut_code(self, question: str, profile: dict) -> Optional[Tuple[str, str]]:
+        slots = self._llm_pick_ranking_slots(question, profile)
+        mode = str((slots or {}).get("query_mode") or "")
+        if mode not in {"row_ranking", "group_ranking"}:
+            return None
+        top_n_slot = (slots or {}).get("top_n")
+        if top_n_slot is None:
+            logging.info("event=ranking_shortcut_skip reason=missing_top_n mode=%s", mode)
+            return None
+
+        columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+        dtypes = (profile or {}).get("dtypes") or {}
+        if mode == "row_ranking":
+            if not _has_ranking_cues(question) and _looks_like_value_filter_query(question):
+                logging.info("event=ranking_shortcut_skip reason=filter_like_query mode=row")
+                return None
+            top_n = int(top_n_slot)
+            top_n = max(1, top_n)
+        else:
+            top_n = int(top_n_slot)
+            top_n = max(1, top_n)
+        order = "asc" if str((slots or {}).get("order") or "").lower() == "asc" else "desc"
+        require_available = bool((slots or {}).get("require_available"))
+        availability_col = str((slots or {}).get("availability_col") or "").strip() or None
+        lines = [
+            "_src = df.copy(deep=False)",
+            f"_avail_col = {availability_col!r}" if availability_col else "_avail_col = None",
+            f"_require_avail = {require_available!r}",
+            f"_top_n = {top_n}",
+            f"_order = {order!r}",
+            "_work = _src",
+            "if _require_avail and _avail_col and (_avail_col in _work.columns):",
+            "    _st = _work[_avail_col].astype(str).str.strip().str.lower()",
+            r"    _in = _st.str.contains(r'(?:в\s*наявн|наявн|in\s*stock|available|доступн|резерв\w*|закінч\w*)', regex=True, na=False)",
+            r"    _out = _st.str.contains(r'(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)', regex=True, na=False)",
+            r"    _ord = _st.str.contains(r'(?:під\s*замовлення|under\s*order|backorder)', regex=True, na=False)",
+            "    _work = _work.loc[_in & ~_out & ~_ord].copy()",
+        ]
+
+        if mode == "row_ranking":
+            metric_col = str((slots or {}).get("metric_col") or "").strip()
+            if not metric_col:
+                return None
+
+            entity_cols = [str(c) for c in ((slots or {}).get("entity_cols") or []) if str(c) in columns]
+            if not entity_cols:
+                text_cols = [
+                    c for c in columns
+                    if not str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))
+                    and c != availability_col
+                    and c != metric_col
+                ]
+                entity_cols = text_cols[:3]
+
+            out_cols: List[str] = []
+            for c in ("ID", *entity_cols, metric_col):
+                if c in columns and c not in out_cols:
+                    out_cols.append(c)
+            if not out_cols:
+                out_cols = [metric_col]
+
+            lines.extend(
+                [
+                    f"_metric_col = {metric_col!r}",
+                    "_metric_raw = _work[_metric_col].astype(str)",
+                    r"_metric_clean = _metric_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+                    r"_metric_mask = _metric_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+                    "_metric = _metric_clean.where(_metric_mask, np.nan).astype(float)",
+                    "_work = _work.loc[_metric.notna()].copy()",
+                    "_work[_metric_col] = _metric.loc[_metric.notna()]",
+                    "if _order == 'asc':",
+                    "    _work = _work.nsmallest(_top_n, _metric_col)",
+                    "else:",
+                    "    _work = _work.nlargest(_top_n, _metric_col)",
+                    f"_out_cols = {out_cols!r}",
+                    "_out_cols = [c for c in _out_cols if c in _work.columns]",
+                    "result = _work[_out_cols] if _out_cols else _work",
+                ]
+            )
+            plan = f"Побудувати {'топ' if order == 'desc' else 'нижні'}-{top_n} рядків за метрикою {metric_col}."
+            logging.info("event=ranking_shortcut_llm mode=row slots=%s", _safe_trunc(slots, 600))
+            return "\n".join(lines) + "\n", plan
+
+        group_col = str((slots or {}).get("group_col") or "").strip()
+        agg = str((slots or {}).get("agg") or "").strip().lower()
+        target_col = str((slots or {}).get("target_col") or "").strip()
+        metric_col = str((slots or {}).get("metric_col") or "").strip()
+        if not group_col or agg not in {"count", "sum", "mean", "min", "max", "median"}:
+            return None
+        if agg != "count" and not target_col and metric_col in columns and _is_numeric_dtype_text(dtypes.get(metric_col, "")):
+            target_col = metric_col
+        if agg == "sum" and not target_col:
+            qty_col = _pick_quantity_like_column(profile)
+            if qty_col and qty_col in columns:
+                target_col = qty_col
+        if agg != "count" and not target_col:
+            return None
+
+        out_name = "count" if agg == "count" else f"{agg}_{target_col}"
+        lines.append(f"_group_col = {group_col!r}")
+        lines.append(f"_agg = {agg!r}")
+        lines.append(f"_target_col = {target_col!r}" if target_col else "_target_col = None")
+        lines.append("if _agg == 'count':")
+        lines.append("    _res = _work.groupby(_group_col).size().reset_index(name='count')")
+        lines.append("else:")
+        lines.append("    _num_raw = _work[_target_col].astype(str)")
+        lines.append(r"    _num_clean = _num_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')")
+        lines.append(r"    _num_mask = _num_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+        lines.append("    _num = _num_clean.where(_num_mask, np.nan).astype(float)")
+        lines.append("    _work = _work.loc[_num.notna()].copy()")
+        lines.append("    _work[_target_col] = _num.loc[_num.notna()]")
+        lines.append("    if _agg == 'sum':")
+        lines.append(f"        _res = _work.groupby(_group_col)[_target_col].sum().reset_index(name={out_name!r})")
+        lines.append("    elif _agg == 'mean':")
+        lines.append(f"        _res = _work.groupby(_group_col)[_target_col].mean().reset_index(name={out_name!r})")
+        lines.append("    elif _agg == 'min':")
+        lines.append(f"        _res = _work.groupby(_group_col)[_target_col].min().reset_index(name={out_name!r})")
+        lines.append("    elif _agg == 'max':")
+        lines.append(f"        _res = _work.groupby(_group_col)[_target_col].max().reset_index(name={out_name!r})")
+        lines.append("    else:")
+        lines.append(f"        _res = _work.groupby(_group_col)[_target_col].median().reset_index(name={out_name!r})")
+        lines.append("if _order == 'asc':")
+        lines.append(f"    _res = _res.sort_values({out_name!r}, ascending=True)")
+        lines.append("else:")
+        lines.append(f"    _res = _res.sort_values({out_name!r}, ascending=False)")
+        lines.append("result = _res.head(_top_n)")
+        plan = f"Побудувати {'топ' if order == 'desc' else 'нижні'}-{top_n} груп за {group_col} ({agg})."
+        logging.info("event=ranking_shortcut_llm mode=group slots=%s", _safe_trunc(slots, 600))
+        return "\n".join(lines) + "\n", plan
+
+    def _llm_extract_subset_terms(self, question: str, profile: dict) -> List[str]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return []
+        system = (
+            "Extract only subset-filter terms from user query for dataframe filtering. "
+            "Return ONLY JSON: {\"terms\": [..]}. "
+            "Include product/entity/category/feature terms only. "
+            "Exclude metric words and aggregation words like max/min/avg/sum/count/price/ціна/кількість. "
+            "If useful, include 1-2 short aliases in other likely languages (uk/ru/en) that may appear in table values. "
+            "Prefer 1-6 concise terms."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "preview": ((profile or {}).get("preview") or [])[:20],
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return []
+        out: List[str] = []
+        raw = (parsed or {}).get("terms")
+        if isinstance(raw, list):
+            for t in raw:
+                s = str(t).strip()
+                if len(s) < 2 or len(s) > 40:
+                    continue
+                if re.fullmatch(r"[\d\s.,:%\-]+", s):
+                    continue
+                if s not in out:
+                    out.append(s)
+        logging.info("event=subset_terms_llm terms=%s", _safe_trunc(out, 240))
+        return out[:6]
+
+    def _llm_pick_subset_metric_slots(self, question: str, profile: dict) -> Dict[str, Any]:
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return {}
+        system = (
+            "Map subset filtering query to aggregation slots. "
+            "Return ONLY JSON with keys: agg, metric_col, availability_mode, availability_col. "
+            "agg must be one of: count, sum, mean, min, max, median. "
+            "metric_col and availability_col must be exact names from columns or empty string. "
+            "availability_mode must be one of: in, out, any, none. "
+            "Use agg='sum' when user asks total quantity/amount in subset. "
+            "Use agg='count' only when user asks number of matching rows/items."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "preview": ((profile or {}).get("preview") or [])[:20],
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        out: Dict[str, Any] = {}
+        agg = str((parsed or {}).get("agg") or "").strip().lower()
+        metric_col = str((parsed or {}).get("metric_col") or "").strip()
+        availability_mode = str((parsed or {}).get("availability_mode") or "").strip().lower()
+        availability_col = str((parsed or {}).get("availability_col") or "").strip()
+        if agg in {"count", "sum", "mean", "min", "max", "median"}:
+            out["agg"] = agg
+        if metric_col in columns:
+            out["metric_col"] = metric_col
+        if availability_mode in {"in", "out", "any", "none"}:
+            out["availability_mode"] = availability_mode
+        if availability_col in columns:
+            out["availability_col"] = availability_col
+        logging.info("event=subset_slots_llm slots=%s", _safe_trunc(out, 260))
+        return out
+
+    def _build_subset_keyword_metric_shortcut(
+        self,
+        question: str,
+        profile: dict,
+        preferred_col: Optional[str] = None,
+    ) -> Optional[Tuple[str, str]]:
+        terms_hint = self._llm_extract_subset_terms(question, profile)
+        slots_hint = self._llm_pick_subset_metric_slots(question, profile)
+        return _subset_keyword_metric_shortcut_code(
+            question,
+            profile,
+            preferred_col=preferred_col,
+            terms_hint=terms_hint,
+            slots_hint=slots_hint,
+        )
+
+    def _select_router_or_shortcut(
+        self,
+        question: str,
+        profile: dict,
+        has_edit: bool,
+    ) -> Tuple[Optional[Tuple[str, Dict[str, Any]]], Optional[Tuple[str, str]], Dict[str, Any], Dict[str, Any]]:
+        router_hit: Optional[Tuple[str, Dict[str, Any]]] = None
+        shortcut: Optional[Tuple[str, str]] = None
+        router_meta: Dict[str, Any] = {}
+        planner_hints: Dict[str, Any] = {}
+
+        candidate_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
+        if candidate_hit:
+            candidate_code, candidate_meta = candidate_hit
+            if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta, question):
+                logging.warning(
+                    "event=shortcut_router status=rejected reason=read_guard intent_id=%s question=%s",
+                    (candidate_meta or {}).get("intent_id"),
+                    _safe_trunc(question, 200),
+                )
+            else:
+                router_meta = candidate_meta or {}
+                router_hit = (candidate_code, router_meta)
+                logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
+                return router_hit, None, router_meta, planner_hints
+
+        if has_edit:
+            logging.info("event=shortcut_router status=skipped reason=edit_intent")
+        else:
+            logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
+
+        metrics = _detect_metrics(question)
+        is_meta = _is_meta_task_text(question)
+        inferred_op = _infer_op_from_question(question)
+        requires_subset_filter = bool(
+            inferred_op == "read" and not is_meta and not has_edit and _question_requires_subset_filter(question, profile)
+        )
+
+        metric_col_hint: Optional[str] = None
+        if inferred_op == "read" and not is_meta and not has_edit and metrics:
+            metric_col_hint = self._llm_pick_numeric_metric_column(question, profile)
+
+        if inferred_op == "read" and not is_meta and not has_edit:
+            lookup_slots = self._llm_pick_lookup_slots(question, profile)
+            lookup_hints = self._lookup_hints_from_slots(lookup_slots)
+            if lookup_hints:
+                planner_hints["lookup_hints"] = lookup_hints
+            shortcut = self._lookup_shortcut_code_from_slots(question, profile, lookup_slots)
+        if not shortcut and inferred_op == "read" and not is_meta and not has_edit:
+            shortcut = self._ranking_shortcut_code(question, profile)
+        if not shortcut and inferred_op == "read" and not is_meta and not has_edit and requires_subset_filter:
+            shortcut = self._build_subset_keyword_metric_shortcut(
+                question,
+                profile,
+                preferred_col=metric_col_hint,
+            )
+        if (
+            not shortcut
+            and inferred_op == "read"
+            and not is_meta
+            and not has_edit
+            and not requires_subset_filter
+            and len(metrics) >= 2
+        ):
+            shortcut = _stats_shortcut_code(question, profile, preferred_col=metric_col_hint)
+        if not shortcut:
+            allow_availability_shortcut = True
+            if _is_availability_count_intent(question):
+                allow_availability_shortcut = self._should_use_availability_shortcut(question, profile)
+            shortcut = _template_shortcut_code(
+                question,
+                profile,
+                allow_availability_shortcut=allow_availability_shortcut,
+            )
+        if not shortcut:
+            shortcut = _edit_shortcut_code(question, profile)
+        if not shortcut and not requires_subset_filter:
+            shortcut = _stats_shortcut_code(question, profile, preferred_col=metric_col_hint)
+
+        return None, shortcut, router_meta, planner_hints
+
+    def _format_scalar_list_from_result(self, result_text: str, max_items: int = 100) -> Optional[str]:
+        text = (result_text or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, list):
+            return None
+        if not data:
+            return "Нічого не знайдено."
+        if any(isinstance(x, (dict, list, tuple)) for x in data):
+            return None
+        values = [str(x).strip() for x in data if str(x).strip()]
+        if not values:
+            return "Нічого не знайдено."
+        if len(values) == 1:
+            return values[0]
+        return "\n".join(f"- {v}" for v in values[: max(1, max_items)])
+
+    def _should_use_availability_shortcut(self, question: str, profile: dict) -> bool:
+        """
+        Availability shortcut is safe only for global counts.
+        For filtered intents (brand/category/model/etc.) we should let codegen build explicit filters.
+        """
+        columns = [str(c) for c in (profile or {}).get("columns") or []]
+        if not columns:
+            return True
+        mentioned = _find_columns_in_text(question, columns)
+        non_status_mentions = [
+            c
+            for c in mentioned
+            if not _AVAILABILITY_COL_RE.search(str(c))
+        ]
+        if non_status_mentions:
+            logging.info(
+                "event=availability_shortcut_scope source=heuristic scope=filtered mentioned=%s",
+                _safe_trunc(non_status_mentions, 200),
+            )
+            return False
+        # Entity-like tokens (e.g., NVIDIA, RTX4090) usually indicate filtered subset.
+        if re.search(r"\b[A-Z][A-Z0-9_-]{1,}\b", question or ""):
+            logging.info("event=availability_shortcut_scope source=heuristic scope=filtered reason=entity_token")
+            return False
+        # Quoted explicit value also indicates a filter.
+        if re.search(r"[\"'“”«»][^\"'“”«»]{2,}[\"'“”«»]", question or ""):
+            logging.info("event=availability_shortcut_scope source=heuristic scope=filtered reason=quoted_value")
+            return False
+
+        system = (
+            "Decide if the user asks a GLOBAL availability count over all rows, "
+            "or a FILTERED subset count. Return ONLY JSON: "
+            "{\"scope\":\"global\"|\"filtered\"}. "
+            "Use filtered when query constrains category/brand/model/id/color/spec/price or named entities."
+        )
+        payload = {
+            "question": question,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "preview": ((profile or {}).get("preview") or [])[:20],
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+            scope = str((parsed or {}).get("scope") or "").strip().lower()
+            if scope in {"filtered", "subset", "specific"}:
+                logging.info("event=availability_shortcut_scope source=llm scope=filtered")
+                return False
+            if scope in {"global", "all", "overall"}:
+                logging.info("event=availability_shortcut_scope source=llm scope=global")
+                return True
+        except Exception as exc:
+            logging.warning("event=availability_shortcut_scope source=llm error=%s", str(exc))
+        return True
 
     def _llm_pick_columns_by_role_for_shortcut(self, question: str, profile: dict) -> Dict[str, Any]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
@@ -3348,14 +5389,18 @@ class Pipeline(object):
                 return f"Загальна вартість — {scalar} UAH."
             row_idx = _parse_row_index(question or "")
             columns = [str(c) for c in (profile or {}).get("columns") or []]
-            col = _pick_relevant_column(question, columns)
-            if row_idx and col:
-                return f"{col} в рядку {row_idx} — {scalar}."
-            if col:
-                return f"{col} — {scalar}."
+            explicit_col = _find_explicit_column_in_text(question, columns)
+            if row_idx and explicit_col:
+                return f"{explicit_col} в рядку {row_idx} — {scalar}."
+            if explicit_col:
+                return f"{explicit_col} — {scalar}."
             if row_idx:
                 return f"Значення в рядку {row_idx} — {scalar}."
             return scalar
+
+        list_answer = self._format_scalar_list_from_result(result_text)
+        if list_answer:
+            return list_answer
 
         table = self._format_table_from_result(result_text)
         is_preview_request = bool(
@@ -3563,6 +5608,10 @@ class Pipeline(object):
             msg = "Оновлено таблицю."
             _log_return("edit_fallback", msg)
             return msg
+        if run_status == "ok" and not (error or "").strip() and not (result_text or "").strip():
+            msg = "За умовою запиту не знайдено значень."
+            _log_return("empty_result", msg)
+            return msg
         deterministic = self._deterministic_answer(question, result_text, profile)
         if deterministic:
             logging.info("event=final_answer mode=deterministic preview=%s", _safe_trunc(deterministic, 300))
@@ -3702,6 +5751,316 @@ class Pipeline(object):
         resp.raise_for_status()
         return resp.json()
 
+    def _prepare_analysis_code_for_question(
+        self,
+        question: str,
+        profile: dict,
+        has_edit: bool,
+    ) -> Dict[str, Any]:
+        events: List[Tuple[str, Dict[str, Any]]] = []
+        events.append(("codegen", {"question": _safe_trunc(question, 200)}))
+
+        edit_expected = False
+        op: Optional[str] = None
+        commit_df: Optional[bool] = None
+        plan = ""
+
+        router_hit, shortcut, router_meta, planner_hints = self._select_router_or_shortcut(question, profile, has_edit)
+        lookup_hints = planner_hints.get("lookup_hints") if isinstance(planner_hints, dict) else None
+        if router_hit:
+            analysis_code, router_meta = router_hit
+            plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+            events.append(("codegen_shortcut", {"intent_id": router_meta.get("intent_id")}))
+        elif shortcut:
+            analysis_code, plan = shortcut
+            events.append(("codegen_shortcut", {}))
+        else:
+            analysis_code, plan, op, commit_df = self._plan_code(question, profile, lookup_hints=lookup_hints)
+            if not (analysis_code or "").strip():
+                events.append(("codegen_empty", {}))
+                return {
+                    "ok": False,
+                    "events": events,
+                    "status": "codegen_empty",
+                    "message_sync": "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше.",
+                    "message_stream": "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання.",
+                }
+
+        analysis_code, count_err = _enforce_count_code(question, analysis_code)
+        if count_err:
+            return {
+                "ok": False,
+                "events": events,
+                "status": "invalid_code",
+                "message_sync": f"Неможливо виконати запит: {count_err}",
+                "message_stream": f"Неможливо виконати: {count_err}",
+            }
+        analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
+
+        analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
+            question, analysis_code, op, commit_df, df_profile=profile
+        )
+        need_retry_missing_result = bool(
+            finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit
+        )
+        need_retry_missing_filter = bool(finalize_err and "missing_subset_filter" in finalize_err)
+        if need_retry_missing_result or need_retry_missing_filter:
+            retry_reason = "missing_subset_filter" if need_retry_missing_filter else "missing_result_assignment"
+            events.append(("codegen_retry", {"reason": retry_reason}))
+            if need_retry_missing_filter:
+                analysis_code, plan, op, commit_df = self._plan_code_retry_missing_filter(
+                    question=question,
+                    profile=profile,
+                    previous_code=analysis_code,
+                    reason=finalize_err or "",
+                    lookup_hints=lookup_hints,
+                )
+            else:
+                analysis_code, plan, op, commit_df = self._plan_code_retry_missing_result(
+                    question=question,
+                    profile=profile,
+                    previous_code=analysis_code,
+                    reason=finalize_err or "",
+                    lookup_hints=lookup_hints,
+                )
+            if not (analysis_code or "").strip():
+                events.append(("codegen_empty", {}))
+                return {
+                    "ok": False,
+                    "events": events,
+                    "status": "codegen_empty",
+                    "message_sync": "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше.",
+                    "message_stream": "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання.",
+                }
+            analysis_code, count_err = _enforce_count_code(question, analysis_code)
+            if count_err:
+                return {
+                    "ok": False,
+                    "events": events,
+                    "status": "invalid_code",
+                    "message_sync": f"Неможливо виконати запит: {count_err}",
+                    "message_stream": f"Неможливо виконати: {count_err}",
+                }
+            analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
+            analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
+                question, analysis_code, op, commit_df, df_profile=profile
+            )
+
+        if finalize_err:
+            if "missing_result_assignment" in finalize_err:
+                status = "invalid_missing_result"
+            elif "missing_subset_filter" in finalize_err:
+                status = "invalid_subset_filter"
+            else:
+                status = "invalid_read_mutation"
+            return {
+                "ok": False,
+                "events": events,
+                "status": status,
+                "message_sync": f"Неможливо виконати запит: {finalize_err}",
+                "message_stream": f"Неможливо виконати: {finalize_err}",
+            }
+
+        if _has_forbidden_import_nodes(analysis_code):
+            return {
+                "ok": False,
+                "events": events,
+                "status": "invalid_import",
+                "message_sync": "Неможливо виконати запит: згенерований код містить заборонений import.",
+                "message_stream": "Неможливо виконати: згенерований код містить заборонений import.",
+            }
+
+        analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
+        analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
+        if "df_profile" in (analysis_code or ""):
+            analysis_code = f"df_profile = {profile!r}\n" + analysis_code
+        analysis_code = _normalize_generated_code(analysis_code)
+        logging.info("event=analysis_code preview=%s", _safe_trunc(analysis_code, 4000))
+        if _has_forbidden_import_nodes(analysis_code):
+            return {
+                "ok": False,
+                "events": events,
+                "status": "invalid_import",
+                "message_sync": "Неможливо виконати запит: згенерований код містить заборонений import.",
+                "message_stream": "Неможливо виконати: згенерований код містить заборонений import.",
+            }
+
+        return {
+            "ok": True,
+            "events": events,
+            "analysis_code": analysis_code,
+            "plan": plan,
+            "op": op,
+            "commit_df": commit_df,
+            "edit_expected": edit_expected,
+        }
+
+    def _run_analysis_with_retry(
+        self,
+        question: str,
+        profile: dict,
+        df_id: str,
+        analysis_code: str,
+        plan: str,
+        op: Optional[str],
+        commit_df: Optional[bool],
+        edit_expected: bool,
+    ) -> Dict[str, Any]:
+        events: List[Tuple[str, Dict[str, Any]]] = []
+        events.append(("sandbox_run", {"df_id": df_id}))
+        run_resp = self._sandbox_run(df_id, analysis_code)
+
+        run_status = run_resp.get("status", "")
+        run_error = run_resp.get("error", "") or ""
+        if run_status != "ok" and _is_retryable_import_keyerror(run_error):
+            try:
+                logging.warning("event=sandbox_retry reason=import_keyerror error=%s", _safe_trunc(run_error, 500))
+                events.append(("codegen_retry", {"reason": "runtime_keyerror_import"}))
+
+                retry_code = ""
+                retry_plan = plan
+                retry_op = op
+                retry_commit = commit_df
+
+                shortcut_retry = None
+                if not _question_requires_subset_filter(question, profile):
+                    shortcut_retry = _stats_shortcut_code(question, profile)
+                if shortcut_retry:
+                    retry_code, retry_plan = shortcut_retry
+                    retry_op = None
+                    retry_commit = None
+                else:
+                    retry_code, retry_plan, retry_op, retry_commit = self._plan_code_retry_runtime_error(
+                        question=question,
+                        profile=profile,
+                        previous_code=analysis_code,
+                        runtime_error=run_error,
+                    )
+
+                if (retry_code or "").strip():
+                    retry_code, retry_edit_expected, retry_finalize_err = _finalize_code_for_sandbox(
+                        question, retry_code, retry_op, retry_commit, df_profile=profile
+                    )
+                    if not retry_finalize_err and not _has_forbidden_import_nodes(retry_code):
+                        retry_code, retry_plan = self._resolve_shortcut_placeholders(
+                            retry_code, retry_plan, question, profile
+                        )
+                        retry_code = textwrap.dedent(retry_code or "").strip() + "\n"
+                        if "df_profile" in (retry_code or ""):
+                            retry_code = f"df_profile = {profile!r}\n" + retry_code
+                        retry_code = _normalize_generated_code(retry_code)
+                        logging.info("event=analysis_code_retry preview=%s", _safe_trunc(retry_code, 4000))
+
+                        events.append(("sandbox_run", {"df_id": df_id, "retry": True}))
+                        retry_resp = self._sandbox_run(df_id, retry_code)
+                        if retry_resp is not None:
+                            run_resp = retry_resp
+                            analysis_code = retry_code
+                            plan = retry_plan
+                            edit_expected = retry_edit_expected
+            except Exception as retry_exc:
+                logging.warning(
+                    "event=sandbox_retry_failed reason=import_keyerror error=%s",
+                    _safe_trunc(str(retry_exc), 500),
+                )
+
+        return {
+            "events": events,
+            "run_resp": run_resp,
+            "analysis_code": analysis_code,
+            "plan": plan,
+            "edit_expected": edit_expected,
+        }
+
+    def _postprocess_run_result(
+        self,
+        *,
+        run_resp: Dict[str, Any],
+        analysis_code: str,
+        edit_expected: bool,
+        profile: dict,
+        cached_fp: str,
+        session_key: str,
+        file_id: str,
+        df_id: str,
+    ) -> Dict[str, Any]:
+        profile_out = (run_resp or {}).get("profile")
+        was_committed = bool((run_resp or {}).get("committed"))
+        structure_changed = bool((run_resp or {}).get("structure_changed"))
+        profile_changed = False
+
+        if profile_out is not None:
+            profile_fp = _profile_fingerprint(profile_out)
+            profile_changed = bool(profile_fp and profile_fp != cached_fp)
+            if was_committed or structure_changed or (profile_fp and profile_fp != cached_fp):
+                profile = profile_out
+                self._session_set(session_key, file_id, df_id, profile_out)
+                if self.valves.debug:
+                    logging.info(
+                        "event=profile_updated committed=%s structure_changed=%s fp_old=%s fp_new=%s",
+                        was_committed,
+                        structure_changed,
+                        cached_fp[:8] if cached_fp else "none",
+                        profile_fp[:8] if profile_fp else "none",
+                    )
+
+        run_status = str((run_resp or {}).get("status", ""))
+        if run_status != "ok":
+            error = (run_resp or {}).get("error", "") or "Sandbox execution failed."
+            return {
+                "ok": False,
+                "status": run_status,
+                "profile": profile,
+                "message_sync": f"Не вдалося виконати аналіз (статус: {run_status}). Помилка: {error}",
+                "message_stream": f"Помилка виконання у sandbox (status: {run_status}). {error}",
+                "mutation_flags": {
+                    "committed": was_committed,
+                    "auto_committed": bool((run_resp or {}).get("auto_committed")),
+                    "structure_changed": structure_changed,
+                    "profile_changed": profile_changed,
+                },
+            }
+
+        has_commit_marker = "COMMIT_DF" in (analysis_code or "")
+        auto_committed = bool((run_resp or {}).get("auto_committed"))
+        logging.info(
+            "event=commit_result edit_expected=%s commit_marker=%s committed=%s auto_committed=%s structure_changed=%s profile_changed=%s",
+            edit_expected,
+            has_commit_marker,
+            was_committed,
+            auto_committed,
+            structure_changed,
+            profile_changed,
+        )
+
+        if edit_expected and has_commit_marker:
+            if not (was_committed or auto_committed or structure_changed or profile_changed):
+                return {
+                    "ok": False,
+                    "status": "commit_failed",
+                    "profile": profile,
+                    "message_sync": "Зміни не були зафіксовані. Спробуйте ще раз або вкажіть COMMIT_DF = True явно.",
+                    "message_stream": "Зміни не були застосовані. Будь ласка, перевірте код або спробуйте ще раз.",
+                    "mutation_flags": {
+                        "committed": was_committed,
+                        "auto_committed": auto_committed,
+                        "structure_changed": structure_changed,
+                        "profile_changed": profile_changed,
+                    },
+                }
+
+        return {
+            "ok": True,
+            "status": run_status,
+            "profile": profile,
+            "mutation_flags": {
+                "committed": was_committed,
+                "auto_committed": auto_committed,
+                "structure_changed": structure_changed,
+                "profile_changed": profile_changed,
+            },
+        }
+
     def pipe(
         self,
         user_message: str,
@@ -3753,10 +6112,14 @@ class Pipeline(object):
             session = self._session_get(session_key)
             cached_fp = session.get("profile_fp") if session else ""
 
-            file_id, file_obj = _pick_file_ref(body, messages)
-            if not file_id and session:
-                file_id = session.get("file_id")
-                file_obj = None
+            file_id, file_obj, file_source, ignored_history_file_id = _resolve_active_file_ref(body, messages, session)
+            logging.info(
+                "event=file_selection source=%s session_file_id=%s selected_file_id=%s ignored_history_file_id=%s",
+                file_source,
+                (session or {}).get("file_id"),
+                file_id,
+                ignored_history_file_id,
+            )
 
             self._emit(event_emitter, "file_id", {"file_id": file_id})
             if not file_id:
@@ -3795,160 +6158,54 @@ class Pipeline(object):
             commit_df = None
             
             has_edit = _has_edit_triggers(question)
-            router_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
-            shortcut = None
-            router_meta: Dict[str, Any] = {}
+            prep = self._prepare_analysis_code_for_question(question, profile, has_edit)
+            for ev, payload in prep.get("events", []):
+                self._emit(event_emitter, ev, payload)
+            if not prep.get("ok"):
+                status = str(prep.get("status") or "")
+                if status in {"invalid_missing_result", "invalid_subset_filter", "invalid_read_mutation", "invalid_import"}:
+                    self._emit(event_emitter, "final_answer", {"status": status})
+                return str(prep.get("message_sync") or "Неможливо виконати запит.")
 
-            if router_hit:
-                candidate_code, candidate_meta = router_hit
-                if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta):
-                    logging.warning(
-                        "event=shortcut_router status=rejected reason=mutating_for_read intent_id=%s question=%s",
-                        (candidate_meta or {}).get("intent_id"),
-                        _safe_trunc(question, 200),
-                    )
-                    router_hit = None
-                else:
-                    analysis_code, router_meta = candidate_code, candidate_meta
-                    plan = f"retrieval_intent:{router_meta.get('intent_id')}"
-                    logging.info("event=shortcut_router status=ok meta=%s", _safe_trunc(router_meta, 800))
-            if not router_hit:
-                if has_edit:
-                    logging.info("event=shortcut_router status=skipped reason=edit_intent")
-                else:
-                    logging.info("event=shortcut_router status=miss question=%s", _safe_trunc(question, 200))
-                metrics = _detect_metrics(question)
-                is_meta = _is_meta_task_text(question)
-                inferred_op = _infer_op_from_question(question)
+            analysis_code = str(prep.get("analysis_code") or "")
+            plan = str(prep.get("plan") or "")
+            op = prep.get("op")
+            commit_df = prep.get("commit_df")
+            edit_expected = bool(prep.get("edit_expected"))
 
-                if inferred_op == "read" and not is_meta and not has_edit and len(metrics) >= 2:
-                    shortcut = _stats_shortcut_code(question, profile)
-                
-                if not shortcut:
-                    shortcut = _template_shortcut_code(question, profile)
-                if not shortcut:
-                    shortcut = _edit_shortcut_code(question, profile)
-                if not shortcut:
-                    shortcut = _stats_shortcut_code(question, profile)
-
-            self._emit(event_emitter, "codegen", {"question": _safe_trunc(question, 200)})
-            
-            if router_hit:
-                self._emit(event_emitter, "codegen_shortcut", {"intent_id": router_meta.get("intent_id")})
-            elif shortcut:
-                self._emit(event_emitter, "codegen_shortcut", {})
-                analysis_code, plan = shortcut
-            else:
-                wait = self._start_wait(event_emitter, "codegen")
-                try:
-                    analysis_code, plan, op, commit_df = self._plan_code(question, profile)
-                finally:
-                    self._stop_wait(wait)
-                
-                if not (analysis_code or "").strip():
-                    self._emit(event_emitter, "codegen_empty", {})
-                    return "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше."
-
-            analysis_code, count_err = _enforce_count_code(question, analysis_code)
-            if count_err:
-                return f"Неможливо виконати запит: {count_err}"
-            analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
-
-            analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
-                question, analysis_code, op, commit_df, df_profile=profile
+            run_stage = self._run_analysis_with_retry(
+                question=question,
+                profile=profile,
+                df_id=df_id,
+                analysis_code=analysis_code,
+                plan=plan,
+                op=op,
+                commit_df=commit_df,
+                edit_expected=edit_expected,
             )
-            if finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit:
-                self._emit(event_emitter, "codegen_retry", {"reason": "missing_result_assignment"})
-                wait = self._start_wait(event_emitter, "codegen")
-                try:
-                    analysis_code, plan, op, commit_df = self._plan_code_retry_missing_result(
-                        question=question,
-                        profile=profile,
-                        previous_code=analysis_code,
-                        reason=finalize_err,
-                    )
-                finally:
-                    self._stop_wait(wait)
-                if not (analysis_code or "").strip():
-                    self._emit(event_emitter, "codegen_empty", {})
-                    return "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше."
-                analysis_code, count_err = _enforce_count_code(question, analysis_code)
-                if count_err:
-                    return f"Неможливо виконати запит: {count_err}"
-                analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
-                analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
-                    question, analysis_code, op, commit_df, df_profile=profile
-                )
-            if finalize_err:
-                status = "invalid_missing_result" if "missing_result_assignment" in finalize_err else "invalid_read_mutation"
-                self._emit(event_emitter, "final_answer", {"status": status})
-                return f"Неможливо виконати запит: {finalize_err}"
-            if _has_forbidden_import_nodes(analysis_code):
-                self._emit(event_emitter, "final_answer", {"status": "invalid_import"})
-                return "Неможливо виконати запит: згенерований код містить заборонений import."
-            analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
-            
-            analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
-            if "df_profile" in (analysis_code or ""):
-                analysis_code = f"df_profile = {profile!r}\n" + analysis_code
-            
-            analysis_code = _normalize_generated_code(analysis_code)
-            logging.info("event=analysis_code preview=%s", _safe_trunc(analysis_code, 4000))
-            if _has_forbidden_import_nodes(analysis_code):
-                self._emit(event_emitter, "final_answer", {"status": "invalid_import"})
-                return "Неможливо виконати запит: згенерований код містить заборонений import."
-
-            self._emit(event_emitter, "sandbox_run", {"df_id": df_id})
-            wait = self._start_wait(event_emitter, "sandbox_run")
-            try:
-                run_resp = self._sandbox_run(df_id, analysis_code)
-            finally:
-                self._stop_wait(wait)
-
-            profile_out = (run_resp or {}).get("profile")
-            was_committed = run_resp.get("committed", False)
-            structure_changed = bool(run_resp.get("structure_changed"))
-            profile_changed = False
-
-            if profile_out is not None:
-                profile_fp = _profile_fingerprint(profile_out)
-                profile_changed = bool(profile_fp and profile_fp != cached_fp)
-                if was_committed or structure_changed or (profile_fp and profile_fp != cached_fp):
-                    profile = profile_out
-                    self._session_set(session_key, file_id, df_id, profile_out)
-                    if self.valves.debug:
-                        logging.info(
-                            "event=profile_updated committed=%s structure_changed=%s fp_old=%s fp_new=%s",
-                            was_committed,
-                            structure_changed,
-                            cached_fp[:8] if cached_fp else "none",
-                            profile_fp[:8] if profile_fp else "none"
-                        )
-
-            run_status = run_resp.get("status", "")
-            if run_status != "ok":
+            for ev, payload in run_stage.get("events", []):
+                self._emit(event_emitter, ev, payload)
+            run_resp = run_stage.get("run_resp") or {}
+            analysis_code = str(run_stage.get("analysis_code") or analysis_code)
+            plan = str(run_stage.get("plan") or plan)
+            edit_expected = bool(run_stage.get("edit_expected"))
+            post = self._postprocess_run_result(
+                run_resp=run_resp,
+                analysis_code=analysis_code,
+                edit_expected=edit_expected,
+                profile=profile,
+                cached_fp=cached_fp,
+                session_key=session_key,
+                file_id=file_id,
+                df_id=df_id,
+            )
+            profile = post.get("profile") or profile
+            run_status = str(post.get("status") or "")
+            if not post.get("ok"):
                 self._emit(event_emitter, "final_answer", {"status": run_status})
-                error = run_resp.get("error", "") or "Sandbox execution failed."
-                return f"Не вдалося виконати аналіз (статус: {run_status}). Помилка: {error}"
+                return str(post.get("message_sync") or "Не вдалося виконати аналіз.")
 
-            has_commit_marker = "COMMIT_DF" in (analysis_code or "")
-            was_committed = bool(run_resp.get("committed"))
-            auto_committed = bool(run_resp.get("auto_committed"))
-            logging.info(
-                "event=commit_result edit_expected=%s commit_marker=%s committed=%s auto_committed=%s structure_changed=%s profile_changed=%s",
-                edit_expected,
-                has_commit_marker,
-                was_committed,
-                auto_committed,
-                structure_changed,
-                profile_changed,
-            )
-
-            if edit_expected and has_commit_marker:
-                if not (was_committed or auto_committed or structure_changed or profile_changed):
-                    self._emit(event_emitter, "final_answer", {"status": "commit_failed"})
-                    return "Зміни не були зафіксовані. Спробуйте ще раз або вкажіть COMMIT_DF = True явно."
-
+            mutation_flags = dict(post.get("mutation_flags") or {})
             self._emit(event_emitter, "final_answer", {"status": run_status})
             wait = self._start_wait(event_emitter, "final_answer")
             try:
@@ -3963,12 +6220,7 @@ class Pipeline(object):
                     result_text=run_resp.get("result_text", ""),
                     result_meta=run_resp.get("result_meta", {}) or {},
                     mutation_summary=run_resp.get("mutation_summary", {}) or {},
-                    mutation_flags={
-                        "committed": was_committed,
-                        "auto_committed": auto_committed,
-                        "structure_changed": structure_changed,
-                        "profile_changed": profile_changed,
-                    },
+                    mutation_flags=mutation_flags,
                     error=run_resp.get("error", ""),
                 )
             finally:
@@ -4052,10 +6304,14 @@ class Pipeline(object):
             session = self._session_get(session_key)
             cached_fp = session.get("profile_fp") if session else ""
 
-            file_id, file_obj = _pick_file_ref(body, messages)
-            if not file_id and session:
-                file_id = session.get("file_id")
-                file_obj = None
+            file_id, file_obj, file_source, ignored_history_file_id = _resolve_active_file_ref(body, messages, session)
+            logging.info(
+                "event=file_selection source=%s session_file_id=%s selected_file_id=%s ignored_history_file_id=%s",
+                file_source,
+                (session or {}).get("file_id"),
+                file_id,
+                ignored_history_file_id,
+            )
 
             emit("file_id", {"file_id": file_id})
             yield from drain()
@@ -4099,160 +6355,60 @@ class Pipeline(object):
             commit_df = None
             
             has_edit = _has_edit_triggers(question)
-            router_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
-            shortcut = None
-            router_meta: Dict[str, Any] = {}
-
-            if router_hit:
-                candidate_code, candidate_meta = router_hit
-                if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta):
-                    logging.warning(
-                        "event=shortcut_router status=rejected reason=mutating_for_read intent_id=%s question=%s",
-                        (candidate_meta or {}).get("intent_id"),
-                        _safe_trunc(question, 200),
-                    )
-                    router_hit = None
-                else:
-                    analysis_code, router_meta = candidate_code, candidate_meta
-                    plan = f"retrieval_intent:{router_meta.get('intent_id')}"
-            if not router_hit:
-                if has_edit:
-                    logging.info("event=shortcut_router status=skipped reason=edit_intent")
-                metrics = _detect_metrics(question)
-                is_meta = _is_meta_task_text(question)
-                inferred_op = _infer_op_from_question(question)
-
-                if inferred_op == "read" and not is_meta and not has_edit and len(metrics) >= 2:
-                    shortcut = _stats_shortcut_code(question, profile)
-                
-                if not shortcut:
-                    shortcut = _template_shortcut_code(question, profile)
-                if not shortcut:
-                    shortcut = _edit_shortcut_code(question, profile)
-                if not shortcut:
-                    shortcut = _stats_shortcut_code(question, profile)
-
-            emit("codegen", {"question": _safe_trunc(question, 200)})
-            yield from drain()
-
-            if router_hit:
-                emit("codegen_shortcut", {"intent_id": router_meta.get("intent_id")})
+            prep = self._prepare_analysis_code_for_question(question, profile, has_edit)
+            for ev, payload in prep.get("events", []):
+                emit(ev, payload)
                 yield from drain()
-            elif shortcut:
-                emit("codegen_shortcut", {})
-                yield from drain()
-                analysis_code, plan = shortcut
-            else:
-                analysis_code, plan, op, commit_df = self._plan_code(question, profile)
-                if not (analysis_code or "").strip():
-                    emit("codegen_empty", {})
+            if not prep.get("ok"):
+                status = str(prep.get("status") or "")
+                if status in {"invalid_code", "invalid_missing_result", "invalid_subset_filter", "invalid_read_mutation", "invalid_import"}:
+                    emit("final_answer", {"status": status})
                     yield from drain()
-                    yield "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання."
-                    return
-
-            analysis_code, count_err = _enforce_count_code(question, analysis_code)
-            if count_err:
-                emit("final_answer", {"status": "invalid_code"})
-                yield from drain()
-                yield f"Неможливо виконати: {count_err}"
+                yield str(prep.get("message_stream") or "Неможливо виконати запит.")
                 return
-            analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
 
-            analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
-                question, analysis_code, op, commit_df, df_profile=profile
+            analysis_code = str(prep.get("analysis_code") or "")
+            plan = str(prep.get("plan") or "")
+            op = prep.get("op")
+            commit_df = prep.get("commit_df")
+            edit_expected = bool(prep.get("edit_expected"))
+
+            run_stage = self._run_analysis_with_retry(
+                question=question,
+                profile=profile,
+                df_id=df_id,
+                analysis_code=analysis_code,
+                plan=plan,
+                op=op,
+                commit_df=commit_df,
+                edit_expected=edit_expected,
             )
-            if finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit:
-                emit("codegen_retry", {"reason": "missing_result_assignment"})
+            for ev, payload in run_stage.get("events", []):
+                emit(ev, payload)
                 yield from drain()
-                analysis_code, plan, op, commit_df = self._plan_code_retry_missing_result(
-                    question=question,
-                    profile=profile,
-                    previous_code=analysis_code,
-                    reason=finalize_err,
-                )
-                if not (analysis_code or "").strip():
-                    emit("codegen_empty", {})
-                    yield from drain()
-                    yield "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання."
-                    return
-                analysis_code, count_err = _enforce_count_code(question, analysis_code)
-                if count_err:
-                    emit("final_answer", {"status": "invalid_code"})
-                    yield from drain()
-                    yield f"Неможливо виконати: {count_err}"
-                    return
-                analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
-                analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
-                    question, analysis_code, op, commit_df, df_profile=profile
-                )
-            if finalize_err:
-                status = "invalid_missing_result" if "missing_result_assignment" in finalize_err else "invalid_read_mutation"
-                emit("final_answer", {"status": status})
-                yield from drain()
-                yield f"Неможливо виконати: {finalize_err}"
-                return
-            if _has_forbidden_import_nodes(analysis_code):
-                emit("final_answer", {"status": "invalid_import"})
-                yield from drain()
-                yield "Неможливо виконати: згенерований код містить заборонений import."
-                return
-            analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
-            analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
-            
-            if "df_profile" in (analysis_code or ""):
-                analysis_code = f"df_profile = {profile!r}\n" + analysis_code
-            
-            analysis_code = _normalize_generated_code(analysis_code)
-            if _has_forbidden_import_nodes(analysis_code):
-                emit("final_answer", {"status": "invalid_import"})
-                yield from drain()
-                yield "Неможливо виконати: згенерований код містить заборонений import."
-                return
-
-            emit("sandbox_run", {"df_id": df_id})
-            yield from drain()
-            run_resp = self._sandbox_run(df_id, analysis_code)
-
-            profile_out = (run_resp or {}).get("profile")
-            was_committed = run_resp.get("committed", False)
-            structure_changed = bool(run_resp.get("structure_changed"))
-            profile_changed = False
-
-            if profile_out is not None:
-                profile_fp = _profile_fingerprint(profile_out)
-                profile_changed = bool(profile_fp and profile_fp != cached_fp)
-                if was_committed or structure_changed or (profile_fp and profile_fp != cached_fp):
-                    profile = profile_out
-                    self._session_set(session_key, file_id, df_id, profile_out)
-
-            run_status = run_resp.get("status", "")
-            if run_status != "ok":
+            run_resp = run_stage.get("run_resp") or {}
+            analysis_code = str(run_stage.get("analysis_code") or analysis_code)
+            plan = str(run_stage.get("plan") or plan)
+            edit_expected = bool(run_stage.get("edit_expected"))
+            post = self._postprocess_run_result(
+                run_resp=run_resp,
+                analysis_code=analysis_code,
+                edit_expected=edit_expected,
+                profile=profile,
+                cached_fp=cached_fp,
+                session_key=session_key,
+                file_id=file_id,
+                df_id=df_id,
+            )
+            profile = post.get("profile") or profile
+            run_status = str(post.get("status") or "")
+            if not post.get("ok"):
                 emit("final_answer", {"status": run_status})
                 yield from drain()
-                error = run_resp.get("error", "") or "Sandbox execution failed."
-                yield f"Помилка виконання у sandbox (status: {run_status}). {error}"
+                yield str(post.get("message_stream") or "Помилка виконання у sandbox.")
                 return
 
-            has_commit_marker = "COMMIT_DF" in (analysis_code or "")
-            was_committed = bool(run_resp.get("committed"))
-            auto_committed = bool(run_resp.get("auto_committed"))
-            logging.info(
-                "event=commit_result edit_expected=%s commit_marker=%s committed=%s auto_committed=%s structure_changed=%s profile_changed=%s",
-                edit_expected,
-                has_commit_marker,
-                was_committed,
-                auto_committed,
-                structure_changed,
-                profile_changed,
-            )
-
-            if edit_expected and has_commit_marker:
-                if not (was_committed or auto_committed or structure_changed or profile_changed):
-                    emit("final_answer", {"status": "commit_failed"})
-                    yield from drain()
-                    yield "Зміни не були застосовані. Будь ласка, перевірте код або спробуйте ще раз."
-                    return
-
+            mutation_flags = dict(post.get("mutation_flags") or {})
             emit("final_answer", {"status": run_status})
             yield from drain()
             
@@ -4267,12 +6423,7 @@ class Pipeline(object):
                 result_text=run_resp.get("result_text", ""),
                 result_meta=run_resp.get("result_meta", {}) or {},
                 mutation_summary=run_resp.get("mutation_summary", {}) or {},
-                mutation_flags={
-                    "committed": was_committed,
-                    "auto_committed": auto_committed,
-                    "structure_changed": structure_changed,
-                    "profile_changed": profile_changed,
-                },
+                mutation_flags=mutation_flags,
                 error=run_resp.get("error", ""),
             )
 

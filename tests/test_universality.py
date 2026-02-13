@@ -8,7 +8,11 @@ from pipelines.spreadsheet_analyst_pipeline import (
     _classify_columns_by_role,
     _find_column_in_text,
     _find_columns_in_text,
+    _is_top_expensive_available_intent,
+    _looks_like_value_filter_query,
+    _stats_shortcut_code,
     _template_shortcut_code,
+    _total_inventory_value_shortcut_code,
 )
 
 
@@ -111,6 +115,18 @@ def test_find_columns_in_text_semantic_multiple() -> None:
     assert "Кількість_шт" in found
 
 
+def test_find_column_does_not_match_id_inside_nvidia() -> None:
+    cols = ["ID", "Категорія", "Бренд", "Статус"]
+    picked = _find_column_in_text("Скільки в нас відеокарт NVIDIA у наявності?", cols)
+    assert picked is None
+
+
+def test_find_columns_does_not_match_id_inside_nvidia() -> None:
+    cols = ["ID", "Категорія", "Бренд", "Статус"]
+    found = _find_columns_in_text("Скільки в нас відеокарт NVIDIA у наявності?", cols)
+    assert "ID" not in found
+
+
 def test_classify_columns_by_role_prefers_categorical_plus_numeric() -> None:
     roles = _classify_columns_by_role(
         "Які топ-3 категорії мають найбільшу загальну кількість товарів?",
@@ -143,3 +159,263 @@ def test_resolve_shortcut_placeholders_groupby_sum_topn_llm_first() -> None:
     assert ".head(3)" in resolved_code
     assert "Категорія" in resolved_plan
     assert "Кількість" in resolved_plan
+
+
+def test_availability_shortcut_scope_filtered_for_entity_token() -> None:
+    pipeline = Pipeline()
+    profile = {"columns": ["ID", "Категорія", "Бренд", "Статус"], "dtypes": {}, "preview": []}
+    allowed = pipeline._should_use_availability_shortcut(
+        "Скільки в нас відеокарт NVIDIA у наявності?",
+        profile,
+    )
+    assert allowed is False
+
+
+def test_total_inventory_value_shortcut_builds_product_sum() -> None:
+    profile = {
+        "columns": ["ID", "Ціна_UAH", "Кількість", "Статус"],
+        "dtypes": {"ID": "float64", "Ціна_UAH": "float64", "Кількість": "int64", "Статус": "str"},
+    }
+    q = "Яка сума виручки, якщо продати весь наявний товар?"
+    shortcut = _total_inventory_value_shortcut_code(q, profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "result = (df['Ціна_UAH'] * df['Кількість']).sum()" in code
+
+
+def test_top_expensive_available_intent_detected() -> None:
+    q = "Які 5 найдорожчих товарів у нас є у наявності?"
+    assert _is_top_expensive_available_intent(q) is True
+
+
+def test_stats_shortcut_prefers_llm_metric_column_hint() -> None:
+    profile = {
+        "columns": ["ID", "Ціна_UAH", "Кількість"],
+        "dtypes": {"ID": "float64", "Ціна_UAH": "float64", "Кількість": "int64"},
+    }
+    shortcut = _stats_shortcut_code("Яке середнє значення вартості?", profile, preferred_col="Ціна_UAH")
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_col = df['Ціна_UAH']" in code
+
+
+def test_deterministic_scalar_does_not_guess_column_without_explicit_mention() -> None:
+    pipeline = Pipeline()
+    profile = {"columns": ["ID", "Категорія", "Бренд", "Статус"]}
+    out = pipeline._deterministic_answer("Скільки в нас відеокарт NVIDIA у наявності?", "2", profile)
+    assert out == "2"
+
+
+def test_deterministic_scalar_uses_explicit_column_mention() -> None:
+    pipeline = Pipeline()
+    profile = {"columns": ["ID", "Категорія", "Бренд", "Статус"]}
+    out = pipeline._deterministic_answer("Скільки значень у колонці ID?", "2", profile)
+    assert out == "ID — 2."
+
+
+def test_ranking_shortcut_code_uses_llm_slots_row_ranking() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "row_ranking",
+        "metric_col": "Ціна_UAH",
+        "top_n": 5,
+        "order": "desc",
+        "require_available": True,
+        "availability_col": "Статус",
+        "entity_cols": ["Модель", "Бренд"],
+    }
+    profile = {
+        "columns": ["ID", "Модель", "Бренд", "Ціна_UAH", "Статус"],
+        "dtypes": {"ID": "float64", "Модель": "str", "Бренд": "str", "Ціна_UAH": "float64", "Статус": "str"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Які 5 найдорожчих товарів у наявності?", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_metric_col = 'Ціна_UAH'" in code
+    assert "_top_n = 5" in code
+    assert "_avail_col = 'Статус'" in code
+    assert "_work = _work.nlargest(_top_n, _metric_col)" in code
+
+
+def test_ranking_shortcut_code_skips_group_ranking() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "metric_col": "Кількість",
+        "top_n": 3,
+    }
+    profile = {"columns": ["Категорія", "Кількість"], "dtypes": {"Кількість": "int64"}}
+    shortcut = pipeline._ranking_shortcut_code("Топ-3 категорії за кількістю", profile)
+    assert shortcut is None
+
+
+def test_ranking_shortcut_code_group_ranking_sum_from_llm_slots() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "Категорія",
+        "target_col": "Кількість",
+        "agg": "sum",
+        "top_n": 3,
+        "order": "desc",
+        "require_available": False,
+    }
+    profile = {
+        "columns": ["Категорія", "Кількість", "Статус"],
+        "dtypes": {"Категорія": "str", "Кількість": "int64", "Статус": "str"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Топ-3 категорії за сумою кількості", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_group_col = 'Категорія'" in code
+    assert "_agg = 'sum'" in code
+    assert "_target_col = 'Кількість'" in code
+    assert "groupby(_group_col)[_target_col].sum()" in code
+    assert "result = _res.head(_top_n)" in code
+
+
+def test_ranking_shortcut_code_group_ranking_sum_uses_metric_col_as_target_fallback() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "Категорія",
+        "metric_col": "Кількість",
+        "target_col": "",
+        "agg": "sum",
+        "top_n": 10,
+        "order": "desc",
+        "require_available": False,
+    }
+    profile = {
+        "columns": ["Категорія", "Кількість", "Статус"],
+        "dtypes": {"Категорія": "str", "Кількість": "int64", "Статус": "str"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Загальна кількість штук по категоріях", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_target_col = 'Кількість'" in code
+    assert "groupby(_group_col)[_target_col].sum()" in code
+
+
+def test_ranking_shortcut_code_group_ranking_sum_metric_col_fallback_generic_names() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "segment_name",
+        "metric_col": "units_on_hand",
+        "target_col": "",
+        "agg": "sum",
+        "top_n": 10,
+        "order": "desc",
+        "require_available": False,
+    }
+    profile = {
+        "columns": ["segment_name", "units_on_hand", "state_flag"],
+        "dtypes": {"segment_name": "str", "units_on_hand": "int64", "state_flag": "str"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Total units by segment", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_target_col = 'units_on_hand'" in code
+    assert "groupby(_group_col)[_target_col].sum()" in code
+
+
+def test_ranking_shortcut_code_group_ranking_count_from_llm_slots() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "Бренд",
+        "agg": "count",
+        "top_n": 5,
+        "order": "desc",
+    }
+    profile = {
+        "columns": ["Бренд", "Модель", "Ціна_UAH"],
+        "dtypes": {"Бренд": "str", "Модель": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Топ-5 брендів за кількістю моделей", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_agg = 'count'" in code
+    assert "groupby(_group_col).size().reset_index(name='count')" in code
+
+
+def test_ranking_shortcut_skips_filter_like_query_without_topn() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "row_ranking",
+        "metric_col": "Ціна_UAH",
+        "order": "asc",
+        "require_available": False,
+        "entity_cols": ["Модель"],
+    }
+    profile = {
+        "columns": ["ID", "Модель", "Ціна_UAH"],
+        "dtypes": {"ID": "float64", "Модель": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Поверни всі моделі, де ціна 5200", profile)
+    assert shortcut is None
+
+
+def test_ranking_shortcut_generated_code_has_no_pd_to_numeric_calls() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "row_ranking",
+        "metric_col": "Ціна_UAH",
+        "top_n": 5,
+        "order": "desc",
+        "require_available": False,
+        "entity_cols": ["Модель"],
+    }
+    profile = {
+        "columns": ["ID", "Модель", "Ціна_UAH"],
+        "dtypes": {"ID": "float64", "Модель": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Топ-5 найдорожчих моделей", profile)
+    assert shortcut is not None
+    code, _ = shortcut
+    assert "pd.to_numeric(" not in code
+
+
+def test_filter_like_detector_hits_price_equality_query() -> None:
+    assert _looks_like_value_filter_query("Поверни всі моделі мишей які мають ціну 5200") is True
+
+
+def test_lookup_shortcut_code_generates_filter_path_from_llm_slots() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_lookup_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "mode": "lookup",
+        "filters": [
+            {"column": "Категорія", "op": "eq", "value": "Миша"},
+            {"column": "Ціна_UAH", "op": "eq", "value": 5200},
+        ],
+        "output_columns": ["Модель"],
+        "limit": None,
+    }
+    profile = {
+        "columns": ["ID", "Категорія", "Бренд", "Модель", "Ціна_UAH"],
+        "dtypes": {
+            "ID": "float64",
+            "Категорія": "str",
+            "Бренд": "str",
+            "Модель": "str",
+            "Ціна_UAH": "float64",
+        },
+    }
+    shortcut = pipeline._lookup_shortcut_code("Поверни всі моделі мишей які мають ціну 5200", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_c0 = 'Категорія'" in code
+    assert "_c1 = 'Ціна_UAH'" in code
+    assert "_out_cols = ['Модель']" in code
+    assert "pd.to_numeric(" not in code
+
+
+def test_lookup_shortcut_code_returns_none_for_non_lookup_mode() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_lookup_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "mode": "other",
+        "filters": [],
+    }
+    profile = {"columns": ["ID", "Модель"], "dtypes": {"ID": "float64", "Модель": "str"}}
+    assert pipeline._lookup_shortcut_code("Які 5 найдорожчих товарів?", profile) is None

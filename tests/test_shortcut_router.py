@@ -1,100 +1,237 @@
-import os
-import sys
+import json
 
-ROOT = os.path.dirname(os.path.dirname(__file__))
-PIPELINES_DIR = os.path.join(ROOT, "pipelines")
-if PIPELINES_DIR not in sys.path:
-    sys.path.append(PIPELINES_DIR)
-
-from pipelines.shortcut_router import ShortcutRouter, ShortcutRouterConfig
+from pipelines.shortcut_router.shortcut_router import ShortcutRouter
 
 
-def _router() -> ShortcutRouter:
-    cfg = ShortcutRouterConfig(enabled=False)
-    return ShortcutRouter(cfg, llm_json=None)
+def test_match_enum_handles_ukrainian_inflections() -> None:
+    router = ShortcutRouter()
+    values = ["mean", "sum", "min", "max", "median"]
+    assert router._match_enum(values, "яка середня вартість?") == "mean"
+    assert router._match_enum(values, "який мінімальний чек?") == "min"
+    assert router._match_enum(values, "який максимальний чек?") == "max"
 
 
-def test_fill_slots_groupby_count_rule_based() -> None:
-    router = _router()
+def test_fill_slots_stats_aggregation_forces_numeric_column() -> None:
+    router = ShortcutRouter()
     intent = {
-        "id": "groupby_count",
-        "slots": {"group_col": {"type": "column", "required": True}, "top_n": {"type": "int", "required": False, "default": 0}},
-        "plan": [{"op": "groupby_count"}],
-    }
-    profile = {"rows": 100, "dtypes": {"Марка машин": "object"}}
-    columns = ["Марка машин", "Кількість"]
-    slots = router._fill_slots(intent, "скільки для кожної марки машин", columns, profile)  # type: ignore[attr-defined]
-    assert slots is not None
-    assert slots.get("group_col") == "Марка машин"
-
-
-def test_compile_drop_rows_by_position_contains_commit() -> None:
-    router = _router()
-    intent = {
-        "id": "drop_rows_by_position",
-        "slots": {"row_indices": {"type": "row_indices", "required": True}},
-        "plan": [{"op": "drop_rows_by_position"}],
-    }
-    profile = {"rows": 10, "columns": ["A"]}
-    slots = {"row_indices": [1, 3, 5]}
-    code = router._compile_plan(intent, slots, profile)  # type: ignore[attr-defined]
-    assert code
-    assert "drop_rows_by_position" not in code
-    assert "COMMIT_DF = True" in code
-    assert "_idx_1b" in code
-
-
-def test_resolve_groupby_count_to_groupby_agg_with_llm() -> None:
-    def _fake_llm_json(_system: str, _payload: str) -> dict:
-        return {"group_col": "Категорія", "target_col": "Кількість", "agg": "sum", "top_n": 3}
-
-    cfg = ShortcutRouterConfig(enabled=False)
-    router = ShortcutRouter(cfg, llm_json=_fake_llm_json)
-    groupby_count_intent = {
-        "id": "groupby_count",
-        "slots": {"group_col": {"type": "column", "required": True}},
-        "plan": [{"op": "groupby_count"}],
-    }
-    groupby_agg_intent = {
-        "id": "groupby_agg",
+        "id": "stats_aggregation",
         "slots": {
-            "group_col": {"type": "column", "required": True},
-            "target_col": {"type": "column", "required": True},
-            "agg": {"type": "enum", "required": False, "default": "sum", "values": ["sum", "mean", "min", "max"]},
+            "column": {"type": "column", "required": True},
+            "metric": {"type": "enum", "required": True, "values": ["mean", "sum", "min", "max", "median"]},
         },
-        "plan": [{"op": "groupby_agg"}],
     }
-    router._intents = {"groupby_count": groupby_count_intent, "groupby_agg": groupby_agg_intent}  # type: ignore[attr-defined]
-    profile = {"rows": 100, "columns": ["Категорія", "Кількість"], "dtypes": {"Кількість": "int64"}}
-    resolved, preset = router._resolve_intent_and_slots(  # type: ignore[attr-defined]
-        groupby_count_intent,
-        "Які ТОП-3 категорії мають найбільшу загальну кількість?",
-        ["Категорія", "Кількість"],
+    query = "Яка середня вартість ноутбука в нашому каталогу?"
+    columns = ["ID", "Категорія", "Бренд", "Ціна_UAH", "Кількість"]
+    profile = {
+        "dtypes": {
+            "ID": "float64",
+            "Категорія": "str",
+            "Бренд": "str",
+            "Ціна_UAH": "float64",
+            "Кількість": "int64",
+        }
+    }
+    slots = router._fill_slots(intent, query, columns, profile)
+    assert slots is not None
+    assert slots["metric"] == "mean"
+    assert slots["column"] == "Ціна_UAH"
+
+
+def test_has_filter_context_detects_metric_subset_query() -> None:
+    router = ShortcutRouter()
+    profile = {
+        "columns": ["Категорія", "Ціна_UAH", "Бренд"],
+        "preview": [
+            {"Категорія": "Миша", "Ціна_UAH": 1200, "Бренд": "Logitech"},
+            {"Категорія": "Клавіатура", "Ціна_UAH": 2200, "Бренд": "Keychron"},
+        ],
+    }
+    assert router._has_filter_context("Яка максимальна ціна серед мишей?", profile) is True
+
+
+def test_has_filter_context_false_for_plain_metric_query() -> None:
+    router = ShortcutRouter()
+    profile = {
+        "columns": ["Категорія", "Ціна_UAH"],
+        "preview": [{"Категорія": "Миша", "Ціна_UAH": 1200}],
+    }
+    assert router._has_filter_context("Яка максимальна ціна?", profile) is False
+
+
+def test_assess_query_complexity_high_for_filtered_metric_query() -> None:
+    router = ShortcutRouter()
+    profile = {
+        "columns": ["Категорія", "Ціна_UAH", "Бренд"],
+        "preview": [
+            {"Категорія": "Миша", "Ціна_UAH": 1200, "Бренд": "Logitech"},
+            {"Категорія": "Клавіатура", "Ціна_UAH": 2200, "Бренд": "Keychron"},
+        ],
+    }
+    score = router._assess_query_complexity("Яка максимальна ціна серед мишей та клавіатур?", profile)
+    assert score >= 0.7
+
+
+def test_fill_slots_filter_contains_uses_value_to_pick_filter_column() -> None:
+    def fake_llm(_system: str, user: str) -> dict:
+        payload = json.loads(user)
+        if payload.get("slot_name") == "value":
+            return {"value": "Миша"}
+        return {"value": None}
+
+    router = ShortcutRouter(llm_json=fake_llm)
+    intent = {
+        "id": "filter_contains",
+        "slots": {
+            "column": {"type": "column", "required": True},
+            "value": {"type": "str", "required": True},
+        },
+    }
+    query = "Загальна кількість товарів категорії Миша зі статусом на складі"
+    columns = ["ID", "Категорія", "Кількість", "Статус"]
+    profile = {
+        "dtypes": {"ID": "int64", "Категорія": "object", "Кількість": "int64", "Статус": "object"},
+        "preview": [
+            {"ID": 1, "Категорія": "Миша", "Кількість": 12, "Статус": "В наявності"},
+            {"ID": 2, "Категорія": "Клавіатура", "Кількість": 8, "Статус": "В наявності"},
+        ],
+    }
+    slots = router._fill_slots(intent, query, columns, profile)
+    assert slots is not None
+    assert slots["value"] == "Миша"
+    assert slots["column"] == "Категорія"
+
+
+def test_fill_slots_filtered_metric_aggregation_enforces_filter_and_numeric_target() -> None:
+    def fake_llm(_system: str, user: str) -> dict:
+        payload = json.loads(user)
+        if payload.get("slot_name") == "filter_value":
+            return {"value": "Миша"}
+        if payload.get("slot_name") == "target_col":
+            return {"value": "Кількість"}
+        return {"value": None}
+
+    router = ShortcutRouter(llm_json=fake_llm)
+    intent = {
+        "id": "filtered_metric_aggregation",
+        "slots": {
+            "filter_col": {"type": "column", "required": True},
+            "filter_value": {"type": "str", "required": True},
+            "target_col": {"type": "column", "required": True},
+            "metric": {"type": "enum", "required": True, "values": ["mean", "sum", "min", "max", "median"]},
+        },
+    }
+    query = "Яка максимальна кількість серед товарів категорії Миша?"
+    columns = ["ID", "Категорія", "Кількість", "Статус"]
+    profile = {
+        "dtypes": {"ID": "int64", "Категорія": "object", "Кількість": "int64", "Статус": "object"},
+        "preview": [
+            {"ID": 1, "Категорія": "Миша", "Кількість": 12, "Статус": "В наявності"},
+            {"ID": 2, "Категорія": "Клавіатура", "Кількість": 8, "Статус": "В наявності"},
+        ],
+    }
+    slots = router._fill_slots(intent, query, columns, profile)
+    assert slots is not None
+    assert slots["filter_col"] == "Категорія"
+    assert slots["filter_value"] == "Миша"
+    assert slots["target_col"] == "Кількість"
+
+
+def test_fill_slots_filter_contains_is_column_name_agnostic() -> None:
+    router = ShortcutRouter()
+    intent = {
+        "id": "filter_contains",
+        "slots": {
+            "column": {"type": "column", "required": True},
+            "value": {"type": "str", "required": True},
+        },
+    }
+    query = "Загальна кількість товарів миша зі статусом на складі"
+    columns = ["col_1", "col_2", "col_3"]
+    profile = {
+        "dtypes": {"col_1": "int64", "col_2": "object", "col_3": "object"},
+        "preview": [
+            {"col_1": 12, "col_2": "Миша", "col_3": "В наявності"},
+            {"col_1": 8, "col_2": "Клавіатура", "col_3": "В наявності"},
+        ],
+    }
+    slots = router._fill_slots(intent, query, columns, profile)
+    assert slots is not None
+    assert slots["value"] == "миша"
+    assert slots["column"] == "col_2"
+
+
+def test_resolve_intent_prefers_groupby_sum_for_grouped_total_quantity_query() -> None:
+    def fake_llm(_system: str, _user: str) -> dict:
+        return {
+            "group_col": "Категорія",
+            "target_col": "ID",
+            "agg": "count",
+            "top_n": 0,
+        }
+
+    router = ShortcutRouter(llm_json=fake_llm)
+    router._intents = {
+        "groupby_count": {"id": "groupby_count"},
+        "groupby_agg": {"id": "groupby_agg"},
+    }
+    base_intent = {"id": "groupby_count"}
+    columns = ["ID", "Категорія", "Кількість", "Статус"]
+    profile = {
+        "dtypes": {"ID": "float64", "Категорія": "str", "Кількість": "int64", "Статус": "str"},
+        "rows": 100,
+        "preview": [
+            {"ID": 1.0, "Категорія": "Миша", "Кількість": 25, "Статус": "В наявності"},
+            {"ID": 2.0, "Категорія": "SSD", "Кількість": 12, "Статус": "В наявності"},
+        ],
+    }
+    resolved_intent, preset = router._resolve_intent_and_slots(
+        base_intent,
+        "Загальна кількість товарів по категоріях",
+        columns,
         profile,
     )
-    assert resolved.get("id") == "groupby_agg"
+    assert resolved_intent.get("id") == "groupby_agg"
     assert preset.get("group_col") == "Категорія"
-    assert preset.get("target_col") == "Кількість"
     assert preset.get("agg") == "sum"
-    assert preset.get("top_n") == 3
+    assert preset.get("target_col") == "Кількість"
 
 
-def test_compile_groupby_agg_applies_sort_and_top_n() -> None:
-    router = _router()
-    intent = {"id": "groupby_agg", "slots": {}, "plan": [{"op": "groupby_agg"}]}
-    profile = {"rows": 100, "columns": ["Категорія", "Кількість"]}
-    slots = {"group_col": "Категорія", "target_col": "Кількість", "agg": "sum", "top_n": 3}
-    code = router._compile_plan(intent, slots, profile)  # type: ignore[attr-defined]
-    assert code
-    assert ".agg('sum').reset_index(name='Кількість')" in code
-    assert "sort_values('Кількість', ascending=False)" in code
-    assert "result = result.head(3)" in code
+def test_resolve_intent_prefers_groupby_sum_for_grouped_total_quantity_query_generic_names() -> None:
+    def fake_llm(_system: str, _user: str) -> dict:
+        return {
+            "group_col": "segment_name",
+            "target_col": "record_id",
+            "agg": "count",
+            "top_n": 0,
+        }
 
-
-def test_compile_stats_nulls_has_no_lambda() -> None:
-    router = _router()
-    intent = {"id": "stats_nulls", "slots": {}, "plan": [{"op": "stats_nulls"}]}
-    code = router._compile_plan(intent, {"top_n": 5}, {"rows": 10})  # type: ignore[attr-defined]
-    assert code
-    assert "lambda" not in code
-    assert "sort_values(ascending=False).head(5)" in code
+    router = ShortcutRouter(llm_json=fake_llm)
+    router._intents = {
+        "groupby_count": {"id": "groupby_count"},
+        "groupby_agg": {"id": "groupby_agg"},
+    }
+    base_intent = {"id": "groupby_count"}
+    columns = ["record_id", "segment_name", "units_on_hand", "state_flag"]
+    profile = {
+        "dtypes": {
+            "record_id": "int64",
+            "segment_name": "str",
+            "units_on_hand": "int64",
+            "state_flag": "str",
+        },
+        "rows": 100,
+        "preview": [
+            {"record_id": 1, "segment_name": "A", "units_on_hand": 10, "state_flag": "in"},
+            {"record_id": 2, "segment_name": "B", "units_on_hand": 8, "state_flag": "in"},
+        ],
+    }
+    resolved_intent, preset = router._resolve_intent_and_slots(
+        base_intent,
+        "Total units by segment",
+        columns,
+        profile,
+    )
+    assert resolved_intent.get("id") == "groupby_agg"
+    assert preset.get("group_col") == "segment_name"
+    assert preset.get("agg") == "sum"
+    assert preset.get("target_col") == "units_on_hand"

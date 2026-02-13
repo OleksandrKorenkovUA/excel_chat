@@ -28,6 +28,16 @@ def test_auto_detect_commit_inplace_true() -> None:
     assert _auto_detect_commit(code) is True
 
 
+def test_auto_detect_commit_df_filter_assignment() -> None:
+    code = "df = df[df['A'] > 0]\nresult = int(df.shape[0])\n"
+    assert _auto_detect_commit(code) is True
+
+
+def test_auto_detect_commit_allows_df_copy_assignment_in_read_code() -> None:
+    code = "df = df.copy(deep=False)\nresult = int(df['A'].mean())\n"
+    assert _auto_detect_commit(code) is False
+
+
 def test_auto_detect_commit_read_only_code() -> None:
     code = "result = int(df['A'].mean())\n"
     assert _auto_detect_commit(code) is False
@@ -43,6 +53,18 @@ def test_finalize_blocks_commit_for_read_with_mutation() -> None:
     assert committed is False
     assert err is not None
     assert "COMMIT_DF = True" not in code
+
+
+def test_finalize_blocks_read_when_df_is_reassigned_to_filtered_subset() -> None:
+    code, committed, err = _finalize_code_for_sandbox(
+        question="Яка максимальна ціна на товар Миша",
+        analysis_code="df = df[df['Категорія'].astype(str).str.contains('Миша', case=False, na=False)]\nresult = df['Ціна_UAH'].max()\n",
+        op="read",
+        commit_df=False,
+    )
+    assert committed is False
+    assert err is not None
+    assert "read-запиту" in err
 
 
 def test_finalize_keeps_read_copy_for_non_mutation() -> None:
@@ -119,16 +141,71 @@ def test_detect_result_single_column_sum() -> None:
     assert col == "Кількість"
 
 
+def test_detect_single_sum_does_not_match_product_expression() -> None:
+    col = _detect_result_single_column_sum("result = df['Ціна_UAH'] * df['Кількість'].sum()\n")
+    assert col is None
+
+
+def test_detect_sum_of_product_does_not_match_right_side_sum_expression() -> None:
+    cols = _detect_result_sum_of_product_columns("result = df['Ціна_UAH'] * df['Кількість'].sum()\n")
+    assert cols is None
+
+
 def test_rewrite_sum_of_product_code_applies_valid_mask() -> None:
     code = "result = (df['Ціна_UAH'] * df['Кількість']).sum()\n"
     rewritten = _rewrite_sum_of_product_code(
         code,
         {"columns": ["ID", "Ціна_UAH", "Кількість", "Статус"]},
     )
-    assert "_valid = pd.Series(True, index=df.index)" in rewritten
-    assert "_id_like" in rewritten
-    assert "result = float((_left * _right).sum())" in rewritten
-    assert "pd.to_numeric" not in rewritten
+    assert "_valid = _left.notna() & _right.notna()" in rewritten
+    assert "result = float((_left[_valid] * _right[_valid]).sum())" in rewritten
+    assert "_meta_cols" not in rewritten
+    assert "_id_like" not in rewritten
+    assert "pd.to_numeric" in rewritten
+
+
+def test_rewrite_sum_of_product_code_skips_for_non_sum_aggregation_intent() -> None:
+    code = "result = (df['Ціна_UAH'] * df['Кількість']).sum()\n"
+    rewritten = _rewrite_sum_of_product_code(
+        code,
+        {"columns": ["ID", "Категорія", "Ціна_UAH", "Кількість"]},
+        question="Яка середня ціна ноутбуків?",
+    )
+    assert rewritten == code
+
+
+def test_rewrite_sum_of_product_code_skips_when_code_has_filter() -> None:
+    code = (
+        "_m = df['Категорія'].astype(str).str.contains('Ноутбук', case=False, na=False)\n"
+        "result = (df['Ціна_UAH'] * df['Кількість']).sum()\n"
+    )
+    rewritten = _rewrite_sum_of_product_code(
+        code,
+        {"columns": ["ID", "Категорія", "Ціна_UAH", "Кількість"]},
+        question="Яка загальна вартість ноутбуків?",
+    )
+    assert rewritten == code
+
+
+def test_rewrite_sum_of_product_code_does_not_exclude_rows_by_id_or_meta() -> None:
+    code = "result = (df['Ціна_UAH'] * df['Кількість']).sum()\n"
+    rewritten = _rewrite_sum_of_product_code(
+        code,
+        {"columns": ["ID", "Категорія", "Ціна_UAH", "Кількість", "Статус"]},
+        question="Яка загальна вартість усіх товарів на складі?",
+    )
+    df = pd.DataFrame(
+        {
+            "ID": [1001.0, np.nan],
+            "Категорія": ["Ноутбук", np.nan],
+            "Ціна_UAH": [100.0, 200.0],
+            "Кількість": [2, 3],
+            "Статус": ["В наявності", np.nan],
+        }
+    )
+    env = {"df": df, "pd": pd, "np": np}
+    exec(rewritten, env, env)
+    assert float(env["result"]) == 800.0
 
 
 def test_rewrite_single_column_sum_excludes_summary_rows() -> None:
@@ -167,3 +244,63 @@ def test_deterministic_answer_for_inventory_total_not_labeled_as_column() -> Non
 def test_is_total_value_scalar_question_variant_phrase() -> None:
     profile = {"columns": ["Ціна_UAH", "Кількість", "Категорія"]}
     assert _is_total_value_scalar_question("Скільки всього коштує склад?", profile) is True
+
+
+def test_is_total_value_scalar_question_false_for_average_intent() -> None:
+    profile = {"columns": ["Ціна_UAH", "Кількість", "Категорія"]}
+    assert _is_total_value_scalar_question("Середня ціна ноутбуків", profile) is False
+
+
+def test_final_answer_returns_short_message_for_empty_result() -> None:
+    pipeline = Pipeline()
+    answer = pipeline._final_answer(
+        question="Яка максимальна ціна серед мишей?",
+        profile={"columns": ["Категорія", "Ціна_UAH"]},
+        plan="",
+        code="result = None\n",
+        edit_expected=False,
+        run_status="ok",
+        stdout="",
+        result_text="",
+        result_meta={},
+        mutation_summary={},
+        mutation_flags={},
+        error="",
+    )
+    assert answer == "За умовою запиту не знайдено значень."
+
+
+def test_stats_shortcut_does_not_replace_average_with_total_inventory() -> None:
+    from pipelines.spreadsheet_analyst_pipeline import _stats_shortcut_code
+
+    profile = {
+        "columns": ["Категорія", "Ціна_UAH", "Кількість"],
+        "dtypes": {"Категорія": "str", "Ціна_UAH": "float64", "Кількість": "int64"},
+    }
+    out = _stats_shortcut_code("Середня ціна ноутбуків", profile)
+    assert out is not None
+    code, _plan = out
+    assert ".mean()" in code or "result['mean']" in code
+    assert "(df['Ціна_UAH'] * df['Кількість']).sum()" not in code
+
+
+def test_lookup_shortcut_status_semantic_uses_contains_pattern() -> None:
+    pipeline = Pipeline()
+    profile = {
+        "columns": ["Категорія", "Статус", "Кількість"],
+        "dtypes": {"Категорія": "str", "Статус": "str", "Кількість": "int64"},
+    }
+    slots = {
+        "mode": "lookup",
+        "filters": [
+            {"column": "Категорія", "op": "contains", "value": "Миша"},
+            {"column": "Статус", "op": "eq", "value": "на складі"},
+        ],
+        "output_columns": ["Кількість"],
+    }
+    out = pipeline._lookup_shortcut_code_from_slots("Яка кількість мишей на складі", profile, slots)
+    assert out is not None
+    code, _plan = out
+    assert "_pat1" in code
+    assert "склад" in code
+    assert ".str.contains(_pat" in code

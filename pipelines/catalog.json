@@ -751,7 +751,12 @@
 				"Містить текст у полі comment",
 				"Відфільтруй за підрядком",
 				"Пошук по частині слова",
-				"Rows where name contains ann"
+				"Rows where name contains ann",
+				"Покажи товари, де бренд містить NVIDIA",
+				"Знайди позиції де модель містить RTX",
+				"Покажи записи, де опис містить GeForce",
+				"Виведи товари, де категорія містить миш",
+				"Пошук по Intel у назві товару"
 			],
 			"slots": {
 				"column": {
@@ -769,6 +774,115 @@
 					"args": {
 						"column": "{column}",
 						"value": "{value}"
+					},
+					"out": "result"
+				}
+			]
+		},
+		{
+			"id": "filtered_metric_aggregation",
+			"name": "Агрегація з фільтром підрядка",
+			"description": "Рахує max/min/mean/sum/median для числової колонки всередині відфільтрованої підмножини (contains).",
+			"examples": [
+				"Яка максимальна ціна серед мишей?",
+				"Покажи мінімальну ціну серед клавіатур",
+				"Середня ціна для ноутбуків",
+				"Сума quantity серед категорії відеокарт",
+				"Медіана ціни серед товарів з категорією монітор",
+				"Максимальна вартість серед бренду ASUS",
+				"Яка середня ціна серед товарів з RTX"
+			],
+			"slots": {
+				"filter_col": {
+					"type": "column",
+					"required": true
+				},
+				"filter_value": {
+					"type": "str",
+					"required": true
+				},
+				"target_col": {
+					"type": "column",
+					"required": true
+				},
+				"metric": {
+					"type": "enum",
+					"required": true,
+					"values": ["mean", "sum", "min", "max", "median"]
+				}
+			},
+			"plan": [
+				{
+					"op": "filter_contains_aggregation",
+					"args": {
+						"filter_col": "{filter_col}",
+						"filter_value": "{filter_value}",
+						"target_col": "{target_col}",
+						"metric": "{metric}"
+					},
+					"out": "result"
+				}
+			]
+		},
+		{
+			"id": "keyword_search_count",
+			"name": "Пошук за ключовим словом (count)",
+			"description": "Рахує кількість рядків, де ключове слово зустрічається в текстових колонках.",
+			"examples": [
+				"Скільки товарів NVIDIA",
+				"Порахуй позиції з RTX",
+				"Скільки записів містять GeForce",
+				"Кількість товарів з Intel",
+				"Порахуй рядки де є слово wireless",
+				"Скільки товарів із SSD",
+				"Скільки позицій з AMD"
+			],
+			"slots": {
+				"keyword": {
+					"type": "str",
+					"required": true
+				}
+			},
+			"plan": [
+				{
+					"op": "keyword_search_count",
+					"args": {
+						"keyword": "{keyword}"
+					},
+					"out": "result"
+				}
+			]
+		},
+		{
+			"id": "keyword_search_rows",
+			"name": "Пошук за ключовим словом (rows)",
+			"description": "Повертає рядки, де ключове слово зустрічається в текстових колонках.",
+			"examples": [
+				"Покажи товари з NVIDIA",
+				"Знайди позиції з GeForce",
+				"Виведи записи де є RTX",
+				"Покажи товари з Intel",
+				"Знайди рядки зі словом wireless",
+				"Покажи позиції з SSD",
+				"Виведи товари з AMD"
+			],
+			"slots": {
+				"keyword": {
+					"type": "str",
+					"required": true
+				},
+				"top_n": {
+					"type": "int",
+					"required": false,
+					"default": 20
+				}
+			},
+			"plan": [
+				{
+					"op": "keyword_search_rows",
+					"args": {
+						"keyword": "{keyword}",
+						"top_n": "{top_n}"
 					},
 					"out": "result"
 				}

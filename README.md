@@ -23,6 +23,10 @@
 │   └── user_params.env
 ├── docker-compose.yml
 ├── README.md
+├── docs/                          # Розширена документація
+│   ├── README.md                  # Головна документація (українською)
+│   ├── FUNCTIONS.md               # Детальна документація функцій
+│   └── DATA_FLOW.md               # Карта потоків даних
 ├── sandbox_service/
 │   ├── Dockerfile
 │   ├── main.py
@@ -135,6 +139,36 @@ docker compose up -d --force-recreate
 - Якщо не бачите файл у чаті — перевірте `WEBUI_BASE_URL` і `WEBUI_API_KEY`.
 
 ## Діагностика
+
+- `Attach a CSV/XLSX file and ask a question.` — файл не прикріпився до запиту.
+- `Failed to load the table in the sandbox.` — sandbox не зміг прочитати файл або перевищено ліміти.
+- `Pipeline error` — перевірте доступність `BASE_LLM_BASE_URL` та `SANDBOX_URL`.
+
+## Документація
+
+### Головна документація
+
+Детальна документація усіх компонентів, функцій та потоків даних доступна у папці `docs/`:
+
+- **[docs/README.md](docs/README.md)** — Повний посібник користувача (українською)
+  - Концептуальний огляд
+  - Архітектура системи
+  - Встановлення та налаштування
+  - Приклади запитів
+  - API документація
+
+- **[docs/FUNCTIONS.md](docs/FUNCTIONS.md)** — Детальна документація всіх функцій
+  - Опис призначення кожної функції
+  - Параметри та типи даних
+  - Приклади використання
+
+- **[docs/DATA_FLOW.md](docs/DATA_FLOW.md)** — Карта потоків даних
+  - Життєвий цикл запиту користувача
+  - Система кешування
+  - Система шорткатів
+  - Безпека та валідація
+
+### Діагностика
 
 - `Attach a CSV/XLSX file and ask a question.` — файл не прикріпився до запиту.
 - `Failed to load the table in the sandbox.` — sandbox не зміг прочитати файл або перевищено ліміти.

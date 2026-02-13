@@ -47,6 +47,22 @@ class ShortcutRouter:
         if not q:
             return None
 
+        complexity = self._assess_query_complexity(q, profile)
+        if complexity > 0.7:
+            logging.info(
+                "event=shortcut_router_call status=skipped reason=complex_query score=%.2f query_preview=%s",
+                complexity,
+                q[:300],
+            )
+            return None
+
+        if self._has_filter_context(q, profile):
+            logging.info(
+                "event=shortcut_router_call status=skipped reason=filter_context query_preview=%s",
+                q[:300],
+            )
+            return None
+
         try:
             hit = self._retrieve(q)
         except Exception as exc:
@@ -201,6 +217,38 @@ class ShortcutRouter:
     ) -> Optional[Dict[str, Any]]:
         slots: Dict[str, Any] = dict(preset_slots or {})
         spec = intent.get("slots") or {}
+        intent_id = str(intent.get("id") or "")
+
+        # Special handling for contains-style intents:
+        # resolve filter value first, then choose filter column from value/profile.
+        if intent_id in {"filter_contains", "filtered_metric_aggregation"}:
+            value_slot = "value" if intent_id == "filter_contains" else "filter_value"
+            filter_col_slot = "column" if intent_id == "filter_contains" else "filter_col"
+
+            value_cfg = spec.get(value_slot) or {}
+            if value_slot not in slots and value_cfg:
+                value = self._slot_from_text(value_slot, value_cfg, query, columns)
+                if value is None:
+                    value = self._extract_filter_value_from_query(query)
+                if value is None and "default" in value_cfg:
+                    value = value_cfg.get("default")
+                if value is None and value_cfg.get("required") and self._llm_json:
+                    value = self._slot_from_llm(intent, value_slot, value_cfg, query, columns, profile)
+                if value is not None:
+                    slots[value_slot] = value
+
+            if filter_col_slot not in slots:
+                filter_value = slots.get(value_slot)
+                filter_col = self._best_filter_column_for_value(
+                    query=query,
+                    value=filter_value,
+                    columns=columns,
+                    profile=profile,
+                    intent_id=intent_id,
+                )
+                if filter_col:
+                    slots[filter_col_slot] = filter_col
+
         for name, cfg in spec.items():
             if name in slots:
                 continue
@@ -212,9 +260,65 @@ class ShortcutRouter:
                 if self._llm_json:
                     val = self._slot_from_llm(intent, name, cfg, query, columns, profile)
             if val is None and cfg.get("required"):
+                # For stats_aggregation we can still recover a numeric column in post-processing.
+                if intent_id == "stats_aggregation" and name == "column":
+                    continue
+                if intent_id == "filtered_metric_aggregation" and name == "target_col":
+                    continue
                 return None
             if val is not None:
                 slots[name] = val
+        if intent_id == "stats_aggregation":
+            col = slots.get("column")
+            dtypes = (profile or {}).get("dtypes") or {}
+            if not isinstance(col, str) or col not in columns:
+                col = None
+            if col and not self._is_numeric_dtype(dtypes.get(col, "")):
+                # Retry with LLM for column slot, but enforce numeric column.
+                cfg = (intent.get("slots") or {}).get("column") or {}
+                llm_col = self._slot_from_llm(intent, "column", cfg, query, columns, profile) if self._llm_json else None
+                if isinstance(llm_col, str) and llm_col in columns and self._is_numeric_dtype(dtypes.get(llm_col, "")):
+                    col = llm_col
+                else:
+                    col = self._best_numeric_column_for_query(query, columns, profile)
+            if not col:
+                return None
+            slots["column"] = col
+        if intent_id == "filtered_metric_aggregation":
+            dtypes = (profile or {}).get("dtypes") or {}
+            filter_col = slots.get("filter_col")
+            filter_value = slots.get("filter_value")
+            if not isinstance(filter_col, str) or filter_col not in columns:
+                filter_col = None
+            if filter_col and self._is_numeric_dtype(dtypes.get(filter_col, "")):
+                filter_col = None
+            if not filter_col:
+                filter_col = self._best_filter_column_for_value(
+                    query=query,
+                    value=filter_value,
+                    columns=columns,
+                    profile=profile,
+                    intent_id=intent_id,
+                )
+            if not filter_col:
+                return None
+            slots["filter_col"] = filter_col
+
+            target_col = slots.get("target_col")
+            if not isinstance(target_col, str) or target_col not in columns:
+                target_col = None
+            if target_col and not self._is_numeric_dtype(dtypes.get(target_col, "")):
+                target_col = None
+            if not target_col:
+                cfg = (intent.get("slots") or {}).get("target_col") or {}
+                llm_col = self._slot_from_llm(intent, "target_col", cfg, query, columns, profile) if self._llm_json else None
+                if isinstance(llm_col, str) and llm_col in columns and self._is_numeric_dtype(dtypes.get(llm_col, "")):
+                    target_col = llm_col
+                else:
+                    target_col = self._best_numeric_column_for_query(query, columns, profile)
+            if not target_col:
+                return None
+            slots["target_col"] = target_col
         return slots
 
     def _resolve_intent_and_slots(
@@ -232,6 +336,12 @@ class ShortcutRouter:
             return intent, {}
 
         agg = str(llm_slots.get("agg") or "").strip().lower()
+        if self._is_group_total_quantity_query(query):
+            qty_col = self._best_numeric_column_for_query("кількість qty quantity units stock", columns, profile)
+            if qty_col:
+                agg = "sum"
+                llm_slots["agg"] = "sum"
+                llm_slots["target_col"] = qty_col
         resolved_intent = intent
         if agg and agg != "count" and "groupby_agg" in self._intents:
             resolved_intent = self._intents["groupby_agg"]
@@ -261,6 +371,26 @@ class ShortcutRouter:
             json.dumps(preset, ensure_ascii=False),
         )
         return resolved_intent, preset
+
+    def _is_group_total_quantity_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        if not q:
+            return False
+        has_group = bool(
+            re.search(
+                r"\b(group\s*by|per\s+\w+|by\s+\w+|по\s+\w+|за\s+\w+)\b"
+                r"|(?:по|за)\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)",
+                q,
+                re.I,
+            )
+        )
+        if not has_group:
+            return False
+        has_qty = bool(re.search(r"\b(кільк\w*|штук|одиниц\w*|qty|quantity|units?)\b", q, re.I))
+        if not has_qty:
+            return False
+        has_totalish = bool(re.search(r"\b(загальн\w*|total|sum|сума|на\s+склад\w*|наявн\w*|залишк\w*)\b", q, re.I))
+        return has_totalish
 
     def _llm_groupby_slots(self, query: str, columns: List[str], profile: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self._llm_json or not columns:
@@ -312,6 +442,122 @@ class ShortcutRouter:
         if m and re.search(r"(?:top|топ)", q, re.I):
             return int(m.group(1))
         return 0
+
+    def _question_has_metric_cue(self, question: str) -> bool:
+        q_low = (question or "").lower()
+        return bool(
+            re.search(
+                r"\b("
+                r"max(?:imum)?|мін(?:імум|імаль\w*)?|minimum|min|"
+                r"mean|average|avg|median|sum|total|count|"
+                r"макс\w*|середн\w*|сума|підсум\w*|"
+                r"кільк\w*|скільк\w*"
+                r")\b",
+                q_low,
+                re.I,
+            )
+        )
+
+    def _question_has_filter_cue(self, question: str) -> bool:
+        q_low = (question or "").lower()
+        return bool(
+            re.search(
+                r"\b(серед|among|within|where|де|тільки|only|лише|having)\b"
+                r"|(?:що|які)\s+мають"
+                r"|(?:with|for)\s+[a-zа-яіїєґ0-9_]{2,}",
+                q_low,
+                re.I,
+            )
+        )
+
+    def _question_mentions_preview_value(self, question: str, profile: Dict[str, Any]) -> bool:
+        q_low = (question or "").lower()
+        if not q_low:
+            return False
+        q_tokens = [
+            tok for tok in re.split(r"[^a-zа-яіїєґ0-9]+", q_low) if len(tok) >= 3
+        ]
+        if not q_tokens:
+            return False
+        q_roots = {tok[:5] for tok in q_tokens}
+        stop_roots = {
+            "скіл",
+            "кіль",
+            "макс",
+            "мін",
+            "сере",
+            "сума",
+            "poun",
+            "coun",
+            "tabl",
+            "рядк",
+            "коло",
+            "това",
+            "дани",
+        }
+        preview = (profile or {}).get("preview") or []
+        for row in preview[:60]:
+            if not isinstance(row, dict):
+                continue
+            for val in row.values():
+                if val is None:
+                    continue
+                sval = str(val).strip().lower()
+                if len(sval) < 3 or len(sval) > 60:
+                    continue
+                if re.fullmatch(r"[\d\s.,:%\-]+", sval):
+                    continue
+                parts = re.split(r"[^a-zа-яіїєґ0-9]+", sval)
+                for part in parts:
+                    if len(part) < 3:
+                        continue
+                    root = part[:5]
+                    if root in stop_roots:
+                        continue
+                    if root in q_roots:
+                        return True
+        return False
+
+    def _has_filter_context(self, question: str, profile: Dict[str, Any]) -> bool:
+        """
+        Detects metric questions asked within a filtered subset:
+        e.g. "max price among mice", "avg amount for red items".
+        """
+        if not self._question_has_metric_cue(question):
+            return False
+        if self._question_has_filter_cue(question):
+            return True
+        return self._question_mentions_preview_value(question, profile)
+
+    def _assess_query_complexity(self, question: str, profile: Dict[str, Any]) -> float:
+        q_low = (question or "").lower()
+        score = 0.0
+
+        if self._question_has_filter_cue(question):
+            score += 0.3
+        if self._question_mentions_preview_value(question, profile):
+            score += 0.2
+        if re.search(r"\b(та|і|and|or|або)\b", q_low, re.I):
+            score += 0.2
+
+        columns = [str(c).lower() for c in ((profile or {}).get("columns") or [])]
+        mentioned_cols = 0
+        for col in columns:
+            col = col.strip()
+            if len(col) < 3:
+                continue
+            if col in q_low:
+                mentioned_cols += 1
+        if mentioned_cols >= 2:
+            score += 0.2
+
+        has_grouping = bool(re.search(r"\b(топ|top|кожн\w*|по\s+\w+|group\w*)\b", q_low, re.I))
+        has_metric = self._question_has_metric_cue(question)
+        has_filter = self._question_has_filter_cue(question) or self._question_mentions_preview_value(question, profile)
+        if has_grouping and has_metric and has_filter:
+            score += 0.3
+
+        return min(1.0, score)
 
     def _slot_from_llm(
         self,
@@ -390,15 +636,15 @@ class ShortcutRouter:
         for key, val in enums.items():
             if key in q_low:
                 return val
-        if "mean" in enums and re.search(r"\b(average|avg|середн|mean)\b", q_low):
+        if "mean" in enums and re.search(r"\b(average|avg|mean|середн\w*)\b", q_low):
             return enums["mean"]
         if "sum" in enums and re.search(r"\b(sum|сума|total)\b", q_low):
             return enums["sum"]
-        if "min" in enums and re.search(r"\b(min|мін)\b", q_low):
+        if "min" in enums and re.search(r"\b(min(?:imum)?|мін\w*)\b", q_low):
             return enums["min"]
-        if "max" in enums and re.search(r"\b(max|макс)\b", q_low):
+        if "max" in enums and re.search(r"\b(max(?:imum)?|макс\w*)\b", q_low):
             return enums["max"]
-        if "median" in enums and re.search(r"\b(median|медіан)\b", q_low):
+        if "median" in enums and re.search(r"\b(median|медіан\w*)\b", q_low):
             return enums["median"]
         if "asc" in enums and re.search(r"\b(asc|зрост|ascending)\b", q_low):
             return enums["asc"]
@@ -409,6 +655,291 @@ class ShortcutRouter:
         if "tail" in enums and re.search(r"\b(tail|останні|кінец)\b", q_low):
             return enums["tail"]
         return None
+
+    def _is_numeric_dtype(self, dtype: Any) -> bool:
+        return str(dtype or "").lower().startswith(("int", "float", "uint"))
+
+    def _text_columns(self, columns: List[str], profile: Dict[str, Any]) -> List[str]:
+        dtypes = (profile or {}).get("dtypes") or {}
+        text_cols = [c for c in columns if not self._is_numeric_dtype(dtypes.get(c, ""))]
+        return text_cols or list(columns)
+
+    def _extract_filter_value_from_query(self, query: str) -> Optional[str]:
+        q = (query or "").strip()
+        if not q:
+            return None
+        m = re.search(r"['\"]([^'\"]+)['\"]", q)
+        if m:
+            val = (m.group(1) or "").strip()
+            return val or None
+
+        patterns = [
+            r"(?:містить|contains)\s+(.+)$",
+            r"(?:дорівнює|equals?|=)\s+(.+)$",
+        ]
+        for pat in patterns:
+            m = re.search(pat, q, re.I)
+            if not m:
+                continue
+            val = (m.group(1) or "").strip()
+            if not val:
+                continue
+            val = re.split(r"\s+(?:зі|з|де|where|та|і|and|with|у|в)\b", val, maxsplit=1, flags=re.I)[0]
+            val = val.strip().strip("\"'.,;:?!()[]{}")
+            if val:
+                return val
+
+        # Universal fallback: take the last semantically meaningful token.
+        tokens_raw = [t for t in re.split(r"[^A-Za-zА-Яа-яІіЇїЄєҐґ0-9]+", q) if t]
+        if not tokens_raw:
+            return None
+        stop_roots = {
+            "скіл",
+            "кіль",
+            "count",
+            "coun",
+            "sum",
+            "сума",
+            "mean",
+            "aver",
+            "avg",
+            "medi",
+            "меді",
+            "max",
+            "макс",
+            "min",
+            "мін",
+            "ціна",
+            "цін",
+            "варт",
+            "price",
+            "cost",
+            "total",
+            "това",
+            "item",
+            "prod",
+            "стат",
+            "stat",
+            "наяв",
+            "avail",
+            "stock",
+            "скла",
+            "where",
+            "де",
+            "with",
+            "for",
+            "and",
+            "та",
+            "і",
+        }
+        for tok_raw in reversed(tokens_raw):
+            tok = tok_raw.lower()
+            if len(tok) < 3:
+                continue
+            if re.fullmatch(r"\d+", tok):
+                continue
+            if tok[:4] in stop_roots:
+                continue
+            return tok_raw
+        return None
+
+    def _best_filter_column_from_preview(
+        self,
+        value: Any,
+        columns: List[str],
+        profile: Dict[str, Any],
+    ) -> Optional[str]:
+        preview = (profile or {}).get("preview") or []
+        if not isinstance(preview, list) or not preview:
+            return None
+        val = self._normalize_text(str(value or ""))
+        if not val:
+            return None
+        val_tokens = [t for t in val.split() if len(t) >= 2]
+        if not val_tokens:
+            return None
+
+        best_col: Optional[str] = None
+        best_score = 0.0
+        for col in columns:
+            hits_exact = 0
+            hits_fuzzy = 0
+            non_empty = 0
+            for row in preview[:200]:
+                if not isinstance(row, dict):
+                    continue
+                cell = row.get(col)
+                if cell is None:
+                    continue
+                cell_norm = self._normalize_text(str(cell))
+                if not cell_norm:
+                    continue
+                non_empty += 1
+                if val in cell_norm:
+                    hits_exact += 1
+                    continue
+                for tok in val_tokens:
+                    root_len = 3 if re.search(r"[а-яіїєґ]", tok, re.I) else 4
+                    root = tok[: max(2, min(root_len, len(tok)))]
+                    if root and root in cell_norm:
+                        hits_fuzzy += 1
+                        break
+
+            if non_empty == 0:
+                continue
+            support = hits_exact + hits_fuzzy
+            if support <= 0:
+                continue
+            density = ((3.0 * hits_exact) + hits_fuzzy) / float(non_empty)
+            confidence = min(1.0, support / 3.0)
+            score = density + confidence
+            if score > best_score:
+                best_score = score
+                best_col = col
+        if best_score <= 0:
+            return None
+        return best_col
+
+    def _llm_pick_filter_column_for_value(
+        self,
+        query: str,
+        value: Any,
+        columns: List[str],
+        profile: Dict[str, Any],
+        intent_id: str,
+    ) -> Optional[str]:
+        if not self._llm_json or not columns:
+            return None
+        value_text = str(value or "").strip()
+        if not value_text:
+            return None
+        system = (
+            "Pick the single best column to apply a text contains filter. "
+            "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\"}. "
+            "Use query meaning, dtypes and preview values. "
+            "Choose the column where filter_value most likely appears in cell values."
+        )
+        payload = {
+            "intent_id": intent_id,
+            "query": query,
+            "filter_value": value_text,
+            "columns": columns[:200],
+            "dtypes": (profile or {}).get("dtypes") or {},
+            "preview": (profile or {}).get("preview") or [],
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            return None
+        col = str((parsed or {}).get("column") or "").strip()
+        if col in columns:
+            return col
+        return None
+
+    def _best_filter_column_for_value(
+        self,
+        query: str,
+        value: Any,
+        columns: List[str],
+        profile: Dict[str, Any],
+        intent_id: str = "filter_contains",
+    ) -> Optional[str]:
+        if not columns:
+            return None
+        text_cols = self._text_columns(columns, profile)
+        value_text = str(value or "").strip()
+
+        if value_text:
+            try:
+                m = re.search(re.escape(value_text), query or "", re.I)
+            except Exception:
+                m = None
+            if m:
+                left_ctx = (query or "")[max(0, m.start() - 80) : m.start()]
+                ctx_col = self._best_column_match(left_ctx, text_cols)
+                if ctx_col:
+                    logging.info(
+                        "event=shortcut_router_filter_column_resolve source=value_context intent_id=%s column=%s value=%s",
+                        intent_id,
+                        ctx_col,
+                        value_text[:80],
+                    )
+                    return ctx_col
+
+            preview_col = self._best_filter_column_from_preview(value_text, text_cols, profile)
+            if preview_col:
+                logging.info(
+                    "event=shortcut_router_filter_column_resolve source=preview intent_id=%s column=%s value=%s",
+                    intent_id,
+                    preview_col,
+                    value_text[:80],
+                )
+                return preview_col
+
+            llm_col = self._llm_pick_filter_column_for_value(
+                query=query,
+                value=value_text,
+                columns=text_cols,
+                profile=profile,
+                intent_id=intent_id,
+            )
+            if llm_col:
+                logging.info(
+                    "event=shortcut_router_filter_column_resolve source=llm intent_id=%s column=%s value=%s",
+                    intent_id,
+                    llm_col,
+                    value_text[:80],
+                )
+                return llm_col
+
+        # Value-first fallback (less sensitive to metric words in full query).
+        if value_text:
+            col = self._best_column_match(value_text, text_cols)
+            if col:
+                logging.info(
+                    "event=shortcut_router_filter_column_resolve source=value_text intent_id=%s column=%s",
+                    intent_id,
+                    col,
+                )
+                return col
+
+        col = self._best_column_match(query, text_cols)
+        if col:
+            logging.info(
+                "event=shortcut_router_filter_column_resolve source=query_text intent_id=%s column=%s",
+                intent_id,
+                col,
+            )
+            return col
+        return None
+
+    def _best_numeric_column_for_query(self, query: str, columns: List[str], profile: Dict[str, Any]) -> Optional[str]:
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [c for c in columns if self._is_numeric_dtype(dtypes.get(c, ""))]
+        if not numeric_cols:
+            return None
+        q_low = (query or "").lower()
+        price_pref = [
+            c for c in numeric_cols
+            if re.search(r"(цін|price|варт|cost|amount|total|revenue|вируч)", str(c).lower())
+        ]
+        qty_pref = [
+            c for c in numeric_cols
+            if re.search(r"(кільк|qty|quantity|units|stock|залишк)", str(c).lower())
+        ]
+        if re.search(r"\b(середн|average|avg|mean|min|max|median|сума|sum|варт|price|cost|вируч)\b", q_low):
+            if price_pref:
+                return price_pref[0]
+        if re.search(r"\b(кільк|qty|quantity|units|stock|залишк)\b", q_low):
+            if qty_pref:
+                return qty_pref[0]
+        non_id = [
+            c for c in numeric_cols
+            if not re.search(r"(?:^|_)(id|sku|код|артикул)(?:$|_)", str(c).lower())
+        ]
+        if non_id:
+            return non_id[0]
+        return numeric_cols[0]
 
     def _normalize_text(self, text: str) -> str:
         t = re.sub(r"[\W_]+", " ", text.lower())
@@ -491,7 +1022,33 @@ class ShortcutRouter:
                 metric = slots.get("metric") or "sum"
                 if not col:
                     return None
-                code_lines.append(f"result = getattr(df[{col!r}], {metric!r})()")
+                code_lines.append(f"_col_name = {col!r}")
+                code_lines.append(f"_metric = {metric!r}")
+                code_lines.append("if _col_name not in df.columns:")
+                code_lines.append("    result = None")
+                code_lines.append("else:")
+                code_lines.append("    _col = df[_col_name]")
+                code_lines.append("    _dtype = str(_col.dtype).lower()")
+                code_lines.append("    if _dtype.startswith(('int', 'float', 'uint')):")
+                code_lines.append("        _num = _col.astype(float)")
+                code_lines.append("    else:")
+                code_lines.append("        _raw = _col.astype(str)")
+                code_lines.append(
+                    r"        _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
+                code_lines.append(r"        _mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+                code_lines.append("        _num = _clean.where(_mask, np.nan).astype(float)")
+                code_lines.append("    if _metric == 'mean':")
+                code_lines.append("        _v = _num.mean()")
+                code_lines.append("    elif _metric == 'min':")
+                code_lines.append("        _v = _num.min()")
+                code_lines.append("    elif _metric == 'max':")
+                code_lines.append("        _v = _num.max()")
+                code_lines.append("    elif _metric == 'median':")
+                code_lines.append("        _v = _num.median()")
+                code_lines.append("    else:")
+                code_lines.append("        _v = _num.sum()")
+                code_lines.append("    result = None if pd.isna(_v) else float(_v)")
             elif op == "groupby_count":
                 group_col = slots.get("group_col")
                 out_col = slots.get("out_col") or "count"
@@ -552,6 +1109,69 @@ class ShortcutRouter:
                 code_lines.append(
                     f"result = df[df[{col!r}].astype(str).str.contains({val!r}, case=False, na=False)]"
                 )
+            elif op == "filter_contains_aggregation":
+                filter_col = slots.get("filter_col")
+                filter_value = slots.get("filter_value")
+                target_col = slots.get("target_col")
+                metric = slots.get("metric") or "max"
+                if not filter_col or not target_col:
+                    return None
+                code_lines.append(f"_filter_col = {filter_col!r}")
+                code_lines.append(f"_filter_value = {filter_value!r}")
+                code_lines.append(f"_target_col = {target_col!r}")
+                code_lines.append(f"_metric = {metric!r}")
+                code_lines.append("if _filter_col not in df.columns or _target_col not in df.columns:")
+                code_lines.append("    result = None")
+                code_lines.append("else:")
+                code_lines.append("    _work = df[df[_filter_col].astype(str).str.contains(str(_filter_value), case=False, na=False)].copy()")
+                code_lines.append("    _raw = _work[_target_col].astype(str)")
+                code_lines.append(
+                    r"    _clean = _raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+                )
+                code_lines.append(r"    _mask = _clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+                code_lines.append("    _num = _clean.where(_mask, np.nan).astype(float)")
+                code_lines.append("    if _metric == 'mean':")
+                code_lines.append("        _v = _num.mean()")
+                code_lines.append("    elif _metric == 'min':")
+                code_lines.append("        _v = _num.min()")
+                code_lines.append("    elif _metric == 'max':")
+                code_lines.append("        _v = _num.max()")
+                code_lines.append("    elif _metric == 'median':")
+                code_lines.append("        _v = _num.median()")
+                code_lines.append("    else:")
+                code_lines.append("        _v = _num.sum()")
+                code_lines.append("    result = None if pd.isna(_v) else float(_v)")
+            elif op == "keyword_search_count":
+                keyword = slots.get("keyword")
+                if keyword is None:
+                    return None
+                code_lines.append(f"_kw = str({keyword!r}).strip()")
+                code_lines.append("if not _kw:")
+                code_lines.append("    result = 0")
+                code_lines.append("else:")
+                code_lines.append("    _text_cols = [c for c in df.columns if not str(df[c].dtype).lower().startswith(('int', 'float', 'uint'))]")
+                code_lines.append("    if _text_cols:")
+                code_lines.append("        _text = df[_text_cols].fillna('').astype(str).apply(' '.join, axis=1)")
+                code_lines.append("    else:")
+                code_lines.append("        _text = df.fillna('').astype(str).apply(' '.join, axis=1)")
+                code_lines.append("    result = int(_text.str.contains(_kw, case=False, na=False).sum())")
+            elif op == "keyword_search_rows":
+                keyword = slots.get("keyword")
+                top_n = int(slots.get("top_n") or 20)
+                if keyword is None:
+                    return None
+                code_lines.append(f"_kw = str({keyword!r}).strip()")
+                code_lines.append(f"_top_n = {top_n}")
+                code_lines.append("if not _kw:")
+                code_lines.append("    result = []")
+                code_lines.append("else:")
+                code_lines.append("    _text_cols = [c for c in df.columns if not str(df[c].dtype).lower().startswith(('int', 'float', 'uint'))]")
+                code_lines.append("    if _text_cols:")
+                code_lines.append("        _text = df[_text_cols].fillna('').astype(str).apply(' '.join, axis=1)")
+                code_lines.append("    else:")
+                code_lines.append("        _text = df.fillna('').astype(str).apply(' '.join, axis=1)")
+                code_lines.append("    _mask = _text.str.contains(_kw, case=False, na=False)")
+                code_lines.append("    result = df.loc[_mask].head(_top_n)")
             elif op == "filter_range_numeric":
                 col = slots.get("column")
                 min_v = slots.get("min")

@@ -51,6 +51,7 @@ services:
       PIPELINES_MODEL: "spreadsheet_analyst_pipeline"
       WEBUI_BASE_URL: "http://openwebui:8080"
       BASE_LLM_BASE_URL: "http://gpu-test.silly.billy:8098/v1"
+      BASE_LLM_API_KEY: "qwenkey"
       BASE_LLM_MODEL: "qwen3-coder-next"
       SANDBOX_URL: "http://sandbox:8081"
       PIPELINES_REQUIREMENTS_PATH: "/app/requirements.txt"
