@@ -335,7 +335,31 @@ class ShortcutRouter:
         if not llm_slots:
             return intent, {}
 
+        if self._is_group_revenue_product_query(query):
+            resolved_intent = self._intents.get("groupby_agg") or intent
+            preset = self._build_group_revenue_slots(query, columns, profile, llm_slots)
+            if preset:
+                logging.info(
+                    "event=shortcut_router_groupby_redirect reason=revenue_product slots=%s",
+                    json.dumps(preset, ensure_ascii=False),
+                )
+                return resolved_intent, preset
+
         agg = str(llm_slots.get("agg") or "").strip().lower()
+        if self._is_per_item_normalization_query(query) and not self._has_explicit_grouping_cue(query):
+            stats_intent = self._intents.get("stats_aggregation")
+            target_col = llm_slots.get("target_col")
+            if not (isinstance(target_col, str) and target_col in columns):
+                target_col = self._best_numeric_column_for_query(query, columns, profile)
+            metric = agg if agg in {"sum", "mean", "min", "max", "median"} else "mean"
+            if isinstance(stats_intent, dict) and target_col:
+                preset = {"column": target_col, "metric": metric}
+                logging.info(
+                    "event=shortcut_router_groupby_redirect reason=per_item_normalization metric=%s column=%s",
+                    metric,
+                    target_col,
+                )
+                return stats_intent, preset
         if self._is_group_total_quantity_query(query):
             qty_col = self._best_numeric_column_for_query("кількість qty quantity units stock", columns, profile)
             if qty_col:
@@ -371,6 +395,142 @@ class ShortcutRouter:
             json.dumps(preset, ensure_ascii=False),
         )
         return resolved_intent, preset
+
+    def _is_group_revenue_product_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        if not q:
+            return False
+        has_group = bool(
+            re.search(
+                r"\b(group\s*by|by\s+\w+|по\s+\w+|за\s+\w+)\b"
+                r"|(?:по|за)\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)",
+                q,
+                re.I,
+            )
+        )
+        if not has_group:
+            return False
+        has_revenue_like = bool(
+            re.search(r"\b(вируч\w*|revenue|дохід\w*|оборот\w*|sales|gmv|варт\w*)\b", q, re.I)
+        )
+        has_mul = bool(("×" in q) or ("*" in q) or re.search(r"\b(x|mul|помнож|добут)\w*\b", q, re.I))
+        has_price = bool(re.search(r"\b(ціна|price|cost|amount)\w*\b", q, re.I))
+        has_qty = bool(re.search(r"\b(кільк\w*|qty|quantity|units?|штук|одиниц\w*)\b", q, re.I))
+        return has_group and (has_revenue_like or (has_mul and has_price and has_qty))
+
+    def _pick_price_like_column(self, columns: List[str], profile: Dict[str, Any]) -> Optional[str]:
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [c for c in columns if self._is_numeric_dtype(dtypes.get(c, ""))]
+        for c in numeric_cols:
+            if re.search(r"(цін|price|варт|cost|amount|revenue|вируч)", str(c).lower()):
+                return c
+        return None
+
+    def _pick_qty_like_column(self, columns: List[str], profile: Dict[str, Any]) -> Optional[str]:
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [c for c in columns if self._is_numeric_dtype(dtypes.get(c, ""))]
+        for c in numeric_cols:
+            if re.search(r"(кільк|qty|quantity|units|stock|залишк|штук)", str(c).lower()):
+                return c
+        return None
+
+    def _pick_group_like_column(self, query: str, columns: List[str], profile: Dict[str, Any]) -> Optional[str]:
+        # Prefer explicit semantic dimensions commonly used for grouped reports.
+        priority = ("Категорія", "Бренд", "Модель", "Статус")
+        for p in priority:
+            if p in columns and re.search(re.escape(p.lower()[:5]), (query or "").lower()):
+                return p
+        for p in priority:
+            if p in columns:
+                return p
+        return self._best_column_match(query, self._text_columns(columns, profile))
+
+    def _build_group_revenue_slots(
+        self,
+        query: str,
+        columns: List[str],
+        profile: Dict[str, Any],
+        llm_slots: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        group_col = llm_slots.get("group_col") if isinstance(llm_slots.get("group_col"), str) else None
+        if not group_col or group_col not in columns:
+            group_col = self._pick_group_like_column(query, columns, profile)
+        price_col = self._pick_price_like_column(columns, profile)
+        qty_col = self._pick_qty_like_column(columns, profile)
+        if not group_col or not price_col or not qty_col:
+            return {}
+        return {
+            "group_col": group_col,
+            "target_col": price_col,  # keep compatibility with groupby_agg intent contract
+            "agg": "sum",
+            "mul_left_col": price_col,
+            "mul_right_col": qty_col,
+            "out_col": "Виручка_UAH",
+        }
+
+    def _has_explicit_grouping_cue(self, query: str) -> bool:
+        q = (query or "").lower()
+        if self._is_per_item_normalization_query(q):
+            # "per item / на один товар" is normalization, not group-by.
+            return False
+        return bool(
+            re.search(
+                r"\b(group\s*by|by\s+\w+)\b"
+                r"|\bper\s+(?:category|categories|brand|brands|model|models|type|types|status|month|year|day)\b"
+                r"|(?:по|за)\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)",
+                q,
+                re.I,
+            )
+        )
+
+    def _is_per_item_normalization_query(self, query: str) -> bool:
+        q = (query or "").lower()
+        if not q:
+            return False
+
+        has_metric = bool(
+            re.search(
+                r"\b(mean|average|avg|середн\w*|sum|сума|total|загальн\w*|count|кільк\w*|скільк\w*)\b",
+                q,
+                re.I,
+            )
+        )
+        if not has_metric:
+            return False
+
+        blocked_unit_roots = {
+            "category",
+            "categories",
+            "brand",
+            "brands",
+            "model",
+            "models",
+            "type",
+            "types",
+            "status",
+            "category",
+            "категор",
+            "бренд",
+            "модел",
+            "тип",
+            "груп",
+        }
+
+        patterns = [
+            r"\bper\s+(?:one|single|each)?\s*([a-z][a-z0-9_-]{2,})\b",
+            r"\bна\s+(?:один|одну|одне|1|кож(?:ен|ну|не|ний|на|ну)|по\s+одн\w*)\s+([a-zа-яіїєґ0-9_-]{3,})\b",
+            r"\bв\s+середньому\s+на\s+([a-zа-яіїєґ0-9_-]{3,})\b",
+        ]
+        for pat in patterns:
+            for m in re.finditer(pat, q, re.I):
+                unit = str(m.group(1) or "").strip().lower()
+                if not unit:
+                    continue
+                root = unit[:8]
+                if any(root.startswith(b[:8]) for b in blocked_unit_roots):
+                    continue
+                return True
+        return False
 
     def _is_group_total_quantity_query(self, query: str) -> bool:
         q = (query or "").lower()
@@ -1070,13 +1230,36 @@ class ShortcutRouter:
                 agg = slots.get("agg") or "sum"
                 top_n = int(slots.get("top_n") or 0)
                 out_col = slots.get("out_col")
+                mul_left_col = slots.get("mul_left_col")
+                mul_right_col = slots.get("mul_right_col")
                 if not out_col:
                     out_col = str(target_col) if target_col else "value"
                 if not group_col or not target_col:
                     return None
-                code_lines.append(
-                    f"result = df.groupby({group_col!r})[{target_col!r}].agg({agg!r}).reset_index(name={out_col!r})"
-                )
+                if (
+                    isinstance(mul_left_col, str)
+                    and isinstance(mul_right_col, str)
+                    and agg == "sum"
+                ):
+                    code_lines.append(f"_group_col = {group_col!r}")
+                    code_lines.append(f"_left_col = {mul_left_col!r}")
+                    code_lines.append(f"_right_col = {mul_right_col!r}")
+                    code_lines.append("_ok = (_group_col in df.columns) and (_left_col in df.columns) and (_right_col in df.columns)")
+                    code_lines.append("if not _ok:")
+                    code_lines.append("    result = []")
+                    code_lines.append("else:")
+                    code_lines.append("    _left = pd.to_numeric(df[_left_col], errors='coerce')")
+                    code_lines.append("    _right = pd.to_numeric(df[_right_col], errors='coerce')")
+                    code_lines.append("    _work = df.copy(deep=False)")
+                    code_lines.append("    _work['_metric'] = _left * _right")
+                    code_lines.append("    _work = _work.loc[_work['_metric'].notna()].copy()")
+                    code_lines.append(
+                        f"    result = _work.groupby(_group_col)['_metric'].sum().reset_index(name={out_col!r})"
+                    )
+                else:
+                    code_lines.append(
+                        f"result = df.groupby({group_col!r})[{target_col!r}].agg({agg!r}).reset_index(name={out_col!r})"
+                    )
                 code_lines.append(f"result = result.sort_values({out_col!r}, ascending=False)")
                 if top_n > 0:
                     code_lines.append(f"result = result.head({top_n})")

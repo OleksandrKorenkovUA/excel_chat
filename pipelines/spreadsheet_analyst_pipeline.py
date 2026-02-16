@@ -23,6 +23,15 @@ from pydantic import BaseModel, Field
 
 
 PIPELINES_DIR = os.path.dirname(__file__)
+PROJECT_ROOT_DIR = os.path.abspath(os.path.join(PIPELINES_DIR, os.pardir))
+DEFAULT_SPREADSHEET_SKILL_DIR = os.path.join(PROJECT_ROOT_DIR, "skills", "spreadsheet-guardrails")
+_SPREADSHEET_SKILL_PROMPT_MARKER = "RUNTIME SKILL HOOK: spreadsheet-guardrails"
+_SPREADSHEET_SKILL_FILES = (
+    "SKILL.md",
+    os.path.join("references", "column-matching.md"),
+    os.path.join("references", "table-mutation-playbooks.md"),
+    os.path.join("references", "forbidden-code-patterns.md"),
+)
 
 DEF_TIMEOUT_S = int(os.getenv("PIPELINE_HTTP_TIMEOUT_S", "120"))
 _LOCAL_PROMPTS = os.path.join(os.path.dirname(__file__), "prompts.txt")
@@ -1209,6 +1218,85 @@ def _is_non_mutating_df_copy_call(call: ast.Call) -> bool:
         return False
     return True
 
+
+def _is_df_filter_like_value(node: ast.AST) -> bool:
+    """Return True for read-safe df rebinding patterns like df = df[mask]."""
+    cur = node
+    # Allow trailing .copy() calls, e.g. df = df[mask].copy()
+    while isinstance(cur, ast.Call) and isinstance(cur.func, ast.Attribute) and cur.func.attr == "copy":
+        cur = cur.func.value
+    if isinstance(cur, ast.Subscript):
+        root = cur.value
+        if isinstance(root, ast.Name) and root.id == "df":
+            return True
+        if (
+            isinstance(root, ast.Attribute)
+            and isinstance(root.value, ast.Name)
+            and root.value.id == "df"
+            and root.attr in {"loc", "iloc"}
+        ):
+            return True
+    return False
+
+
+def _rewrite_read_df_rebinding(code: str) -> Tuple[str, bool]:
+    """
+    Rewrite read-only df rebinding into a temp variable to avoid false mutation blocks.
+    Example:
+      df = df[df['Категорія'] == 'X']
+      result = df['Ціна'].mean()
+    ->
+      _df_read = df.copy(deep=False)
+      _df_read = _df_read[_df_read['Категорія'] == 'X']
+      result = _df_read['Ціна'].mean()
+    """
+    text = code or ""
+    if not text.strip():
+        return text, False
+    try:
+        tree = ast.parse(text)
+    except Exception:
+        return text, False
+
+    has_df_rebind = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AugAssign) and _is_df_write_target(node.target):
+            return text, False
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, (ast.Subscript, ast.Attribute)) and _is_df_write_target(t):
+                    return text, False
+                if isinstance(t, ast.Name) and t.id == "df":
+                    has_df_rebind = True
+                    value = node.value
+                    if isinstance(value, ast.Call) and _is_non_mutating_df_copy_call(value):
+                        continue
+                    if _is_df_filter_like_value(value):
+                        continue
+                    return text, False
+        if isinstance(node, ast.Call) and _call_has_inplace_true(node):
+            return text, False
+
+    if not has_df_rebind:
+        return text, False
+
+    class _RenameDfToReadVar(ast.NodeTransformer):
+        def visit_Name(self, n: ast.Name) -> ast.AST:
+            if n.id == "df":
+                return ast.copy_location(ast.Name(id="_df_read", ctx=n.ctx), n)
+            return n
+
+    try:
+        rewritten_tree = _RenameDfToReadVar().visit(tree)
+        ast.fix_missing_locations(rewritten_tree)
+        rewritten = ast.unparse(rewritten_tree).strip()
+    except Exception:
+        return text, False
+
+    out = "_df_read = df.copy(deep=False)\n" + rewritten + "\n"
+    return out, True
+
 def _auto_detect_commit(code: str) -> bool:
     if not (code or "").strip():
         return False
@@ -1344,6 +1432,54 @@ _GROUPING_CUE_RE = re.compile(
 )
 
 
+def _is_per_item_normalization_query(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+
+    has_metric = bool(
+        re.search(
+            r"\b(mean|average|avg|середн\w*|sum|сума|total|загальн\w*|count|кільк\w*|скільк\w*)\b",
+            q,
+            re.I,
+        )
+    )
+    if not has_metric:
+        return False
+
+    blocked_unit_roots = {
+        "category",
+        "categories",
+        "brand",
+        "brands",
+        "model",
+        "models",
+        "type",
+        "types",
+        "status",
+        "категор",
+        "бренд",
+        "модел",
+        "тип",
+        "груп",
+    }
+    patterns = [
+        r"\bper\s+(?:one|single|each)?\s*([a-z][a-z0-9_-]{2,})\b",
+        r"\bна\s+(?:один|одну|одне|1|кож(?:ен|ну|не|ний|на|ну)|по\s+одн\w*)\s+([a-zа-яіїєґ0-9_-]{3,})\b",
+        r"\bв\s+середньому\s+на\s+([a-zа-яіїєґ0-9_-]{3,})\b",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, q, re.I):
+            unit = str(m.group(1) or "").strip().lower()
+            if not unit:
+                continue
+            root = unit[:8]
+            if any(root.startswith(b[:8]) for b in blocked_unit_roots):
+                continue
+            return True
+    return False
+
+
 def _router_intent_looks_mutating(intent_id: str) -> bool:
     s = (intent_id or "").strip().lower()
     if not s:
@@ -1354,6 +1490,9 @@ def _router_intent_looks_mutating(intent_id: str) -> bool:
 def _question_has_filter_context_for_router_guard(question: str) -> bool:
     q = (question or "").strip()
     if not q:
+        return False
+    if _is_per_item_normalization_query(q):
+        # "на один товар/позицію" is a normalization cue, not subset filtering.
         return False
     has_metric = bool(_ROUTER_METRIC_CUE_RE.search(q))
     has_filter_words = bool(_ROUTER_FILTER_CONTEXT_RE.search(q))
@@ -1416,6 +1555,8 @@ def _router_code_has_filter_ops(analysis_code: str) -> bool:
 def _question_requires_subset_filter(question: str, profile: Optional[dict] = None) -> bool:
     q = (question or "").strip()
     if not q:
+        return False
+    if _is_per_item_normalization_query(q):
         return False
     has_grouping_cue = bool(_GROUPING_CUE_RE.search(q))
     if has_grouping_cue:
@@ -1535,6 +1676,51 @@ def _detect_metrics(question: str) -> List[str]:
     # stable order
     order = ["mean", "min", "max", "median", "sum", "count"]
     return [m for m in order if m in found]
+
+
+def _has_grouping_cues(question: str) -> bool:
+    q = (question or "").lower()
+    if _is_per_item_normalization_query(q):
+        return False
+    return bool(
+        re.search(
+            r"\b(груп\w*|розбив\w*|розподіл\w*|кожн\w*|each|group\w*|by)\b",
+            q,
+            re.I,
+        )
+        or re.search(
+            r"\bper\s+(?:category|categories|brand|brands|model|models|type|types|status|month|year|day)\b",
+            q,
+            re.I,
+        )
+        or re.search(r"\b(по|за)\s+\w+", q, re.I)
+    )
+
+
+def _is_aggregate_query_intent(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    if _has_grouping_cues(question):
+        return False
+
+    metrics = _detect_metrics(question)
+    if not metrics and not _is_count_intent(question) and not _is_sum_intent(question):
+        return False
+
+    has_total_cue = bool(
+        re.search(
+            r"\b(всього|загальн\w*|total|sum|сума|підсум\w*|скільк\w*|кільк\w*|count|how\s+many)\b",
+            q,
+            re.I,
+        )
+    )
+    has_display_cue = bool(
+        re.search(r"\b(покажи|показати|show|list|перелік|знайди|find|виведи)\b", q, re.I)
+    )
+    if has_display_cue and not has_total_cue:
+        return False
+    return True
 
 
 _SUBSET_TOKEN_STOPWORDS = {
@@ -2147,16 +2333,28 @@ def _finalize_code_for_sandbox(
             op_norm = "edit"
             logging.info("event=op_reclassified from=read to=edit reason=mutations_detected")
         else:
-            logging.warning(
-                "event=read_mutation_blocked question_preview=%s code_preview=%s",
-                _safe_trunc(question, 200),
-                _safe_trunc(code, 300),
-            )
-            return (
-                code,
-                False,
-                "Згенерований код для read-запиту змінює таблицю. Уточніть запит як зміну даних або переформулюйте його як read без модифікацій.",
-            )
+            rewritten_code, was_rewritten = _rewrite_read_df_rebinding(code)
+            if was_rewritten:
+                code = rewritten_code
+                has_mutations = _auto_detect_commit(code)
+                logging.info(
+                    "event=auto_fix_read_rebinding applied=%s still_mutating=%s",
+                    was_rewritten,
+                    has_mutations,
+                )
+            if not has_mutations:
+                logging.info("event=read_mutation_resolved reason=read_rebinding_rewrite")
+            else:
+                logging.warning(
+                    "event=read_mutation_blocked question_preview=%s code_preview=%s",
+                    _safe_trunc(question, 200),
+                    _safe_trunc(code, 300),
+                )
+                return (
+                    code,
+                    False,
+                    "Згенерований код для read-запиту змінює таблицю. Уточніть запит як зміну даних або переформулюйте його як read без модифікацій.",
+                )
 
     if op_norm == "read" and not has_mutations:
         try:
@@ -3712,6 +3910,8 @@ def _status_message(event: str, payload: Optional[dict]) -> str:
         reason = str((payload or {}).get("reason") or "").strip()
         if reason == "missing_subset_filter":
             return "Повторно генерую код: додам обов'язкову фільтрацію підмножини."
+        if reason == "read_mutation":
+            return "Повторно генерую код: прибираю модифікації таблиці для read-запиту."
         if reason == "runtime_keyerror_import":
             return "Повторно генерую код: виправляю помилку виконання."
         return "Повторно генерую код: у попередній версії не було присвоєння в result."
@@ -3761,10 +3961,10 @@ class Pipeline(object):
         webui_api_key: str = Field(default=os.getenv("WEBUI_API_KEY", ""))
 
         base_llm_base_url: str = Field(
-            default=os.getenv("BASE_LLM_BASE_URL", "http://alph-gpu.silly.billy:8031/v1")
+            default=os.getenv("BASE_LLM_BASE_URL", "https://ai-gateway-test.noone.pw/v1")
         )
-        base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", ""))
-        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "chat-model"))
+        base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", "sk-bf-59dc5727-7e10-4d29-a28e-cf7d655f595c"))
+        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "vllm-8099/minimax-m2n"))
 
         sandbox_url: str = Field(default=os.getenv("SANDBOX_URL", "http://sandbox:8081"))
         sandbox_api_key: str = Field(default=os.getenv("SANDBOX_API_KEY", ""))
@@ -3777,6 +3977,17 @@ class Pipeline(object):
 
         session_cache_ttl_s: int = Field(default=_env_int("PIPELINE_SESSION_CACHE_TTL_S", 1800), ge=60)
         wait_tick_s: int = Field(default=_env_int("PIPELINE_WAIT_TICK_S", 5), ge=0)
+        spreadsheet_skill_runtime_enabled: bool = Field(
+            default=os.getenv("SPREADSHEET_SKILL_RUNTIME_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        spreadsheet_skill_force_on_all_queries: bool = Field(
+            default=os.getenv("SPREADSHEET_SKILL_FORCE_ON_ALL_QUERIES", "true").lower()
+            in ("1", "true", "yes", "on")
+        )
+        spreadsheet_skill_dir: str = Field(
+            default=os.getenv("SPREADSHEET_SKILL_DIR", DEFAULT_SPREADSHEET_SKILL_DIR)
+        )
+        spreadsheet_skill_max_chars: int = Field(default=_env_int("SPREADSHEET_SKILL_MAX_CHARS", 16000), ge=1000)
 
         shortcut_enabled: bool = Field(
             default=os.getenv("SHORTCUT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
@@ -3837,6 +4048,8 @@ class Pipeline(object):
             )
         self._session_cache: Dict[str, Dict[str, Any]] = {}
         self._prompts = _read_prompts(PROMPTS_PATH)
+        self._skill_prompt_cache: Dict[str, Dict[str, str]] = {}
+        self._skill_prompt_lock = threading.Lock()
         router_cfg = ShortcutRouterConfig(
             catalog_path=self.valves.shortcut_catalog_path,
             index_path=self.valves.shortcut_index_path,
@@ -3947,7 +4160,169 @@ class Pipeline(object):
         if self.valves.preview_rows > new_max:
             self.valves.preview_rows = new_max
 
+    def _spreadsheet_skill_file_paths(self, focus: str = "plan") -> List[Tuple[str, str]]:
+        skill_dir = str(self.valves.spreadsheet_skill_dir or "").strip()
+        if not skill_dir:
+            return []
+        all_files: List[Tuple[str, str]] = [
+            (rel, os.path.join(skill_dir, rel))
+            for rel in _SPREADSHEET_SKILL_FILES
+        ]
+        if focus == "column":
+            include = {
+                "SKILL.md",
+                os.path.join("references", "column-matching.md"),
+                os.path.join("references", "forbidden-code-patterns.md"),
+            }
+            return [it for it in all_files if it[0] in include]
+        return all_files
+
+    def _strip_markdown_frontmatter(self, text: str) -> str:
+        s = str(text or "")
+        return re.sub(r"(?s)\A---\s*\n.*?\n---\s*\n?", "", s, count=1).strip()
+
+    def _load_spreadsheet_skill_prompt(self, focus: str = "plan") -> str:
+        cache_key = f"{focus}:{self.valves.spreadsheet_skill_dir}:{self.valves.spreadsheet_skill_max_chars}"
+        files = self._spreadsheet_skill_file_paths(focus=focus)
+        if not files:
+            logging.info("event=spreadsheet_skill_cache status=disabled reason=no_files_configured focus=%s", focus)
+            return ""
+
+        stat_items: List[str] = []
+        existing: List[Tuple[str, str]] = []
+        for rel, path in files:
+            if not os.path.exists(path):
+                continue
+            try:
+                st = os.stat(path)
+                stat_items.append(f"{rel}:{int(st.st_mtime_ns)}:{int(st.st_size)}")
+                existing.append((rel, path))
+            except OSError:
+                continue
+        if not existing:
+            logging.info(
+                "event=spreadsheet_skill_cache status=miss reason=no_existing_files focus=%s skill_dir=%s",
+                focus,
+                self.valves.spreadsheet_skill_dir,
+            )
+            return ""
+        version = "|".join(stat_items)
+
+        with self._skill_prompt_lock:
+            cached = self._skill_prompt_cache.get(cache_key)
+            if cached and cached.get("version") == version:
+                logging.info(
+                    "event=spreadsheet_skill_cache status=hit focus=%s file_count=%s chars=%s",
+                    focus,
+                    len(existing),
+                    len(str(cached.get("text") or "")),
+                )
+                return str(cached.get("text") or "")
+
+        sections: List[str] = []
+        for rel, path in existing:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except Exception:
+                continue
+            if rel == "SKILL.md":
+                text = self._strip_markdown_frontmatter(text)
+            label = rel.replace(os.sep, "/")
+            body = text.strip()
+            if not body:
+                continue
+            sections.append(f"[{label}]\n{body}")
+
+        if not sections:
+            logging.info(
+                "event=spreadsheet_skill_cache status=miss reason=empty_contents focus=%s skill_dir=%s",
+                focus,
+                self.valves.spreadsheet_skill_dir,
+            )
+            return ""
+
+        out = "\n\n".join(sections).strip()
+        max_chars = int(self.valves.spreadsheet_skill_max_chars)
+        truncated = False
+        if len(out) > max_chars:
+            out = out[:max_chars].rstrip() + "\n\n[skill context truncated]"
+            truncated = True
+
+        with self._skill_prompt_lock:
+            self._skill_prompt_cache[cache_key] = {"version": version, "text": out}
+        logging.info(
+            "event=spreadsheet_skill_cache status=miss reason=loaded focus=%s file_count=%s chars=%s truncated=%s",
+            focus,
+            len(existing),
+            len(out),
+            truncated,
+        )
+        return out
+
+    def _should_apply_spreadsheet_skill(self, question: str, profile: Optional[dict]) -> bool:
+        if not bool(self.valves.spreadsheet_skill_runtime_enabled):
+            return False
+        if bool(self.valves.spreadsheet_skill_force_on_all_queries):
+            return True
+        q = str(question or "")
+        if _has_edit_triggers(q):
+            return True
+        if isinstance(profile, dict):
+            cols = profile.get("columns")
+            if isinstance(cols, list) and len(cols) > 0:
+                return True
+        return bool(
+            re.search(r"\b(column|columns|table|sheet|cell|row|rows|колон|таблиц|клітин|рядк|збереж)\b", q, re.I)
+        )
+
+    def _with_spreadsheet_skill_prompt(
+        self,
+        base_system: str,
+        question: str,
+        profile: Optional[dict],
+        focus: str = "plan",
+    ) -> str:
+        system = str(base_system or "")
+        if _SPREADSHEET_SKILL_PROMPT_MARKER in system:
+            logging.info("event=spreadsheet_skill_prompt status=skipped reason=already_injected focus=%s", focus)
+            return system
+        should_apply = self._should_apply_spreadsheet_skill(question, profile)
+        if not should_apply:
+            logging.info("event=spreadsheet_skill_prompt status=skipped reason=guard focus=%s", focus)
+            return system
+        skill_context = self._load_spreadsheet_skill_prompt(focus=focus)
+        if not skill_context:
+            logging.info("event=spreadsheet_skill_prompt status=skipped reason=empty_context focus=%s", focus)
+            return system
+        header = (
+            f"{_SPREADSHEET_SKILL_PROMPT_MARKER}\n"
+            "Use the following local skill rules as strict guidance for table-safe code generation. "
+            "Do not invent columns, and prefer clarification over guessing for ambiguous matches."
+        )
+        file_labels = re.findall(r"(?m)^\[([^\]]+)\]", skill_context)
+        logging.info(
+            "event=spreadsheet_skill_prompt status=applied focus=%s files=%s skill_chars=%s question_preview=%s",
+            focus,
+            ",".join(file_labels[:8]),
+            len(skill_context),
+            _safe_trunc(question, 200),
+        )
+        if self.valves.debug:
+            logging.info(
+                "event=spreadsheet_skill_prompt_preview focus=%s preview=%s",
+                focus,
+                _safe_trunc(skill_context, 1200),
+            )
+        return f"{system}\n\n{header}\n\n{skill_context}"
+
     def _llm_json(self, system: str, user: str) -> dict:
+        skill_injected = _SPREADSHEET_SKILL_PROMPT_MARKER in (system or "")
+        logging.info(
+            "event=llm_json_skill_injection active=%s prompt_hash=%s",
+            skill_injected,
+            hashlib.sha256((system or "").encode("utf-8")).hexdigest()[:16],
+        )
         logging.info(
             "event=llm_json_request system_preview=%s user_preview=%s",
             _safe_trunc(system, 800),
@@ -3968,7 +4343,12 @@ class Pipeline(object):
         profile: dict,
         lookup_hints: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, str, Optional[bool]]:
-        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
         payload_obj: Dict[str, Any] = {"question": question, "df_profile": profile}
         if isinstance(lookup_hints, dict) and lookup_hints:
             system += (
@@ -3994,7 +4374,12 @@ class Pipeline(object):
         reason: str,
         lookup_hints: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, str, Optional[bool]]:
-        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
         payload_obj: Dict[str, Any] = {
             "question": question,
             "df_profile": profile,
@@ -4030,7 +4415,12 @@ class Pipeline(object):
         reason: str,
         lookup_hints: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, str, str, Optional[bool]]:
-        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
         payload_obj: Dict[str, Any] = {
             "question": question,
             "df_profile": profile,
@@ -4059,6 +4449,50 @@ class Pipeline(object):
             commit_df if isinstance(commit_df, bool) else None,
         )
 
+    def _plan_code_retry_read_mutation(
+        self,
+        question: str,
+        profile: dict,
+        previous_code: str,
+        reason: str,
+        lookup_hints: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
+        payload_obj: Dict[str, Any] = {
+            "question": question,
+            "df_profile": profile,
+            "retry_reason": reason,
+            "previous_analysis_code": previous_code,
+            "retry_constraints": [
+                "CRITICAL: this is strictly a read-only query.",
+                "Do NOT mutate DataFrame state: no `df = ...`, no `df[...] = ...`, no `.loc/.iloc/.at/.iat` assignments, no `inplace=True`.",
+                "If filtering is needed, use a temporary variable (e.g., `_df = df[...]`) and compute from `_df`.",
+                "CRITICAL: final answer must be assigned to variable `result`.",
+                "Set op='read' and commit_df=false.",
+                "No import/from statements.",
+            ],
+        }
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            system += (
+                " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
+                "in analysis_code and combine them with any additional constraints from the question."
+            )
+            payload_obj["lookup_hints"] = lookup_hints
+        payload = json.dumps(payload_obj, ensure_ascii=False)
+        parsed = self._llm_json(system, payload)
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
+
     def _plan_code_retry_runtime_error(
         self,
         question: str,
@@ -4066,7 +4500,12 @@ class Pipeline(object):
         previous_code: str,
         runtime_error: str,
     ) -> Tuple[str, str, str, Optional[bool]]:
-        system = self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM)
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
         retry_constraints = [
             "CRITICAL: final answer must be assigned to variable `result`.",
             "No import/from statements.",
@@ -4106,6 +4545,7 @@ class Pipeline(object):
             "Pick the single best column name from the provided list that matches the user's question. "
             "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\"}."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4152,6 +4592,7 @@ class Pipeline(object):
             "Use semantic similarity from question, alias, column names, dtypes, and preview values. "
             "If uncertain, return empty column and confidence 0."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "alias": alias,
@@ -4214,6 +4655,7 @@ class Pipeline(object):
             "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\"}. "
             "Choose only from numeric_columns."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4254,6 +4696,7 @@ class Pipeline(object):
             "(use defaults: 5 for row_ranking, 10 for group_ranking when user did not specify). "
             "If the query is not ranking (e.g., exact match/filter lookup), set query_mode='other' and top_n=null."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4484,6 +4927,7 @@ class Pipeline(object):
             "Use mode='lookup' when query asks to find/show rows by conditions (e.g., where price equals X). "
             "For single-value questions like 'яка модель ...', set limit=1."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4828,6 +5272,7 @@ class Pipeline(object):
             "If useful, include 1-2 short aliases in other likely languages (uk/ru/en) that may appear in table values. "
             "Prefer 1-6 concise terms."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4864,6 +5309,7 @@ class Pipeline(object):
             "Use agg='sum' when user asks total quantity/amount in subset. "
             "Use agg='count' only when user asks number of matching rows/items."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -4945,17 +5391,33 @@ class Pipeline(object):
         requires_subset_filter = bool(
             inferred_op == "read" and not is_meta and not has_edit and _question_requires_subset_filter(question, profile)
         )
+        aggregate_intent = _is_aggregate_query_intent(question)
 
         metric_col_hint: Optional[str] = None
         if inferred_op == "read" and not is_meta and not has_edit and metrics:
             metric_col_hint = self._llm_pick_numeric_metric_column(question, profile)
 
+        # Prefer deterministic subset+aggregation shortcut for aggregate filtered requests.
+        if (
+            inferred_op == "read"
+            and not is_meta
+            and not has_edit
+            and requires_subset_filter
+            and aggregate_intent
+        ):
+            shortcut = self._build_subset_keyword_metric_shortcut(
+                question,
+                profile,
+                preferred_col=metric_col_hint,
+            )
+
         if inferred_op == "read" and not is_meta and not has_edit:
-            lookup_slots = self._llm_pick_lookup_slots(question, profile)
-            lookup_hints = self._lookup_hints_from_slots(lookup_slots)
-            if lookup_hints:
-                planner_hints["lookup_hints"] = lookup_hints
-            shortcut = self._lookup_shortcut_code_from_slots(question, profile, lookup_slots)
+            if not shortcut:
+                lookup_slots = self._llm_pick_lookup_slots(question, profile)
+                lookup_hints = self._lookup_hints_from_slots(lookup_slots)
+                if lookup_hints:
+                    planner_hints["lookup_hints"] = lookup_hints
+                shortcut = self._lookup_shortcut_code_from_slots(question, profile, lookup_slots)
         if not shortcut and inferred_op == "read" and not is_meta and not has_edit:
             shortcut = self._ranking_shortcut_code(question, profile)
         if not shortcut and inferred_op == "read" and not is_meta and not has_edit and requires_subset_filter:
@@ -5045,6 +5507,7 @@ class Pipeline(object):
             "{\"scope\":\"global\"|\"filtered\"}. "
             "Use filtered when query constrains category/brand/model/id/color/spec/price or named entities."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -5075,6 +5538,7 @@ class Pipeline(object):
             "top_n must be an integer or null. "
             "Use group_by for categorical grouping dimension and aggregate for numeric value to sum/count/average."
         )
+        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
@@ -5370,6 +5834,129 @@ class Pipeline(object):
             return "Ні, немає в наявності."
         return None
 
+    def _aggregate_from_tabular_result(
+        self,
+        question: str,
+        result_text: str,
+        profile: Optional[dict],
+    ) -> Optional[str]:
+        if not _is_aggregate_query_intent(question):
+            return None
+        if _has_grouping_cues(question):
+            return None
+        text = (result_text or "").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None
+        if not isinstance(data, list) or not data or not all(isinstance(x, dict) for x in data):
+            return None
+
+        def _to_float(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                try:
+                    fv = float(v)
+                except Exception:
+                    return None
+                if fv != fv:
+                    return None
+                return fv
+            s = str(v).strip()
+            if not s:
+                return None
+            s = re.sub(r"[\s\xa0]", "", s)
+            s = re.sub(r"[^0-9,.\-]", "", s).replace(",", ".")
+            if not re.fullmatch(r"-?(\d+(\.\d*)?|\.\d+)", s or ""):
+                return None
+            try:
+                return float(s)
+            except Exception:
+                return None
+
+        def _fmt_num(v: float) -> str:
+            if float(v).is_integer():
+                return str(int(v))
+            return f"{float(v):.6f}".rstrip("0").rstrip(".")
+
+        cols = [str(c) for c in (data[0] or {}).keys()]
+        if not cols:
+            return None
+
+        metrics = _detect_metrics(question)
+        metric = metrics[0] if metrics else ("sum" if _is_sum_intent(question) else ("count" if _is_count_intent(question) else ""))
+        if not metric:
+            return None
+
+        # Disambiguate "загальна кількість ...": usually sum over qty-like column.
+        if metric == "count" and _is_sum_intent(question):
+            metric = "sum"
+
+        if metric == "count":
+            return f"Кількість — {len(data)}."
+
+        numeric_by_col: Dict[str, List[float]] = {}
+        for c in cols:
+            nums: List[float] = []
+            for row in data:
+                val = _to_float((row or {}).get(c))
+                if val is not None:
+                    nums.append(val)
+            if nums:
+                numeric_by_col[c] = nums
+        if not numeric_by_col:
+            return None
+
+        explicit_col = _find_explicit_column_in_text(question, cols) or _find_column_in_text(question, cols)
+        qty_like = _pick_quantity_like_column(profile or {})
+        target_col = None
+        if explicit_col in numeric_by_col:
+            target_col = explicit_col
+        elif metric == "sum" and qty_like in numeric_by_col:
+            target_col = qty_like
+        if not target_col:
+            target_col = max(numeric_by_col.keys(), key=lambda c: len(numeric_by_col[c]))
+
+        values = numeric_by_col.get(target_col) or []
+        if not values:
+            return None
+
+        if metric == "sum":
+            val = float(sum(values))
+        elif metric == "mean":
+            val = float(sum(values) / len(values))
+        elif metric == "min":
+            val = float(min(values))
+        elif metric == "max":
+            val = float(max(values))
+        elif metric == "median":
+            vals = sorted(values)
+            mid = len(vals) // 2
+            if len(vals) % 2 == 0:
+                val = float((vals[mid - 1] + vals[mid]) / 2.0)
+            else:
+                val = float(vals[mid])
+        else:
+            return None
+
+        col_low = str(target_col or "").lower()
+        if metric == "sum" and re.search(r"(кільк|qty|quantity|units|stock|залишк)", col_low):
+            label = "Загальна кількість"
+        elif metric == "sum":
+            label = "Сума"
+        elif metric == "mean":
+            label = "Середнє"
+        elif metric == "min":
+            label = "Мінімум"
+        elif metric == "max":
+            label = "Максимум"
+        else:
+            label = "Медіана"
+        return f"{label} — {_fmt_num(val)}."
+
     def _deterministic_answer(self, question: str, result_text: str, profile: Optional[dict]) -> Optional[str]:
         q = (question or "").lower()
         if any(word in q for word in ["видали", "додай", "зміни", "онов", "переймен"]):
@@ -5380,6 +5967,10 @@ class Pipeline(object):
             except:
                 pass
             return result_text 
+
+        aggregate_answer = self._aggregate_from_tabular_result(question, result_text, profile)
+        if aggregate_answer:
+            return aggregate_answer
 
         scalar = (result_text or "").strip()
         if scalar and "\n" not in scalar and not scalar.startswith(("{", "[", "|")):
@@ -5804,11 +6395,27 @@ class Pipeline(object):
             finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit
         )
         need_retry_missing_filter = bool(finalize_err and "missing_subset_filter" in finalize_err)
-        if need_retry_missing_result or need_retry_missing_filter:
-            retry_reason = "missing_subset_filter" if need_retry_missing_filter else "missing_result_assignment"
+        need_retry_read_mutation = bool(
+            finalize_err and "read-запиту змінює таблицю" in finalize_err and not shortcut and not router_hit
+        )
+        if need_retry_missing_result or need_retry_missing_filter or need_retry_read_mutation:
+            if need_retry_missing_filter:
+                retry_reason = "missing_subset_filter"
+            elif need_retry_read_mutation:
+                retry_reason = "read_mutation"
+            else:
+                retry_reason = "missing_result_assignment"
             events.append(("codegen_retry", {"reason": retry_reason}))
             if need_retry_missing_filter:
                 analysis_code, plan, op, commit_df = self._plan_code_retry_missing_filter(
+                    question=question,
+                    profile=profile,
+                    previous_code=analysis_code,
+                    reason=finalize_err or "",
+                    lookup_hints=lookup_hints,
+                )
+            elif need_retry_read_mutation:
+                analysis_code, plan, op, commit_df = self._plan_code_retry_read_mutation(
                     question=question,
                     profile=profile,
                     previous_code=analysis_code,
