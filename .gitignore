@@ -1,31 +1,70 @@
+# -----------------------------
+# OS / editor junk
+# -----------------------------
 .DS_Store
-venv/
-.venv/
+Thumbs.db
+.vscode/
+.idea/
 
-# macOS
-.DS_Store
-
-# secrets
-.env
-*.env
-config/*.env
-*.key
-*.pem
-.webui_secret_key
-printf "\n# python cache\n__pycache__/\n*.pyc\n" >> .gitignore
-
-
-# macOS
-.DS_Store
-
-# python cache
+# -----------------------------
+# Python artifacts
+# -----------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 
-# env/secrets
+# -----------------------------
+# Virtual environments
+# -----------------------------
+.venv/
+venv/
+.venv311/
+
+# -----------------------------
+# Build / packaging
+# -----------------------------
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -----------------------------
+# Runtime logs / temp
+# -----------------------------
+*.log
+*.tmp
+*.swp
+tmp/
+temp/
+
+# -----------------------------
+# Secrets / local config
+# -----------------------------
 .env
+.env.*
 *.env
 config/*.env
 *.key
 *.pem
 .webui_secret_key
+!.env.example
+
+# -----------------------------
+# Project-specific generated artifacts
+# -----------------------------
+pipelines/shortcut_router/learning/
+reports/
+docker-compose.override.yml

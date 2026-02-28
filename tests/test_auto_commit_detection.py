@@ -55,7 +55,7 @@ def test_finalize_blocks_commit_for_read_with_mutation() -> None:
     assert "COMMIT_DF = True" not in code
 
 
-def test_finalize_blocks_read_when_df_is_reassigned_to_filtered_subset() -> None:
+def test_finalize_allows_read_when_df_is_reassigned_to_filtered_subset() -> None:
     code, committed, err = _finalize_code_for_sandbox(
         question="Яка максимальна ціна на товар Миша",
         analysis_code="df = df[df['Категорія'].astype(str).str.contains('Миша', case=False, na=False)]\nresult = df['Ціна_UAH'].max()\n",
@@ -63,8 +63,28 @@ def test_finalize_blocks_read_when_df_is_reassigned_to_filtered_subset() -> None
         commit_df=False,
     )
     assert committed is False
-    assert err is not None
-    assert "read-запиту" in err
+    assert err is None
+    assert code.startswith("df = df.copy(deep=False)\n_df_read = df.copy(deep=False)\n")
+    assert "result = _df_read['Ціна_UAH'].max()" in code
+
+
+def test_finalize_strips_think_sections_before_read_rebinding_guard() -> None:
+    code, committed, err = _finalize_code_for_sandbox(
+        question="Яка максимальна ціна на товар Миша",
+        analysis_code=(
+            "<think>\n"
+            "I will filter then aggregate.\n"
+            "</think>\n"
+            "df = df[df['Категорія'].astype(str).str.contains('Миша', case=False, na=False)]\n"
+            "result = df['Ціна_UAH'].max()\n"
+        ),
+        op="read",
+        commit_df=False,
+    )
+    assert committed is False
+    assert err is None
+    assert "<think>" not in code
+    assert "_df_read = _df_read[_df_read['Категорія'].astype(str).str.contains('Миша', case=False, na=False)]" in code
 
 
 def test_finalize_keeps_read_copy_for_non_mutation() -> None:
@@ -229,6 +249,22 @@ def test_rewrite_single_column_sum_excludes_summary_rows() -> None:
     assert float(env["result"]) == 867.0
 
 
+def test_rewrite_single_column_sum_skips_derived_column_assignment() -> None:
+    code = (
+        "df['Total_Cost'] = pd.to_numeric(df['Ціна_UAH'], errors='coerce') * "
+        "pd.to_numeric(df['Кількість'], errors='coerce')\n"
+        "result = df['Total_Cost'].sum()\n"
+    )
+    profile = {"columns": ["ID", "Ціна_UAH", "Кількість"]}
+    rewritten = _rewrite_single_column_sum_code(code, profile)
+    assert rewritten == code
+
+    df = pd.DataFrame({"Ціна_UAH": [10.0, 20.0], "Кількість": [2, 3]})
+    env = {"df": df, "pd": pd, "np": np}
+    exec(rewritten, env, env)
+    assert float(env["result"]) == 80.0
+
+
 def test_deterministic_answer_for_inventory_total_not_labeled_as_column() -> None:
     pipeline = Pipeline()
     answer = pipeline._deterministic_answer(
@@ -270,6 +306,26 @@ def test_final_answer_returns_short_message_for_empty_result() -> None:
     assert answer == "За умовою запиту не знайдено значень."
 
 
+def test_final_answer_nan_uses_filter_hint_instead_of_raw_nan() -> None:
+    pipeline = Pipeline()
+    answer = pipeline._final_answer(
+        question="Яка максимальна ціна на товар Миша?",
+        profile={"columns": ["Модель", "Ціна_UAH"]},
+        plan="",
+        code='filtered_df = df[df["Модель"] == "Миша"]\nresult = filtered_df["Ціна_UAH"].max()\n',
+        edit_expected=False,
+        run_status="ok",
+        stdout="",
+        result_text="nan",
+        result_meta={},
+        mutation_summary={},
+        mutation_flags={},
+        error="",
+    )
+    assert "Не знайдено рядків для фільтра" in answer
+    assert "Модель = Миша" in answer
+
+
 def test_stats_shortcut_does_not_replace_average_with_total_inventory() -> None:
     from pipelines.spreadsheet_analyst_pipeline import _stats_shortcut_code
 
@@ -304,3 +360,54 @@ def test_lookup_shortcut_status_semantic_uses_contains_pattern() -> None:
     assert "_pat1" in code
     assert "склад" in code
     assert ".str.contains(_pat" in code
+
+
+def test_final_answer_success_path_does_not_call_llm_and_formats_result_text() -> None:
+    class _FakeMessage:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+    class _FakeChoice:
+        def __init__(self, content: str) -> None:
+            self.message = _FakeMessage(content)
+
+    class _FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.choices = [_FakeChoice(content)]
+
+    class _FakeCompletions:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create(self, **_kwargs):
+            self.calls += 1
+            raise AssertionError("LLM should not be called on strict success path")
+
+    class _FakeChat:
+        def __init__(self) -> None:
+            self.completions = _FakeCompletions()
+
+    class _FakeLLM:
+        def __init__(self) -> None:
+            self.chat = _FakeChat()
+
+    pipeline = Pipeline()
+    pipeline._llm = _FakeLLM()
+
+    answer = pipeline._final_answer(
+        question="Виручка по категоріях (Ціна × Кількість)",
+        profile={"columns": ["Категорія", "Виручка_UAH"]},
+        plan="retrieval_intent:groupby_agg",
+        code="result = _work.groupby(_group_col)['_metric'].sum().reset_index(name='Виручка_UAH')\n",
+        edit_expected=False,
+        run_status="ok",
+        stdout="",
+        result_text='[{"Категорія":"Ноутбук","Виручка_UAH":1000.0}]',
+        result_meta={},
+        mutation_summary={},
+        mutation_flags={},
+        error="",
+    )
+    assert "| Категорія | Виручка_UAH |" in answer
+    assert "| Ноутбук | 1000.0 |" in answer
+    assert pipeline._llm.chat.completions.calls == 0

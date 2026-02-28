@@ -339,56 +339,88 @@
       "text": "Top категорій за кількістю"
     },
     {
-      "intent_id": "filter_equals",
-      "text": "Відфільтруй рядки де city = Kyiv"
+      "intent_id": "groupby_count",
+      "text": "Бренди на літеру A та кількість моделей"
+    },
+    {
+      "intent_id": "groupby_count",
+      "text": "Бренди на літеру \"A\" та кількість моделей"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Покажи тільки записи з category = shoes"
+      "text": "Покажи записи, де значення поля точно дорівнює вказаному"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Залиш рядки де status дорівнює active"
+      "text": "Відфільтруй рядки з точним збігом значення"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Вибери всі записи де id = 12345"
+      "text": "Залиш лише записи зі статусом exact match"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Покажи дані для manager 'Ivanov'"
+      "text": "Знайди рядки, де код дорівнює заданому значенню"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Зроби фільтр по type 'Samsung'"
+      "text": "Покажи записи, де прапорець дорівнює true"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Виведи рядки де gender = M"
+      "text": "Вибери дані, де рік точно дорівнює потрібному"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Покажи тільки ті рядки де currency = UAH"
+      "text": "Show rows where field equals given value"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Знайди всі записи де department = IT"
+      "text": "Filter by exact value in selected column"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Відобрази рядки з color = Red"
+      "text": "Exact match filter for identifier"
     },
     {
       "intent_id": "filter_equals",
-      "text": "Дай мені тільки ті де success = True"
+      "text": "Покажи лише записи зі значенням \"активний\""
     },
     {
-      "intent_id": "filter_equals",
-      "text": "Фільтрувати по колонці name значення John"
+      "intent_id": "filter_multi_conditions",
+      "text": "Покажи всі записи, де категорія = X і виробник = Y"
     },
     {
-      "intent_id": "filter_equals",
-      "text": "Вибрати де рік дорівнює 2023"
+      "intent_id": "filter_multi_conditions",
+      "text": "Знайди всі товари заданої категорії від заданого виробника"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Покажи всі позиції типу <тип> від <виробник>"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Знайди всі ноутбуки певного виробника"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Show all items where category is X and maker is Y"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Filter records with two conditions across different fields"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Вибери записи, де статус = active і канал = online"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Покажи рядки, де одна умова текстова, а друга числова"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Знайди об'єкти з групою G1 і кількістю більше 0"
     },
     {
       "intent_id": "filter_comparison",
@@ -437,6 +469,14 @@
     {
       "intent_id": "filter_comparison",
       "text": "Фільтр по height більше 180"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Товари дешевші за 3,000 UAH"
+    },
+    {
+      "intent_id": "filter_comparison",
+      "text": "Покажи категорії товарів дешевші за 3000 грн"
     },
     {
       "intent_id": "sort_by_column",
@@ -823,64 +863,60 @@
       "text": "Average price per category"
     },
     {
-      "intent_id": "filter_contains",
-      "text": "Знайди рядки де name містить ivan"
+      "intent_id": "groupby_agg",
+      "text": "Порахуй загальну сумму по всім товарам кожної категорії"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Порахуй загальну сумму по цінам для всіх товарів кожної категорії"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Надай детальну інформацію про те яка загальна сума по категоріях"
+    },
+    {
+      "intent_id": "groupby_agg",
+      "text": "Топ-5 товарів за сумарною вартістю на складі"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Фільтр по підрядку у колонці city"
+      "text": "Знайди рядки, де текст поля містить вказане слово"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Покажи записи де опис містить pro"
+      "text": "Фільтр по частковому збігу в колонці"
     },
     {
       "intent_id": "filter_contains",
-      "text": "contains для колонки brand"
+      "text": "Покажи записи, де опис містить заданий фрагмент"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Де title містить слово max"
+      "text": "Contains-пошук у текстовому полі"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Фільтруй коли адреса містить kyiv"
+      "text": "Відфільтруй записи за підрядком"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Містить текст у полі comment"
+      "text": "Пошук по частині слова у назві"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Відфільтруй за підрядком"
+      "text": "Rows where text field contains a token"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Пошук по частині слова"
+      "text": "Find records containing keyword in description"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Rows where name contains ann"
+      "text": "Покажи елементи, де статус містить потрібний фрагмент"
     },
     {
       "intent_id": "filter_contains",
-      "text": "Покажи товари, де бренд містить NVIDIA"
-    },
-    {
-      "intent_id": "filter_contains",
-      "text": "Знайди позиції де модель містить RTX"
-    },
-    {
-      "intent_id": "filter_contains",
-      "text": "Покажи записи, де опис містить GeForce"
-    },
-    {
-      "intent_id": "filter_contains",
-      "text": "Виведи товари, де категорія містить миш"
-    },
-    {
-      "intent_id": "filter_contains",
-      "text": "Пошук по Intel у назві товару"
+      "text": "Виведи записи з підрядком у коментарі"
     },
     {
       "intent_id": "filtered_metric_aggregation",
@@ -1005,6 +1041,14 @@
     {
       "intent_id": "filter_range_numeric",
       "text": "Between min and max"
+    },
+    {
+      "intent_id": "filter_multi_conditions",
+      "text": "Знайди всі ноутбуки Apple"
+    },
+    {
+      "intent_id": "stats_aggregation",
+      "text": "Середня кількість штук на одну позицію"
     }
   ],
   "embedding": {

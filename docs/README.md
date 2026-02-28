@@ -662,6 +662,7 @@ docker compose exec sandbox env | grep -E "MAX|TIMEOUT"
 
 - [Functions Documentation](./FUNCTIONS.md) — Детальна документація всіх функцій
 - [Data Flow Documentation](./DATA_FLOW.md) — Карта потоків даних та життєвий цикл
+- [Shortcut Debug Dashboard](./SHORTCUT_DEBUG_DASHBOARD.md) — Як запустити локальний дашборд трейсів
 
 ---
 

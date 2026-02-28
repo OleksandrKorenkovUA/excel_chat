@@ -1,8 +1,7 @@
-### Поточна версія коду 
-
 import ast
 import asyncio
 import base64
+import contextlib
 import contextvars
 import inspect
 import hashlib
@@ -17,6 +16,37 @@ import traceback
 import uuid
 from typing import Any, ClassVar, Dict, Generator, Iterator, List, Optional, Tuple, Union
 from pipelines.shortcut_router.shortcut_router import ShortcutRouter, ShortcutRouterConfig
+from pipelines.lib.pipeline_prompts import (
+    DEFAULT_FINAL_ANSWER_SYSTEM,
+    DEFAULT_FINAL_REWRITE_SYSTEM,
+    DEFAULT_PLAN_CODE_SYSTEM,
+    DEFAULT_RLM_CORE_REPL_SYSTEM,
+    DEFAULT_RLM_CODEGEN_SYSTEM,
+    META_TASK_HINTS,
+    SEARCH_QUERY_META_HINTS,
+    _SPREADSHEET_SKILL_PROMPT_MARKER,
+)
+from pipelines.lib.query_signals import (
+    COUNT_CONTEXT_RE as _COUNT_CONTEXT_RE,
+    COUNT_NUMBER_OF_RE as _COUNT_NUMBER_OF_RE,
+    COUNT_QTY_RE as _COUNT_QTY_RE,
+    COUNT_WORD_RE as _COUNT_WORD_RE,
+    METRIC_CONTEXT_RE as _METRIC_CONTEXT_RE,
+    METRIC_PATTERNS as _METRIC_PATTERNS,
+    has_availability_filter_cue,
+    has_explicit_subset_filter_words,
+    has_grouping_cue,
+    has_router_entity_token,
+    has_router_filter_context_cue,
+    has_router_metric_cue,
+)
+from pipelines.lib.route_trace import (
+    RouteTracer,
+    current_route_tracer,
+    reset_active_route_tracer,
+    set_active_route_tracer,
+)
+from pipelines.lib.rlm_core import LMHandler, RLMCore, SandboxREPL
 import requests
 from openai import OpenAI
 from pydantic import BaseModel, Field
@@ -25,7 +55,6 @@ from pydantic import BaseModel, Field
 PIPELINES_DIR = os.path.dirname(__file__)
 PROJECT_ROOT_DIR = os.path.abspath(os.path.join(PIPELINES_DIR, os.pardir))
 DEFAULT_SPREADSHEET_SKILL_DIR = os.path.join(PROJECT_ROOT_DIR, "skills", "spreadsheet-guardrails")
-_SPREADSHEET_SKILL_PROMPT_MARKER = "RUNTIME SKILL HOOK: spreadsheet-guardrails"
 _SPREADSHEET_SKILL_FILES = (
     "SKILL.md",
     os.path.join("references", "column-matching.md"),
@@ -36,95 +65,20 @@ _SPREADSHEET_SKILL_FILES = (
 DEF_TIMEOUT_S = int(os.getenv("PIPELINE_HTTP_TIMEOUT_S", "120"))
 _LOCAL_PROMPTS = os.path.join(os.path.dirname(__file__), "prompts.txt")
 PROMPTS_PATH = _LOCAL_PROMPTS if os.path.exists(_LOCAL_PROMPTS) else os.path.join(PIPELINES_DIR, "prompts.txt")
-DEFAULT_PLAN_CODE_SYSTEM = (
-    "You write pandas code to answer questions about a DataFrame named df. "
-    "CRITICAL SUBSET RULE: When user asks about a subset (e.g., among/for/with/where/тільки/лише/серед), "
-    "you MUST filter DataFrame first, then compute metric on filtered rows only. "
-    "Do NOT compute metric on full df when subset is requested. "
-    "Example: 'max price among mice' => "
-    "result = df[df['Категорія'].astype(str).str.contains('миш', case=False, na=False)]['Ціна_UAH'].max(). "
-    "Return ONLY valid JSON with keys: analysis_code, short_plan, op, commit_df. "
-    "CRITICAL: The FINAL value MUST be assigned to variable named 'result'. "
-    "NEVER use custom final variable names like 'total_value', 'sum_price', 'avg_qty'. "
-    "ALWAYS use: result = <your calculation>. "
-    "For read queries that compute total via product of two columns and sum (e.g., colA * colB).sum(), "
-    "ignore synthetic summary rows with missing identifiers/metadata. "
-    "op must be 'edit' if the user asks to modify data (delete, add, rename, update values), otherwise 'read'. "
-    "commit_df must be true when DataFrame is modified, otherwise false. "
-    "CRITICAL: NO IMPORTS ALLOWED. Do NOT write any import statements (import/from). "
-    "CRITICAL: DO NOT USE lambda expressions. "
-    "pd and np are already available in the execution environment. "
-    "CRITICAL: For op='edit', your analysis_code MUST ALWAYS include these lines at the end:\n"
-    "COMMIT_DF = True\n"
-    "result = {'status': 'updated'}\n"
-    "If op == 'edit', your code MUST assign the updated DataFrame back to variable df (e.g. df = df.drop(...)) "
-    "or use df.loc/at assignment or inplace=True. "
-    "After updates like df.loc[...] = value, DO NOT overwrite df with a scalar/series extraction "
-    "(e.g. DO NOT do df = df.loc[...].iloc[0]). "
-    "CRITICAL ROW DELETION RULES:\n"
-    "- When user mentions row numbers/positions (e.g. 'delete rows 98 and 99', 'видали рядки 98 і 99'), "
-    "these are 1-based row positions in the visible table.\n"
-    "- Phrase 'рядки з номерами X, Y' also means row positions, not ID values.\n"
-    "- You MUST use df.drop(index=[...]) with 0-based indices (subtract 1 from each number).\n"
-    "- You MUST call df.reset_index(drop=True) BEFORE dropping to ensure correct positional indexing.\n"
-    "- DO NOT filter by ID column unless user explicitly says 'where ID equals' or 'з ID='.\n"
-    "- DO NOT assign filtered result to result variable; ALWAYS assign back to df.\n"
-    "ROW/ID DISAMBIGUATION RULE:\n"
-    "- Phrase like 'рядок N' usually means 1-based row position, but if N is far beyond table length and "
-    "'ID' column exists with value N, treat it as ID lookup.\n"
-    "CRITICAL ROW ADDITION RULES:\n"
-    "- When adding rows with pd.concat, ALWAYS assign back to df: df = pd.concat([df, new_rows], ignore_index=True).\n"
-    "- NEVER assign pd.concat result only to result variable.\n"
-    "CRITICAL MUTATION ASSIGNMENT RULES:\n"
-    "- NEVER write result = df[...] for edit operations. Use df = df[...] instead.\n"
-    "- NEVER write result = df.drop(...) / result = df.rename(...). Use df = ... instead.\n"
-    "\nExample for 'delete rows 98 and 99':\n"
-    "{\n"
-    '  "analysis_code": "df = df.copy()\\ndf = df.reset_index(drop=True)\\ndf = df.drop(index=[97, 98])\\nCOMMIT_DF = True\\nresult = {\'status\': \'updated\'}",\n'
-    '  "short_plan": "Видалити рядки 98 та 99 за позицією",\n'
-    '  "op": "edit",\n'
-    '  "commit_df": true\n'
-    "}\n"
-    "\nExample WRONG (DO NOT DO THIS):\n"
-    "{\n"
-    '  "analysis_code": "df = df[df[\'ID\'] != 98]\\nresult = df[df[\'ID\'] != 99]",\n'
-    '  "short_plan": "Видалити рядки з ID 98 та 99"\n'
-    "}\n"
-    "\nExample for 'add 3 empty rows':\n"
-    "{\n"
-    '  "analysis_code": "df = df.copy()\\nnew_rows = pd.DataFrame([{} for _ in range(3)], columns=df.columns)\\ndf = pd.concat([df, new_rows], ignore_index=True)\\nCOMMIT_DF = True\\nresult = {\'status\': \'updated\'}",\n'
-    '  "short_plan": "Додати 3 порожні рядки",\n'
-    '  "op": "edit",\n'
-    '  "commit_df": true\n'
-    "}\n"
-)
-
-DEFAULT_FINAL_ANSWER_SYSTEM = (
-    "You are a data analysis assistant. Answer in Ukrainian. "
-    "CRITICAL: Use ONLY the data from result_text field. NEVER generate or invent numbers. "
-    "If you mention any numbers, they must appear in result_text. "
-    "Do not mention model numbers or SKUs unless they appear in result_text. "
-    "If result_text contains the answer, format it clearly. "
-    "If result_text is empty or has an error, explain what to change. "
-    "If a keyword for grouping is not explicitly mentioned, first try to infer the grouping column from df_profile column names. "
-    "DO NOT use data from df_profile to answer questions about counts or aggregations."
-)
-
-DEFAULT_FINAL_REWRITE_SYSTEM = (
-    "You rewrite a validated result into a concise, human-friendly Ukrainian answer. "
-    "Use ONLY result_text to determine facts. "
-    "Do not add any numbers or details not present in result_text. "
-    "If result_text is empty or unclear, say that the result is unclear and ask the user to уточнити запит."
-)
 
 SHORTCUT_COL_PLACEHOLDER = "_SHORTCUT_COL_"
 GROUP_COL_PLACEHOLDER = "__GROUP_COL__"
 SUM_COL_PLACEHOLDER = "__SUM_COL__"
 AGG_COL_PLACEHOLDER = "__AGG_COL__"
 TOP_N_PLACEHOLDER = "__TOP_N__"
+LOOKUP_ALLOWED_FILTER_OPS = {"eq", "ne", "gt", "ge", "lt", "le", "contains", "startswith", "endswith"}
+LOOKUP_ALLOWED_AGGREGATIONS = {"none", "count", "sum", "mean", "min", "max", "median"}
 
 _REQUEST_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_request_id", default="-")
 _TRACE_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_trace_id", default="-")
+_LLM_CALL_STATS_CTX: contextvars.ContextVar[Optional[List[Dict[str, Any]]]] = contextvars.ContextVar(
+    "pipeline_llm_call_stats", default=None
+)
 
 
 class _RequestTraceLoggingFilter(logging.Filter):
@@ -183,6 +137,18 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _normalize_optional_top_n(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        n = int(value)
+    except Exception:
+        return None
+    return n if n > 0 else None
+
+
 def _read_prompts(path: str) -> Dict[str, str]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -193,26 +159,6 @@ def _read_prompts(path: str) -> Dict[str, str]:
     for match in re.finditer(r"\[(?P<name>[a-z_]+)\]\s*(?P<body>.*?)\s*\[/\1\]", text, re.S):
         prompts[match.group("name")] = match.group("body").strip()
     return prompts
-
-
-META_TASK_HINTS = (
-    "### Task:",
-    "Generate 1-3 broad tags",
-    "Create a concise, 3-5 word title",
-    "Suggest 3-5 relevant follow-up",
-    "determine whether a search is necessary",
-    "<chat_history>",
-    "Respond to the user query using the provided context",
-    "<user_query>",
-)
-
-
-SEARCH_QUERY_META_HINTS = (
-    "determine the necessity of generating search queries",
-    "prioritize generating 1-3 broad and relevant search queries",
-    "return: { \"queries\": [] }",
-    "\"queries\": [",
-)
 
 
 def _is_meta_task_text(text: str) -> bool:
@@ -299,6 +245,11 @@ def _normalize_query_text(text: str) -> str:
     s = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     if not s.strip():
         return ""
+    # Some clients wrap prompts as "History: ... Query: <actual question>".
+    # Keep only the explicit query tail to avoid leaking chat history into planner.
+    m_query_tail = re.search(r"(?is)(?:^|[\n\s])query\s*:\s*(.+)$", s)
+    if m_query_tail:
+        s = (m_query_tail.group(1) or "").strip()
     lines: List[str] = []
     for raw_line in s.split("\n"):
         line = (raw_line or "").strip()
@@ -502,6 +453,100 @@ def _safe_trunc(text: str, limit: int) -> str:
     return text[:limit] + "...(truncated)"
 
 
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _extract_llm_usage(resp: Any) -> Dict[str, Optional[int]]:
+    usage: Any = None
+    if isinstance(resp, dict):
+        usage = resp.get("usage")
+    else:
+        usage = getattr(resp, "usage", None)
+
+    if usage is None:
+        return {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
+
+    if isinstance(usage, dict):
+        prompt_tokens = _safe_int(usage.get("prompt_tokens"))
+        completion_tokens = _safe_int(usage.get("completion_tokens"))
+        total_tokens = _safe_int(usage.get("total_tokens"))
+    else:
+        prompt_tokens = _safe_int(getattr(usage, "prompt_tokens", None))
+        completion_tokens = _safe_int(getattr(usage, "completion_tokens", None))
+        total_tokens = _safe_int(getattr(usage, "total_tokens", None))
+
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _normalize_learning_query(text: str) -> str:
+    s = _normalize_query_text(text or "")
+    s = re.sub(r"^\*{1,3}\s*(.*?)\s*\*{1,3}$", r"\1", s)
+    return re.sub(r"\s+", " ", s).strip().casefold()
+
+
+def _read_json_or_default(path: str, default: Any) -> Any:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def _read_jsonl(path: str) -> List[dict]:
+    out: List[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = (line or "").strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    out.append(obj)
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    return out
+
+
+def _atomic_write_json(path: str, payload: Any) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _atomic_write_jsonl(path: str, rows: List[dict]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            f.write(json.dumps(row, ensure_ascii=False))
+            f.write("\n")
+    os.replace(tmp, path)
+
+
 def _extract_json_candidate(text: str) -> Optional[str]:
     s = (text or "").strip()
     if not s:
@@ -543,15 +588,217 @@ def _extract_json_candidate(text: str) -> Optional[str]:
     return None
 
 
+def _extract_json_candidates(text: str) -> List[str]:
+    s = (text or "").strip()
+    if not s:
+        return []
+    out: List[str] = []
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        escaped = False
+        matched = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    out.append(s[start : i + 1])
+                    start = s.find("{", start + 1)
+                    matched = True
+                    break
+        if not matched:
+            break
+    return out
+
+
+def _strip_llm_reasoning_sections(text: str) -> str:
+    s = str(text or "")
+    if not s:
+        return ""
+    s = re.sub(r"(?is)<(think|analysis|reasoning)[^>]*>.*?</\1>", " ", s)
+    s = re.sub(r"(?is)</?(think|analysis|reasoning)[^>]*>", " ", s)
+    s = re.sub(r"(?is)```(?:think|thinking|analysis|reasoning)[^\n]*\n.*?```", " ", s)
+    return s.strip()
+
+
 def _parse_json_dict_from_llm(text: str) -> dict:
     s = (text or "").strip()
     if not s:
         raise ValueError("LLM did not return JSON")
-    candidate = _extract_json_candidate(s) or s
-    parsed = json.loads(candidate)
-    if not isinstance(parsed, dict):
-        raise ValueError("LLM JSON root must be an object")
-    return parsed
+    candidates: List[str] = []
+    cleaned = _strip_llm_reasoning_sections(s)
+    for source in (s, cleaned):
+        if not source:
+            continue
+        first = _extract_json_candidate(source)
+        if first and first not in candidates:
+            candidates.append(first)
+        for cand in _extract_json_candidates(source):
+            if cand not in candidates:
+                candidates.append(cand)
+    if not candidates:
+        candidates = [cleaned or s]
+    last_err: Optional[Exception] = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except Exception as exc:
+            last_err = exc
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    if last_err is not None:
+        raise last_err
+    raise ValueError("LLM JSON root must be an object")
+
+
+def _strip_llm_think_sections(text: str) -> str:
+    return _strip_llm_reasoning_sections(text)
+
+
+def _scalar_text_is_nan_like(text: Any) -> bool:
+    s = str(text or "").strip().lower()
+    return s in {"nan", "none", "null", "nat", "n/a", "na"}
+
+
+def _extract_filter_hint_from_analysis_code(code: str, max_items: int = 3) -> Optional[str]:
+    s = _strip_llm_reasoning_sections(str(code or ""))
+    if not s:
+        return None
+    hints: List[str] = []
+    patterns = [
+        (r"\[\s*['\"](?P<col>[^'\"]+)['\"]\s*\]\s*==\s*['\"](?P<val>[^'\"]+)['\"]", "{col} = {val}"),
+        (
+            r"\[\s*['\"](?P<col>[^'\"]+)['\"]\s*\]\.astype\(str\)\.str\.contains\(\s*(?:str\()?(?P<q>['\"])(?P<val>.*?)(?P=q)",
+            "{col} contains {val}",
+        ),
+        (
+            r"\[\s*['\"](?P<col>[^'\"]+)['\"]\s*\]\.astype\(str\)\.str\.lower\(\)\s*==\s*str\(\s*['\"](?P<val>[^'\"]+)['\"]\s*\)\.lower\(\)",
+            "{col} = {val}",
+        ),
+    ]
+    for pattern, fmt in patterns:
+        for m in re.finditer(pattern, s, re.I):
+            col = str(m.group("col") or "").strip()
+            val = str(m.group("val") or "").strip()
+            if not col or not val:
+                continue
+            hint = fmt.format(col=col, val=val)
+            if hint not in hints:
+                hints.append(hint)
+            if len(hints) >= max_items:
+                return "; ".join(hints)
+    if not hints:
+        return None
+    return "; ".join(hints)
+
+
+def _looks_like_executable_code(text: str) -> bool:
+    s = str(text or "")
+    return any(
+        token in s
+        for token in (
+            "result =",
+            "df[",
+            "df.",
+            "pd.",
+            "np.",
+            "for ",
+            "if ",
+            "while ",
+        )
+    )
+
+
+def find_code_blocks(text: str) -> List[str]:
+    s = str(text or "")
+    if not s:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    patterns = (
+        r"```(?:python|py)\s*(.*?)\s*```",
+        r"```[a-zA-Z0-9_-]*\s*(.*?)\s*```",
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, s, re.S | re.I):
+            code = str(m.group(1) or "").strip()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def _extract_analysis_code_from_llm(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+
+    # Prefer think-stripped fenced code first to avoid leaking reasoning sections.
+    cleaned_first = _strip_llm_think_sections(raw)
+    cleaned_blocks = find_code_blocks(cleaned_first)
+    for code in cleaned_blocks:
+        if re.search(r"(?m)^\s*result\s*=", code):
+            return code
+    for code in cleaned_blocks:
+        if _looks_like_executable_code(code):
+            return code
+
+    # Then inspect raw fenced blocks.
+    blocks = find_code_blocks(raw)
+    for code in blocks:
+        if re.search(r"(?m)^\s*result\s*=", code):
+            return code
+    for code in blocks:
+        if _looks_like_executable_code(code):
+            return code
+
+    cleaned = cleaned_first
+    if not cleaned:
+        return ""
+
+    # First, try structured JSON payloads when model still follows object format.
+    with contextlib.suppress(Exception):
+        parsed = _parse_json_dict_from_llm(cleaned)
+        code = str((parsed or {}).get("analysis_code") or "").strip()
+        if code:
+            return code
+
+    # Then, prefer fenced code blocks after think-section cleanup.
+    for code in cleaned_blocks:
+        if re.search(r"(?m)^\s*result\s*=", code):
+            return code
+    for code in cleaned_blocks:
+        if _looks_like_executable_code(code):
+            return code
+
+    # Finally, accept raw plain-text code when it looks executable.
+    lines = [ln.rstrip() for ln in cleaned.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if not _looks_like_executable_code(cleaned):
+        return ""
+    return "\n".join(lines).strip()
+
+
+def _extract_analysis_code_from_llm_no_think(text: str) -> str:
+    return _extract_analysis_code_from_llm(_strip_llm_think_sections(text))
 
 
 def _profile_fingerprint(profile: Optional[dict]) -> str:
@@ -566,6 +813,92 @@ def _profile_fingerprint(profile: Optional[dict]) -> str:
     }
     raw = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _profile_columns(profile: Optional[dict], limit: int = 400) -> List[str]:
+    cols = [str(c) for c in ((profile or {}).get("columns") or []) if str(c).strip()]
+    return cols[: max(1, int(limit))]
+
+
+def _profile_numeric_columns(profile: Optional[dict], limit: int = 400) -> List[str]:
+    cols = _profile_columns(profile, limit=5000)
+    dtypes = (profile or {}).get("dtypes") or {}
+    out: List[str] = []
+    for c in cols:
+        if _is_numeric_dtype_text(dtypes.get(c, "")):
+            out.append(c)
+    return out[: max(1, int(limit))]
+
+
+def _compact_profile_for_llm(profile: Optional[dict]) -> Dict[str, Any]:
+    return {
+        "rows": (profile or {}).get("rows"),
+        "cols": (profile or {}).get("cols"),
+        "columns": _profile_columns(profile),
+        "numeric_columns": _profile_numeric_columns(profile),
+    }
+
+
+def _compact_profile_for_trace(profile: Optional[dict]) -> Dict[str, Any]:
+    cols = _profile_columns(profile)
+    numeric_cols = _profile_numeric_columns(profile)
+    return {
+        "rows": (profile or {}).get("rows"),
+        "cols": (profile or {}).get("cols"),
+        "columns_count": len(cols),
+        "numeric_columns_count": len(numeric_cols),
+        "columns": cols,
+        "numeric_columns": numeric_cols,
+    }
+
+
+def _compact_sandbox_run_output(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    result_text = str(out.get("result_text") or "")
+    stdout = str(out.get("stdout") or "")
+    profile = out.get("profile") if isinstance(out.get("profile"), dict) else {}
+    return {
+        "status": str(out.get("status") or ""),
+        "error": str(out.get("error") or ""),
+        "result_text_preview": _safe_trunc(result_text, 1200),
+        "result_meta": out.get("result_meta") if isinstance(out.get("result_meta"), dict) else {},
+        "stdout_preview": _safe_trunc(stdout, 800),
+        "committed": bool(out.get("committed")),
+        "auto_committed": bool(out.get("auto_committed")),
+        "structure_changed": bool(out.get("structure_changed")),
+        "profile": _compact_profile_for_trace(profile) if profile else {},
+    }
+
+
+def _compact_plan_result_for_trace(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    analysis_code = str(out.get("analysis_code") or "")
+    return {
+        "ok": bool(out.get("ok")),
+        "status": str(out.get("status") or ""),
+        "plan_preview": _safe_trunc(str(out.get("plan") or ""), 400),
+        "analysis_code_chars": len(analysis_code),
+        "analysis_code_preview": _safe_trunc(analysis_code, 600),
+        "op": str(out.get("op") or ""),
+        "commit_df": out.get("commit_df"),
+        "edit_expected": bool(out.get("edit_expected")),
+        "router_meta": out.get("router_meta") if isinstance(out.get("router_meta"), dict) else {},
+        "events": out.get("events") if isinstance(out.get("events"), list) else [],
+        "message_sync": _safe_trunc(str(out.get("message_sync") or ""), 400),
+        "message_stream": _safe_trunc(str(out.get("message_stream") or ""), 400),
+    }
+
+
+def _compact_postprocess_result_for_trace(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload or {})
+    return {
+        "ok": bool(out.get("ok")),
+        "status": str(out.get("status") or ""),
+        "profile": _compact_profile_for_trace(out.get("profile")) if isinstance(out.get("profile"), dict) else {},
+        "mutation_flags": out.get("mutation_flags") if isinstance(out.get("mutation_flags"), dict) else {},
+        "message_sync": _safe_trunc(str(out.get("message_sync") or ""), 400),
+        "message_stream": _safe_trunc(str(out.get("message_stream") or ""), 400),
+    }
 
 
 def _profile_change_reason(old: Optional[dict], new: Optional[dict]) -> str:
@@ -822,7 +1155,26 @@ def _is_count_intent(question: str) -> bool:
 
 def _is_sum_intent(question: str) -> bool:
     q = (question or "").lower()
-    return bool(re.search(r"\b(sum|сума|total|загальн\w*|обсяг|volume|units|залишк\w*)\b", q))
+    return bool(
+        re.search(
+            r"\b(sum|сума|total|загальн\w*|обсяг|volume|units|залишк\w*|"
+            r"revenue|sales|gmv|вируч\w*|дохід\w*|оборот\w*|варт\w*)\b",
+            q,
+            re.I,
+        )
+    )
+
+
+def _has_product_sum_intent(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    has_mul = ("×" in q) or ("*" in q) or bool(re.search(r"\b(x|mul|помнож|добут)\w*\b", q, re.I))
+    has_money = bool(
+        re.search(r"\b(ціна|price|cost|amount|revenue|sales|gmv|вируч\w*|дохід\w*|оборот\w*|варт\w*)\b", q, re.I)
+    )
+    has_qty = bool(re.search(r"\b(кільк\w*|qty|quantity|units?|штук|одиниц\w*)\b", q, re.I))
+    return bool((has_mul and (has_money or has_qty)) or (has_money and has_qty))
 
 
 def _extract_df_subscript_col(node: ast.AST) -> Optional[str]:
@@ -892,6 +1244,46 @@ def _detect_result_single_column_sum(code: str) -> Optional[str]:
     return None
 
 
+def _result_sum_uses_derived_df_column(code: str, value_col: str) -> bool:
+    if not value_col:
+        return False
+    try:
+        tree = ast.parse(code or "")
+    except Exception:
+        return False
+
+    result_idx: Optional[int] = None
+    for idx, node in enumerate(tree.body):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        t = node.targets[0]
+        if not isinstance(t, ast.Name) or t.id != "result":
+            continue
+        value = node.value
+        if not isinstance(value, ast.Call):
+            continue
+        if value.args or value.keywords:
+            continue
+        if not isinstance(value.func, ast.Attribute) or value.func.attr != "sum":
+            continue
+        col = _extract_df_subscript_col(value.func.value)
+        if col == value_col:
+            result_idx = idx
+            break
+    if result_idx is None:
+        return False
+
+    for node in tree.body[:result_idx]:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if _extract_df_subscript_col(target) == value_col:
+                    return True
+        elif isinstance(node, ast.AugAssign):
+            if _extract_df_subscript_col(node.target) == value_col:
+                return True
+    return False
+
+
 def _id_like_columns(profile_cols: List[str], excluded: set[str]) -> List[str]:
     return [
         c
@@ -959,6 +1351,18 @@ def _rewrite_single_column_sum_code(code: str, df_profile: Optional[dict]) -> st
     if not value_col:
         return code
     profile_cols = [str(c) for c in ((df_profile or {}).get("columns") or [])]
+    if _result_sum_uses_derived_df_column(code or "", value_col):
+        logging.info(
+            "event=single_sum_rewrite skipped reason=derived_value_column value_col=%s",
+            value_col,
+        )
+        return code
+    if profile_cols and value_col not in profile_cols:
+        logging.info(
+            "event=single_sum_rewrite skipped reason=value_col_not_in_profile value_col=%s",
+            value_col,
+        )
+        return code
     id_like_cols = _id_like_columns(profile_cols, {value_col})
 
     lines = [
@@ -1012,6 +1416,49 @@ def _is_top_expensive_available_intent(question: str) -> bool:
     return has_top and (has_price or has_top) and has_entity and has_available
 
 
+def _detect_top_available_ranking_mode(question: str) -> str:
+    q = (question or "").lower()
+    if not q:
+        return "unit_price"
+    has_mul = ("×" in q) or ("*" in q) or bool(re.search(r"\b(x|mul|помнож|добут)\w*\b", q))
+    has_total_value = bool(
+        re.search(
+            r"\b(сумарн\w*|загальн\w*|total|sum|сума|підсум\w*|overall)\b.*\b(варт\w*|value|cost|цін\w*|price)\b"
+            r"|\b(варт\w*|value|cost|цін\w*|price)\b.*\b(на\s+склад\w*|in\s*stock|inventory|on\s+hand)\b",
+            q,
+            re.I,
+        )
+    )
+    return "inventory_value" if (has_mul or has_total_value) else "unit_price"
+
+
+def _code_has_inventory_value_signal(code: str) -> bool:
+    s = code or ""
+    if not s.strip():
+        return False
+    if _detect_result_sum_of_product_columns(s):
+        return True
+    if re.search(r"\['_metric'\]\s*=\s*.+\*.+", s) and re.search(r"groupby\([^\n]*\)\['_metric'\]", s):
+        return True
+    if re.search(r"nlargest\([^,\n]+,\s*['_\"](?:inventory_value|metric_sum|_metric)['\"]\)", s, re.I):
+        return True
+    return False
+
+
+def _has_explicit_group_dimension_cue(question: str) -> bool:
+    q = (question or "").lower()
+    if not q:
+        return False
+    return bool(
+        re.search(
+            r"\b(group\s*by|by\s+(?:category|categories|brand|brands|model|models|type|types|status|segment|segments|region|regions|country|city))\b"
+            r"|(?:по|за)\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*|сегмент\w*|регіон\w*|країн\w*|міст\w*)",
+            q,
+            re.I,
+        )
+    )
+
+
 def _has_ranking_cues(question: str) -> bool:
     q = (question or "").lower()
     return bool(
@@ -1055,18 +1502,48 @@ def _rewrite_top_expensive_available_code(code: str, question: str, df_profile: 
     """
     if not _is_top_expensive_available_intent(question):
         return code
+    if _has_explicit_group_dimension_cue(question):
+        logging.info(
+            "event=top_expensive_available_rewrite skipped reason=grouping_query question=%s",
+            _safe_trunc(question, 200),
+        )
+        return code
+    if _code_has_inventory_value_signal(code):
+        logging.info(
+            "event=top_expensive_available_rewrite skipped reason=existing_inventory_metric question=%s",
+            _safe_trunc(question, 200),
+        )
+        return code
     profile = df_profile or {}
     price_col = _pick_price_like_column(profile)
     qty_col = _pick_quantity_like_column(profile)
     if not price_col:
         return code
+    rank_mode = _detect_top_available_ranking_mode(question)
+    if rank_mode == "inventory_value" and (not qty_col or qty_col == price_col):
+        logging.info(
+            "event=top_expensive_available_rewrite skipped reason=inventory_mode_missing_qty price_col=%s qty_col=%s",
+            price_col,
+            qty_col,
+        )
+        return code
     cols = [str(c) for c in (profile.get("columns") or [])]
+    dtypes = (profile or {}).get("dtypes") or {}
     status_col = _pick_availability_column(question, profile) if cols else None
     top_n = _extract_top_n_from_question(question, default=5)
     explicit_status = _has_explicit_status_constraint(question)
 
     out_cols: List[str] = []
-    for c in ("ID", "Категорія", "Бренд", "Модель", price_col):
+    id_col = _pick_id_like_column(cols)
+    if id_col:
+        out_cols.append(id_col)
+    text_cols = [
+        c
+        for c in cols
+        if not _is_numeric_dtype_text(dtypes.get(c, ""))
+        and c not in {id_col, status_col, price_col}
+    ]
+    for c in [*text_cols[:3], price_col]:
         if c in cols and c not in out_cols:
             out_cols.append(c)
     if not out_cols:
@@ -1078,6 +1555,7 @@ def _rewrite_top_expensive_available_code(code: str, question: str, df_profile: 
         f"_status_col = {status_col!r}" if status_col else "_status_col = None",
         f"_top_n = {int(top_n)}",
         f"_strict_status = {bool(explicit_status)!r}",
+        f"_rank_mode = {rank_mode!r}",
         "_df_src = df.copy(deep=False)",
         "_avail = pd.Series(True, index=_df_src.index)",
         "if _qty_col and (_qty_col in _df_src.columns):",
@@ -1102,16 +1580,37 @@ def _rewrite_top_expensive_available_code(code: str, question: str, df_profile: 
         "if _price_col not in _top_df.columns:",
         "    result = []",
         "else:",
-        "    _top_df = _top_df.nlargest(_top_n, _price_col)",
-        f"    result = _top_df[{out_cols!r}]",
+        "    _price_raw = _top_df[_price_col].astype(str)",
+        r"    _price_clean = _price_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"    _price_mask = _price_clean.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "    _price = _price_clean.where(_price_mask, np.nan).astype(float)",
+        "    _top_df = _top_df.loc[_price.notna()].copy()",
+        "    _top_df[_price_col] = _price.loc[_price.notna()]",
+        "    if _rank_mode == 'inventory_value' and _qty_col and (_qty_col in _top_df.columns):",
+        "        _qraw2 = _top_df[_qty_col].astype(str)",
+        r"        _qclean2 = _qraw2.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')",
+        r"        _qmask2 = _qclean2.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')",
+        "        _qty2 = _qclean2.where(_qmask2, np.nan).astype(float)",
+        "        _top_df = _top_df.loc[_qty2.notna()].copy()",
+        "        _top_df[_qty_col] = _qty2.loc[_qty2.notna()]",
+        "        _top_df['_inventory_value'] = _top_df[_price_col] * _top_df[_qty_col]",
+        "        _top_df = _top_df.nlargest(_top_n, '_inventory_value')",
+        f"        _out_cols = [c for c in {out_cols!r} if c in _top_df.columns]",
+        "        if '_inventory_value' not in _out_cols:",
+        "            _out_cols.append('_inventory_value')",
+        "        result = _top_df[_out_cols] if _out_cols else _top_df",
+        "    else:",
+        "        _top_df = _top_df.nlargest(_top_n, _price_col)",
+        f"        result = _top_df[{out_cols!r}]",
     ]
     logging.info(
-        "event=top_expensive_available_rewrite applied top_n=%s price_col=%s qty_col=%s status_col=%s strict_status=%s",
+        "event=top_expensive_available_rewrite applied top_n=%s price_col=%s qty_col=%s status_col=%s strict_status=%s rank_mode=%s",
         top_n,
         price_col,
         qty_col,
         status_col,
         explicit_status,
+        rank_mode,
     )
     return "\n".join(lines) + ("\n" if (code or "").endswith("\n") else "")
 
@@ -1123,6 +1622,33 @@ def _is_numeric_dtype_text(dtype: str) -> bool:
 
 def _is_id_like_col_name(col: str) -> bool:
     return bool(re.search(r"(?:^|_)(id|sku|код|артикул)(?:$|_)", str(col).lower()))
+
+
+def _id_like_col_score(col: str) -> int:
+    c = str(col or "").strip().lower()
+    if not c:
+        return 0
+    score = 0
+    if c in {"id", "item_id", "record_id", "product_id"}:
+        score += 10
+    if c in {"sku", "код", "артикул"}:
+        score += 9
+    if _is_id_like_col_name(c):
+        score += 6
+    if c.endswith("_id") or c.startswith("id_"):
+        score += 3
+    return score
+
+
+def _pick_id_like_column(columns: List[str]) -> Optional[str]:
+    best_col: Optional[str] = None
+    best_score = 0
+    for col in [str(c) for c in (columns or [])]:
+        score = _id_like_col_score(col)
+        if score > best_score:
+            best_col = col
+            best_score = score
+    return best_col if best_score > 0 else None
 
 
 def _pick_price_like_column(profile: dict) -> Optional[str]:
@@ -1243,14 +1769,15 @@ def _rewrite_read_df_rebinding(code: str) -> Tuple[str, bool]:
     """
     Rewrite read-only df rebinding into a temp variable to avoid false mutation blocks.
     Example:
-      df = df[df['Категорія'] == 'X']
-      result = df['Ціна'].mean()
+      df = df[df['<filter_col>'] == 'X']
+      result = df['<metric_col>'].mean()
     ->
       _df_read = df.copy(deep=False)
-      _df_read = _df_read[_df_read['Категорія'] == 'X']
-      result = _df_read['Ціна'].mean()
+      _df_read = _df_read[_df_read['<filter_col>'] == 'X']
+      result = _df_read['<metric_col>'].mean()
     """
-    text = code or ""
+    code = _strip_llm_think_sections(code or "")
+    text = code
     if not text.strip():
         return text, False
     try:
@@ -1398,40 +1925,6 @@ _ROUTER_MUTATING_INTENT_HINTS = (
     "concat",
 )
 
-_ROUTER_FILTER_CONTEXT_RE = re.compile(
-    r"\b(серед|among|within|where|де|тільки|only|лише|having)\b"
-    r"|(?:що|які)\s+мають"
-    r"|(?:with|for)\s+[a-zа-яіїєґ0-9_]{2,}",
-    re.I,
-)
-
-_AVAILABILITY_FILTER_CUE_RE = re.compile(
-    r"\b(на\s+склад\w*|в\s+наявн\w*|наявн\w*|в\s+запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн\w*)\b",
-    re.I,
-)
-
-_ROUTER_METRIC_CUE_RE = re.compile(
-    r"\b("
-    r"max(?:imum)?|minimum|min|mean|average|avg|median|sum|total|count|"
-    r"макс\w*|мін\w*|середн\w*|сума|підсум\w*|кільк\w*|скільк\w*"
-    r")\b",
-    re.I,
-)
-
-_ROUTER_ENTITY_TOKEN_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{2,}\b")
-_GROUPING_CUE_RE = re.compile(
-    r"\b("
-    r"group\s*by|"
-    r"by\s+\w+|"
-    r"by\s+(?:category|categories|brand|brands|model|models|type|types)|"
-    r"per\s+\w+|"
-    r"по\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)|"
-    r"за\s+(?:категор\w*|бренд\w*|модел\w*|тип\w*|груп\w*)"
-    r")\b",
-    re.I,
-)
-
-
 def _is_per_item_normalization_query(question: str) -> bool:
     q = (question or "").lower()
     if not q:
@@ -1494,15 +1987,16 @@ def _question_has_filter_context_for_router_guard(question: str) -> bool:
     if _is_per_item_normalization_query(q):
         # "на один товар/позицію" is a normalization cue, not subset filtering.
         return False
-    has_metric = bool(_ROUTER_METRIC_CUE_RE.search(q))
-    has_filter_words = bool(_ROUTER_FILTER_CONTEXT_RE.search(q))
-    has_availability_cue = bool(_AVAILABILITY_FILTER_CUE_RE.search(q))
+    has_metric = has_router_metric_cue(q)
+    has_filter_words = has_router_filter_context_cue(q)
+    has_explicit_filter_words = has_explicit_subset_filter_words(q)
+    has_availability_cue = has_availability_filter_cue(q)
     has_value_filter = _looks_like_value_filter_query(q)
-    has_entity_token = bool(_ROUTER_ENTITY_TOKEN_RE.search(q))
-    has_grouping_cue = bool(_GROUPING_CUE_RE.search(q))
-    if has_grouping_cue and not (has_filter_words or has_availability_cue or has_value_filter or has_entity_token):
+    has_entity_token = has_router_entity_token(q)
+    has_grouping_signal = has_grouping_cue(q)
+    if has_grouping_signal and not (has_explicit_filter_words or has_availability_cue or has_value_filter):
         # Grouped aggregations ("by/per/по/за ...") should not be treated as subset
-        # unless we have an explicit filter signal.
+        # unless we have an explicit subset signal.
         return False
     if has_filter_words or has_availability_cue or has_value_filter or (has_metric and has_entity_token):
         return True
@@ -1537,6 +2031,8 @@ def _router_code_has_filter_ops(analysis_code: str) -> bool:
     code = analysis_code or ""
     if not code.strip():
         return False
+    if re.search(r"(?m)^\s*result\s*=\s*(?:df|_work)\s*\[", code):
+        return True
     if re.search(r"\.query\s*\(", code):
         return True
     if re.search(r"\.str\.contains\s*\(", code):
@@ -1558,19 +2054,26 @@ def _question_requires_subset_filter(question: str, profile: Optional[dict] = No
         return False
     if _is_per_item_normalization_query(q):
         return False
-    has_grouping_cue = bool(_GROUPING_CUE_RE.search(q))
-    if has_grouping_cue:
+    has_grouping_signal = has_grouping_cue(q)
+    has_explicit_filter_words = has_explicit_subset_filter_words(q)
+    has_availability_cue = has_availability_filter_cue(q)
+    has_value_filter = _looks_like_value_filter_query(q)
+    if has_grouping_signal:
         # "по категоріях/брендах" is usually a grouped aggregation over all rows,
-        # not a subset filter. Keep subset mode only when we can detect an actual entity term.
-        if not profile:
-            return False
-        try:
-            maybe_terms = _extract_subset_terms_from_question(q, profile, limit=2)
-            if not maybe_terms:
+        # not a subset filter. Keep subset mode only for explicit subset cues
+        # or when profile evidence shows an actual entity term.
+        if not (has_explicit_filter_words or has_availability_cue or has_value_filter):
+            if not profile:
                 return False
-        except Exception:
+            try:
+                maybe_terms = _extract_subset_terms_from_question(q, profile, limit=2)
+                if not maybe_terms:
+                    return False
+            except Exception:
+                return False
+        elif not profile:
             return False
-    has_metric = bool(_ROUTER_METRIC_CUE_RE.search(q))
+    has_metric = has_router_metric_cue(q)
     if not has_metric:
         return False
     if _question_has_filter_context_for_router_guard(q):
@@ -1585,6 +2088,39 @@ def _question_requires_subset_filter(question: str, profile: Optional[dict] = No
         except Exception:
             return False
     return False
+
+
+def _missing_subset_filter_guard_applies(
+    finalize_err: Optional[str],
+    question: str,
+    profile: Optional[dict] = None,
+) -> bool:
+    reason = str(finalize_err or "")
+    if "missing_subset_filter" not in reason:
+        return False
+    return _question_requires_subset_filter(question, profile)
+
+
+def _is_groupby_without_subset_question(question: str) -> bool:
+    q = (question or "").strip()
+    if not q:
+        return False
+    if not has_grouping_cue(q):
+        return False
+    if has_explicit_subset_filter_words(q):
+        return False
+    if has_availability_filter_cue(q):
+        return False
+    if _looks_like_value_filter_query(q):
+        return False
+    return True
+
+
+def _code_has_groupby_aggregation(code: str) -> bool:
+    s = code or ""
+    if not s.strip():
+        return False
+    return bool(re.search(r"\.groupby\s*\(", s))
 
 
 def _code_has_subset_filter_ops(code: str) -> bool:
@@ -1602,6 +2138,19 @@ def _code_has_subset_filter_ops(code: str) -> bool:
         return True
     if re.search(r"(?m)^\s*(?:df|_work)\s*=\s*(?:df|_work)\s*\[\s*_[A-Za-z]\w*\s*\]", s):
         return True
+    # Numeric subset filters, e.g. df[df['qty'] < 5], _work = _work[_work['price'] >= 100]
+    if re.search(
+        r"(?m)^\s*[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\[[^\n]*(?:<=|>=|<|>|==|!=)[^\n]*\]\s*$",
+        s,
+    ):
+        return True
+    if re.search(
+        r"(?m)^\s*[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\.loc\s*\[[^\n]*(?:<=|>=|<|>|==|!=)[^\n]*\]\s*$",
+        s,
+    ):
+        return True
+    if re.search(r"pd\.to_numeric\s*\([^)]+\)\s*(?:<=|>=|<|>)\s*[-+]?\d", s):
+        return True
     return False
 
 
@@ -1610,6 +2159,7 @@ def _should_reject_router_hit_for_read(
     analysis_code: str,
     router_meta: Optional[dict],
     question: str = "",
+    profile: Optional[dict] = None,
 ) -> bool:
     if has_edit:
         return False
@@ -1624,34 +2174,26 @@ def _should_reject_router_hit_for_read(
             _safe_trunc(analysis_code, 300),
         )
         return True
+    price_col = _pick_price_like_column(profile or {})
+    qty_col = _pick_quantity_like_column(profile or {})
+    if (
+        _is_total_value_scalar_question(question, profile)
+        and price_col
+        and qty_col
+        and price_col != qty_col
+        and not _code_has_inventory_value_signal(analysis_code)
+    ):
+        logging.warning(
+            "event=shortcut_router_guard status=rejected reason=missing_inventory_value_metric intent_id=%s question_preview=%s code_preview=%s",
+            intent_id,
+            _safe_trunc(question, 220),
+            _safe_trunc(analysis_code, 320),
+        )
+        return True
     if re.search(r"(?m)^\s*COMMIT_DF\s*=\s*True\s*$", analysis_code or ""):
         return True
     return _auto_detect_commit(analysis_code or "")
 
-
-_METRIC_CONTEXT_RE = re.compile(
-    r"\b(value|price|amount|total|sum|qty|count|number|rows?|records?|items?|products?|sales?|revenue|profit)\b"
-    r"|\b(значенн\w*|цін\w*|варт\w*|сум\w*|кільк\w*|рядк\w*|запис\w*|елемент\w*|товар\w*)\b",
-    re.I,
-)
-
-_METRIC_PATTERNS = {
-    "mean": r"\b(mean|average|avg|середн\w*)\b",
-    "min": r"\b(min|мін(ім(ум|ал\w*)?)?)\b|\bminimum\b(?=\s+\S+)",
-    "max": r"\b(max|макс(имум|имал\w*)?)\b|\bmaximum\b(?=\s+\S+)",
-    "sum": r"\b(sum|сума|підсум\w*)\b",
-    "median": r"\b(median|медіан\w*)\b",
-}
-
-_COUNT_CONTEXT_RE = re.compile(
-    r"\b(items?|products?|rows?|records?|entries|values?|brands?|categories|orders?|customers?)\b"
-    r"|\b(товар\w*|рядк\w*|запис\w*|елемент\w*|бренд\w*|категор\w*|замовлен\w*|клієнт\w*)\b",
-    re.I,
-)
-
-_COUNT_WORD_RE = re.compile(r"\b(count|кільк\w*)\b", re.I)
-_COUNT_NUMBER_OF_RE = re.compile(r"\bnumber\s+of\s+([a-z]+)\b", re.I)
-_COUNT_QTY_RE = re.compile(r"\bqty\b", re.I)
 
 def _detect_metrics(question: str) -> List[str]:
     q = (question or "").lower()
@@ -1924,6 +2466,37 @@ def _subset_term_pattern(term: str) -> str:
     return r"\b" + re.escape(root) + r"\w*"
 
 
+def _extract_numeric_threshold_condition(text: str) -> Optional[Tuple[str, float]]:
+    s = (text or "").strip().lower()
+    if not s:
+        return None
+
+    symbol = re.search(r"(<=|>=|<|>)\s*(-?\d+(?:[.,]\d+)?)", s)
+    if symbol:
+        raw = symbol.group(2).replace(",", ".")
+        try:
+            return symbol.group(1), float(raw)
+        except Exception:
+            return None
+
+    patterns = [
+        (r"\b(?:не\s+більше|no\s+more\s+than|at\s+most)\s*(-?\d+(?:[.,]\d+)?)", "<="),
+        (r"\b(?:не\s+менше|no\s+less\s+than|at\s+least)\s*(-?\d+(?:[.,]\d+)?)", ">="),
+        (r"\b(?:менше|less\s+than|below|under)\s*(-?\d+(?:[.,]\d+)?)", "<"),
+        (r"\b(?:більше|more\s+than|above|over)\s*(-?\d+(?:[.,]\d+)?)", ">"),
+    ]
+    for pat, op in patterns:
+        m = re.search(pat, s, re.I)
+        if not m:
+            continue
+        raw = m.group(1).replace(",", ".")
+        try:
+            return op, float(raw)
+        except Exception:
+            return None
+    return None
+
+
 def _subset_keyword_metric_shortcut_code(
     question: str,
     profile: dict,
@@ -1975,17 +2548,19 @@ def _subset_keyword_metric_shortcut_code(
     llm_metric_col = str((slots_hint or {}).get("metric_col") or "").strip()
     llm_avail_mode = str((slots_hint or {}).get("availability_mode") or "").strip().lower()
     llm_avail_col = str((slots_hint or {}).get("availability_col") or "").strip()
+    numeric_threshold = _extract_numeric_threshold_condition(question)
 
     metric_order = ["count", "max", "min", "mean", "median", "sum"]
     metric = next((m for m in metric_order if m in metrics), "count")
     if llm_agg in {"count", "sum", "mean", "min", "max", "median"}:
         metric = llm_agg
     # Disambiguate "загальна кількість ... на складі": sum stock units, not row count.
-    if metric == "count" and qty_like_col and (_is_sum_intent(question) or availability_mode):
+    # But keep row-count when query has explicit numeric threshold (e.g. "< 5").
+    if metric == "count" and qty_like_col and (_is_sum_intent(question) or availability_mode) and not numeric_threshold:
         metric = "sum"
-    if llm_avail_mode in {"in", "out", "any"}:
+    if has_availability_cue and llm_avail_mode in {"in", "out", "any"}:
         availability_mode = llm_avail_mode
-    if availability_mode and llm_avail_col in columns:
+    if has_availability_cue and availability_mode and llm_avail_col in columns:
         availability_col = llm_avail_col
 
     metric_col: Optional[str] = None
@@ -2003,26 +2578,159 @@ def _subset_keyword_metric_shortcut_code(
         if not metric_col:
             return None
 
-    patterns = [p for p in (_subset_term_pattern(t) for t in terms) if p]
-    if not patterns:
+    if numeric_threshold and qty_like_col:
+        terms = [
+            t
+            for t in terms
+            if not re.search(r"\d", str(t))
+            and not re.search(r"(менше|більше|less|more|lower|above|below|under|over)", str(t), re.I)
+        ]
+
+    patterns: List[str] = []
+    for p in (_subset_term_pattern(t) for t in terms):
+        if p and p not in patterns:
+            patterns.append(p)
+    if not patterns and not (numeric_threshold and qty_like_col):
         return None
 
-    code_lines: List[str] = [
-        "_work = df.copy(deep=False)",
-        f"_text_cols = {text_cols!r}",
-        "if not _text_cols:",
-        "    _text_cols = list(_work.columns)",
-        "_text = _work[_text_cols].fillna('').astype(str).apply(' '.join, axis=1).str.lower()",
-        f"_patterns = {patterns!r}",
-        "_mask_and = pd.Series(True, index=_work.index)",
-        "for _pat in _patterns:",
-        "    _mask_and = _mask_and & _text.str.contains(_pat, regex=True, na=False)",
-        "_mask_or = pd.Series(False, index=_work.index)",
-        "for _pat in _patterns:",
-        "    _mask_or = _mask_or | _text.str.contains(_pat, regex=True, na=False)",
-        "_mask = _mask_and if _mask_and.any() else _mask_or",
-        "_work = _work.loc[_mask].copy()",
-    ]
+    preview_rows = [r for r in ((profile or {}).get("preview") or []) if isinstance(r, dict)]
+
+    def _preview_match_count(col: str, pat: str) -> int:
+        if not preview_rows:
+            return 0
+        cnt = 0
+        for row in preview_rows:
+            val = str(row.get(col, "") or "").lower()
+            if val and re.search(pat, val, re.I):
+                cnt += 1
+        return cnt
+
+    structured_filters: List[Tuple[str, str]] = []
+    unresolved_patterns: List[str] = []
+    for pat in patterns:
+        scored: List[Tuple[int, str]] = []
+        for col in text_cols:
+            cnt = _preview_match_count(col, pat)
+            if cnt > 0:
+                scored.append((cnt, col))
+        if not scored:
+            unresolved_patterns.append(pat)
+            continue
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_cnt, best_col = scored[0]
+        second_cnt = scored[1][0] if len(scored) > 1 else -1
+        # Avoid hard assignment when column signal is weak/ambiguous on sparse previews.
+        # Weak matches should be resolved later across all text columns to prevent false-zero counts.
+        if best_cnt <= 1 or (second_cnt == best_cnt and best_cnt <= 2):
+            unresolved_patterns.append(pat)
+            continue
+        structured_filters.append((best_col, pat))
+
+    use_structured = bool(structured_filters)
+    code_lines: List[str] = ["_work = df.copy(deep=False)"]
+    if numeric_threshold and qty_like_col:
+        op_sym, threshold = numeric_threshold
+        code_lines.extend(
+            [
+                f"_qty_col = {qty_like_col!r}",
+                "if _qty_col in _work.columns:",
+                f"    _q = pd.to_numeric(_work[_qty_col], errors='coerce')",
+                f"    _work = _work.loc[_q {op_sym} {threshold!r}].copy()",
+            ]
+        )
+        if patterns:
+            code_lines.append(f"_patterns = {patterns!r}")
+            code_lines.extend(
+                [
+                    f"_text_cols = {text_cols!r}",
+                    "if not _text_cols:",
+                    "    _text_cols = list(_work.columns)",
+                    "_mask = pd.Series(True, index=_work.index)",
+                    "for _pat in _patterns:",
+                    "    _mask_pat = pd.Series(False, index=_work.index)",
+                    "    for _c in _text_cols:",
+                    "        if _c in _work.columns:",
+                    "            _s = _work[_c].astype(str).str.lower()",
+                    "            _mask_pat = _mask_pat | _s.str.contains(_pat, regex=True, na=False)",
+                    "    _mask = _mask & _mask_pat",
+                    "_work = _work.loc[_mask].copy()",
+                ]
+            )
+    elif use_structured:
+        grouped_filters: Dict[str, List[str]] = {}
+        for col, pat in structured_filters:
+            grouped_filters.setdefault(col, []).append(pat)
+        code_lines.append(f"_all_patterns = {patterns!r}")
+        code_lines.append(f"_all_text_cols = {text_cols!r}")
+        code_lines.append(f"_structured_filters = {grouped_filters!r}")
+        code_lines.extend(
+            [
+                "for _col, _pats in _structured_filters.items():",
+                "    if _col not in _work.columns:",
+                "        _work = _work.iloc[0:0].copy()",
+                "        break",
+                "    _series = _work[_col].astype(str).str.lower()",
+                "    _mask_col = pd.Series(False, index=_work.index)",
+                "    for _pat in _pats:",
+                "        _mask_col = _mask_col | _series.str.contains(_pat, regex=True, na=False)",
+                "    _work = _work.loc[_mask_col].copy()",
+            ]
+        )
+        if unresolved_patterns:
+            # For unresolved terms use broad OR matching across text columns
+            # to avoid over-constraining with uncertain column assignment.
+            code_lines.extend(
+                [
+                    f"_unresolved_patterns = {unresolved_patterns!r}",
+                    f"_text_cols = {text_cols!r}",
+                    "if not _text_cols:",
+                    "    _text_cols = list(_work.columns)",
+                    "_mask_unresolved = pd.Series(False, index=_work.index)",
+                    "for _pat in _unresolved_patterns:",
+                    "    _mask_pat = pd.Series(False, index=_work.index)",
+                    "    for _c in _text_cols:",
+                    "        if _c in _work.columns:",
+                    "            _s = _work[_c].astype(str).str.lower()",
+                    "            _mask_pat = _mask_pat | _s.str.contains(_pat, regex=True, na=False)",
+                    "    _mask_unresolved = _mask_unresolved | _mask_pat",
+                    "_work = _work.loc[_mask_unresolved].copy()",
+                ]
+            )
+        code_lines.extend(
+            [
+                "if len(_work) == 0 and _all_patterns:",
+                "    _work_fb = df.copy(deep=False)",
+                "    _cols_fb = [c for c in _all_text_cols if c in _work_fb.columns]",
+                "    if not _cols_fb:",
+                "        _cols_fb = list(_work_fb.columns)",
+                "    _mask_fb = pd.Series(True, index=_work_fb.index)",
+                "    for _pat in _all_patterns:",
+                "        _mask_pat = pd.Series(False, index=_work_fb.index)",
+                "        for _c in _cols_fb:",
+                "            _s = _work_fb[_c].astype(str).str.lower()",
+                "            _mask_pat = _mask_pat | _s.str.contains(_pat, regex=True, na=False)",
+                "        _mask_fb = _mask_fb & _mask_pat",
+                "    _work = _work_fb.loc[_mask_fb].copy()",
+            ]
+        )
+    else:
+        code_lines.extend(
+            [
+                f"_text_cols = {text_cols!r}",
+                "if not _text_cols:",
+                "    _text_cols = list(_work.columns)",
+                f"_patterns = {patterns!r}",
+                "_mask = pd.Series(True, index=_work.index)",
+                "for _pat in _patterns:",
+                "    _mask_pat = pd.Series(False, index=_work.index)",
+                "    for _c in _text_cols:",
+                "        if _c in _work.columns:",
+                "            _s = _work[_c].astype(str).str.lower()",
+                "            _mask_pat = _mask_pat | _s.str.contains(_pat, regex=True, na=False)",
+                "    _mask = _mask & _mask_pat",
+                "_work = _work.loc[_mask].copy()",
+            ]
+        )
     if availability_mode:
         code_lines.extend(
             [
@@ -2287,6 +2995,7 @@ def _finalize_code_for_sandbox(
     commit_df: Optional[bool]=None,
     df_profile: Optional[dict]=None,
 ) -> Tuple[str, bool, Optional[str]]:
+    analysis_code = _strip_llm_think_sections(analysis_code or "")
     code = _normalize_generated_code(analysis_code or "")
     inferred = _infer_op_from_question(question)
     op_norm = (op or "").strip().lower()
@@ -2298,6 +3007,18 @@ def _finalize_code_for_sandbox(
         and not _has_edit_triggers(question)
         and _question_requires_subset_filter(question, df_profile)
     )
+    if (
+        requires_subset_filter
+        and _is_groupby_without_subset_question(question)
+        and _code_has_groupby_aggregation(code)
+        and not _code_has_subset_filter_ops(code)
+    ):
+        logging.info(
+            "event=subset_guard_override reason=groupby_without_subset question_preview=%s code_preview=%s",
+            _safe_trunc(question, 200),
+            _safe_trunc(code, 300),
+        )
+        requires_subset_filter = False
     if requires_subset_filter and not _code_has_subset_filter_ops(code):
         logging.warning(
             "event=skip_rewrites reason=subset_filter_missing question_preview=%s code_preview=%s",
@@ -2478,7 +3199,12 @@ def _validate_edit_code(code: str) -> Tuple[str, Optional[str]]:
     return code, "Edit code must assign back to df or use inplace=True"
 
 def _enforce_count_code(question: str, code: str) -> Tuple[str, Optional[str]]:
-    if not _is_count_intent(question) or _is_sum_intent(question):
+    if (
+        not _is_count_intent(question)
+        or _is_sum_intent(question)
+        or _has_product_sum_intent(question)
+        or re.search(r"=\s*_left\s*\*\s*_right", code or "")
+    ):
         return code, None
     if re.search(r"\.sum\s*\(\s*\)", code or ""):
         lines: List[str] = []
@@ -2578,7 +3304,7 @@ def _match_column_by_index(text: str, columns: List[str]) -> Optional[str]:
 
 
 def _column_mention_pos(text: str, column_name: str) -> int:
-    """Return first mention position of a column name, avoiding short-token false positives like ID in NVIDIA."""
+    """Return first mention position of a column name, avoiding short-token false positives inside larger tokens."""
     if not text or not column_name:
         return -1
     hay = str(text)
@@ -3026,7 +3752,10 @@ def _template_shortcut_code(
         code_lines.append("    else:")
         code_lines.append("        result = int(df.loc[_in & ~_out].shape[0])")
         code_lines.append("else:")
-        code_lines.append("    _row_text = df.fillna('').astype(str).apply(' '.join, axis=1).str.lower()")
+        code_lines.append("    _row_text = pd.Series('', index=df.index, dtype='object')")
+        code_lines.append("    for _c in df.columns:")
+        code_lines.append("        _row_text = _row_text + ' ' + df[_c].fillna('').astype(str)")
+        code_lines.append("    _row_text = _row_text.str.lower()")
         code_lines.append("    _in_row = _row_text.str.contains(_pos_re, regex=True, na=False)")
         code_lines.append("    _out_row = _row_text.str.contains(_neg_re, regex=True, na=False)")
         code_lines.append("    if _mode == 'out':")
@@ -3049,7 +3778,7 @@ def _template_shortcut_code(
             plan = f"Показати значення клітинки в рядку {row_idx}, колонці {col}."
             return "\n".join(code_lines) + "\n", plan
 
-    # Read-only robust extractor for "value in row N": try row position first, then fallback to ID=N.
+    # Read-only robust extractor for "value in row N": try row position first, then fallback to identifier=N.
     if (
         not _has_edit_triggers(q)
         and re.search(r"\b(покажи|показати|show|яка|який|яке|which|what|значенн\w*)\b", q_low)
@@ -3611,23 +4340,28 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
     columns=(profile or {}).get("columns") or []
     if not columns: return None
 
-    # Edit by ID: "зміни ... для ID 1003 на ..."
+    # Edit by identifier column (e.g., ID/SKU/код/артикул): "зміни ... для ідентифікатора 1003 на ..."
     if _has_edit_triggers(q):
-        m_id = re.search(r"\bID\s*[:=]?\s*(\d+)\b", q, re.I)
+        m_id = re.search(r"\b(?:id|sku|код|артикул)\s*[:=]?\s*([A-Za-zА-Яа-яІіЇїЄєҐґ0-9._\-]+)\b", q, re.I)
         if m_id:
-            item_id = int(m_id.group(1))
+            item_id = (m_id.group(1) or "").strip()
             col = _find_column_in_text(q, columns)
             raw_value = _parse_set_value(q)
             value = _parse_literal(raw_value) if raw_value is not None else None
-            if col and value is not None and str(col).lower() != "id":
+            id_col = _pick_id_like_column([str(c) for c in columns])
+            if col and value is not None and id_col and str(col) != str(id_col):
                 code_lines: List[str] = []
                 code_lines.append("df = df.copy()")
-                code_lines.append(f"_id = {item_id}")
-                code_lines.append("if 'ID' in df.columns:")
+                code_lines.append(f"_id = {item_id!r}")
+                code_lines.append(f"_id_column = {id_col!r}")
+                code_lines.append("if _id_column in df.columns:")
                 code_lines.append("    _id_target = str(_id).strip()")
-                code_lines.append("    _id_col = df['ID'].astype(str).str.strip()")
+                code_lines.append("    _id_target_norm = _id_target")
+                code_lines.append("    while _id_target_norm.endswith('.0'):")
+                code_lines.append("        _id_target_norm = _id_target_norm[:-2]")
+                code_lines.append("    _id_col = df[_id_column].astype(str).str.strip()")
                 code_lines.append("    _id_col_norm = _id_col.str.replace(r'\\.0+$', '', regex=True)")
-                code_lines.append("    _mask = (_id_col == _id_target) | (_id_col_norm == _id_target)")
+                code_lines.append("    _mask = (_id_col == _id_target) | (_id_col_norm == _id_target_norm)")
                 code_lines.append("    if _mask.any():")
                 code_lines.append(f"        df.loc[_mask, {col!r}] = {value!r}")
                 code_lines.append("        COMMIT_DF = True")
@@ -3636,7 +4370,7 @@ def _edit_shortcut_code(question: str, profile: dict) -> Optional[Tuple[str, str
                 code_lines.append("        result = {'status': 'not_found', 'id': _id}")
                 code_lines.append("else:")
                 code_lines.append("    result = {'status': 'no_id_column'}")
-                plan = f"Змінити {col} для ID {item_id}."
+                plan = f"Змінити {col} для запису з ідентифікатором {item_id}."
                 return "\n".join(code_lines) + "\n", plan
 
     is_add_row=bool(re.search(r"\b(додай|додати|add)\b.*\b(рядок|row)\b", q_low))
@@ -3906,10 +4640,19 @@ def _status_message(event: str, payload: Optional[dict]) -> str:
         return "Генерую план та код аналізу."
     if event == "codegen_shortcut":
         return "Використовую швидкий режим для генерації коду."
+    if event == "codegen_rlm_tool":
+        phase = str((payload or {}).get("phase") or "").strip()
+        if phase == "runtime_error":
+            return "Повторно генерую код за помилкою виконання (RLM-tool)."
+        if phase == "core_repl":
+            return "Запускаю рекурсивний RLM-REPL цикл для виправлення коду."
+        return "Генерую код через RLM-tool і перевіряю обмеження."
     if event == "codegen_retry":
         reason = str((payload or {}).get("reason") or "").strip()
         if reason == "missing_subset_filter":
             return "Повторно генерую код: додам обов'язкову фільтрацію підмножини."
+        if reason == "subset_guard_conflict_non_subset":
+            return "Повторно генерую код: subset-фільтр не потрібен, залишаю агрегацію по всій таблиці."
         if reason == "read_mutation":
             return "Повторно генерую код: прибираю модифікації таблиці для read-запиту."
         if reason == "runtime_keyerror_import":
@@ -3963,8 +4706,31 @@ class Pipeline(object):
         base_llm_base_url: str = Field(
             default=os.getenv("BASE_LLM_BASE_URL", "https://ai-gateway-test.noone.pw/v1")
         )
-        base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", "sk-bf-59dc5727-7e10-4d29-a28e-cf7d655f595c"))
-        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "vllm-8099/minimax-m2n"))
+        base_llm_api_key: str = Field(default=os.getenv("BASE_LLM_API_KEY", "sk-bf-91983094-c759-4f74-b765-b794731b47ca"))
+        base_llm_model: str = Field(default=os.getenv("BASE_LLM_MODEL", "qwen3-coder-next"))
+        base_llm_timeout_s: int = Field(default=_env_int("BASE_LLM_TIMEOUT_S", 45), ge=1)
+        base_llm_max_retries: int = Field(default=_env_int("BASE_LLM_MAX_RETRIES", 1), ge=0)
+        llm_json_max_tokens: int = Field(default=_env_int("LLM_JSON_MAX_TOKENS", 256), ge=64)
+        rlm_codegen_enabled: bool = Field(
+            default=os.getenv("RLM_CODEGEN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        rlm_primary_planner_enabled: bool = Field(
+            default=os.getenv("RLM_PRIMARY_PLANNER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        rlm_codegen_max_turns: int = Field(default=_env_int("RLM_CODEGEN_MAX_TURNS", 2), ge=1)
+        rlm_codegen_max_tokens: int = Field(default=_env_int("RLM_CODEGEN_MAX_TOKENS", 700), ge=128)
+        rlm_codegen_runtime_retry_enabled: bool = Field(
+            default=os.getenv("RLM_CODEGEN_RUNTIME_RETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        rlm_core_repl_enabled: bool = Field(
+            default=os.getenv("RLM_CORE_REPL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        rlm_core_repl_max_iterations: int = Field(
+            default=_env_int("RLM_CORE_REPL_MAX_ITERATIONS", 2),
+            ge=1,
+        )
+        rlm_core_repl_max_tokens: int = Field(default=_env_int("RLM_CORE_REPL_MAX_TOKENS", 700), ge=128)
+        final_answer_max_tokens: int = Field(default=_env_int("FINAL_ANSWER_MAX_TOKENS", 384), ge=64)
 
         sandbox_url: str = Field(default=os.getenv("SANDBOX_URL", "http://sandbox:8081"))
         sandbox_api_key: str = Field(default=os.getenv("SANDBOX_API_KEY", ""))
@@ -3974,9 +4740,28 @@ class Pipeline(object):
         max_cell_chars: int = Field(default=_env_int("PIPELINE_MAX_CELL_CHARS", 200), ge=10)
         code_timeout_s: int = Field(default=_env_int("PIPELINE_CODE_TIMEOUT_S", 120), ge=1)
         max_stdout_chars: int = Field(default=_env_int("PIPELINE_MAX_STDOUT_CHARS", 8000), ge=1000)
+        answer_table_max_rows: int = Field(default=_env_int("ANSWER_TABLE_MAX_ROWS", 0), ge=0)
+        answer_list_max_items: int = Field(default=_env_int("ANSWER_LIST_MAX_ITEMS", 30), ge=1)
+        answer_pairs_max_rows: int = Field(default=_env_int("ANSWER_PAIRS_MAX_ROWS", 0), ge=0)
 
         session_cache_ttl_s: int = Field(default=_env_int("PIPELINE_SESSION_CACHE_TTL_S", 1800), ge=60)
         wait_tick_s: int = Field(default=_env_int("PIPELINE_WAIT_TICK_S", 5), ge=0)
+        route_trace_enabled: bool = Field(
+            default=os.getenv("ROUTE_TRACE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        route_trace_sink_url: str = Field(default=os.getenv("ROUTE_TRACE_SINK_URL", ""))
+        route_trace_sink_api_key: str = Field(default=os.getenv("ROUTE_TRACE_SINK_API_KEY", ""))
+        route_trace_public_url: str = Field(
+            default=os.getenv("ROUTE_TRACE_PUBLIC_URL", "http://localhost:8081/v1/traces/dashboard")
+        )
+        route_trace_include_link: bool = Field(
+            default=os.getenv("ROUTE_TRACE_INCLUDE_LINK", "true").lower() in ("1", "true", "yes", "on")
+        )
+        route_trace_max_payload_chars: int = Field(
+            default=_env_int("ROUTE_TRACE_MAX_PAYLOAD_CHARS", 4000),
+            ge=256,
+        )
+        route_trace_local_path: str = Field(default=os.getenv("ROUTE_TRACE_LOCAL_PATH", ""))
         spreadsheet_skill_runtime_enabled: bool = Field(
             default=os.getenv("SPREADSHEET_SKILL_RUNTIME_ENABLED", "true").lower() in ("1", "true", "yes", "on")
         )
@@ -4002,6 +4787,106 @@ class Pipeline(object):
         shortcut_top_k: int = Field(default=_env_int("SHORTCUT_TOP_K", 5), ge=1)
         shortcut_threshold: float = Field(default=float(os.getenv("SHORTCUT_THRESHOLD", "0.35")))
         shortcut_margin: float = Field(default=float(os.getenv("SHORTCUT_MARGIN", "0.05")))
+        shortcut_llm_intent_min_confidence: float = Field(
+            default=float(os.getenv("SHORTCUT_LLM_INTENT_MIN_CONFIDENCE", "0.45"))
+        )
+        shortcut_llm_intent_max_candidates: int = Field(
+            default=_env_int("SHORTCUT_LLM_INTENT_MAX_CANDIDATES", 8),
+            ge=1,
+        )
+        shortcut_query_ir_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        shortcut_query_ir_llm_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_LLM_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        shortcut_query_ir_require_hard_coverage: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_REQUIRE_HARD_COVERAGE", "true").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_query_ir_block_soft_promotion: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_BLOCK_SOFT_PROMOTION", "true").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_query_ir_llm_verify_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_LLM_VERIFY_ENABLED", "false").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_query_ir_llm_verify_fail_open: bool = Field(
+            default=os.getenv("SHORTCUT_QUERY_IR_LLM_VERIFY_FAIL_OPEN", "true").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_learning_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_LEARNING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        shortcut_learning_pending_path: str = Field(
+            default=os.getenv(
+                "SHORTCUT_LEARNING_PENDING_PATH",
+                "pipelines/shortcut_router/learning/pending_success_queries.jsonl",
+            )
+        )
+        shortcut_learning_min_support: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_MIN_SUPPORT", 2),
+            ge=2,
+        )
+        shortcut_learning_consistency_ratio: float = Field(
+            default=float(os.getenv("SHORTCUT_LEARNING_CONSISTENCY_RATIO", "0.8"))
+        )
+        shortcut_learning_max_pending: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_MAX_PENDING", 4000),
+            ge=100,
+        )
+        shortcut_learning_max_code_chars: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_MAX_CODE_CHARS", 1600),
+            ge=200,
+        )
+        shortcut_learning_max_examples_per_intent: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_MAX_EXAMPLES_PER_INTENT", 300),
+            ge=20,
+        )
+        shortcut_learning_max_cases_per_intent: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_MAX_CASES_PER_INTENT", 200),
+            ge=10,
+        )
+        shortcut_learning_promote_every: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_PROMOTE_EVERY", 1),
+            ge=1,
+        )
+        shortcut_learning_llm_judge_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_LEARNING_LLM_JUDGE_ENABLED", "false").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_learning_llm_judge_min_score: float = Field(
+            default=float(os.getenv("SHORTCUT_LEARNING_LLM_JUDGE_MIN_SCORE", "0.90"))
+        )
+        shortcut_learning_llm_judge_promote_min_score: float = Field(
+            default=float(os.getenv("SHORTCUT_LEARNING_LLM_JUDGE_PROMOTE_MIN_SCORE", "0.90"))
+        )
+        shortcut_learning_llm_judge_fail_open: bool = Field(
+            default=os.getenv("SHORTCUT_LEARNING_LLM_JUDGE_FAIL_OPEN", "true").lower()
+            in ("1", "true", "yes", "on")
+        )
+        shortcut_learning_llm_judge_max_result_chars: int = Field(
+            default=_env_int("SHORTCUT_LEARNING_LLM_JUDGE_MAX_RESULT_CHARS", 1200),
+            ge=200,
+        )
+        shortcut_debug_trace_enabled: bool = Field(
+            default=os.getenv("SHORTCUT_DEBUG_TRACE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+        )
+        shortcut_debug_trace_path: str = Field(
+            default=os.getenv(
+                "SHORTCUT_DEBUG_TRACE_PATH",
+                "pipelines/shortcut_router/learning/debug_trace.jsonl",
+            )
+        )
+        shortcut_debug_trace_max_rows: int = Field(
+            default=_env_int("SHORTCUT_DEBUG_TRACE_MAX_ROWS", 2000),
+            ge=100,
+        )
+        shortcut_debug_trace_max_text_chars: int = Field(
+            default=_env_int("SHORTCUT_DEBUG_TRACE_MAX_TEXT_CHARS", 6000),
+            ge=500,
+        )
 
         vllm_base_url: str = Field(
             default=os.getenv(
@@ -4025,7 +4910,10 @@ class Pipeline(object):
         if not any(isinstance(f, _RequestTraceLoggingFilter) for f in root_logger.filters):
             root_logger.addFilter(_RequestTraceLoggingFilter())
         self._llm = OpenAI(
-            base_url=self.valves.base_llm_base_url, api_key=self.valves.base_llm_api_key or "DUMMY_KEY"
+            base_url=self.valves.base_llm_base_url,
+            api_key=self.valves.base_llm_api_key or "DUMMY_KEY",
+            timeout=float(self.valves.base_llm_timeout_s),
+            max_retries=int(self.valves.base_llm_max_retries),
         )
         logging.info(
             "event=shortcut_paths enabled=%s catalog_path=%s index_path=%s meta_path=%s "
@@ -4050,6 +4938,9 @@ class Pipeline(object):
         self._prompts = _read_prompts(PROMPTS_PATH)
         self._skill_prompt_cache: Dict[str, Dict[str, str]] = {}
         self._skill_prompt_lock = threading.Lock()
+        self._learning_lock = threading.Lock()
+        self._shortcut_debug_trace_lock = threading.Lock()
+        self._learning_record_count = 0
         router_cfg = ShortcutRouterConfig(
             catalog_path=self.valves.shortcut_catalog_path,
             index_path=self.valves.shortcut_index_path,
@@ -4057,11 +4948,19 @@ class Pipeline(object):
             top_k=self.valves.shortcut_top_k,
             threshold=float(self.valves.shortcut_threshold),
             margin=float(self.valves.shortcut_margin),
+            llm_intent_min_confidence=float(self.valves.shortcut_llm_intent_min_confidence),
+            llm_intent_max_candidates=int(self.valves.shortcut_llm_intent_max_candidates),
             vllm_base_url=self.valves.vllm_base_url,
             vllm_embed_model=self.valves.vllm_embed_model,
             vllm_api_key=self.valves.vllm_api_key,
             vllm_timeout_s=self.valves.vllm_timeout_s,
             enabled=bool(self.valves.shortcut_enabled),
+            query_ir_enabled=bool(self.valves.shortcut_query_ir_enabled),
+            query_ir_llm_enabled=bool(self.valves.shortcut_query_ir_llm_enabled),
+            query_ir_require_hard_coverage=bool(self.valves.shortcut_query_ir_require_hard_coverage),
+            query_ir_block_soft_promotion=bool(self.valves.shortcut_query_ir_block_soft_promotion),
+            query_ir_llm_verify_enabled=bool(self.valves.shortcut_query_ir_llm_verify_enabled),
+            query_ir_llm_verify_fail_open=bool(self.valves.shortcut_query_ir_llm_verify_fail_open),
         )
         self._shortcut_router = ShortcutRouter(router_cfg, llm_json=self._llm_json)
 
@@ -4080,57 +4979,234 @@ class Pipeline(object):
             headers["Authorization"] = f"Bearer {self.valves.sandbox_api_key}"
         return headers
 
+    def _route_trace_sink_url(self) -> str:
+        configured = str(self.valves.route_trace_sink_url or "").strip()
+        if configured:
+            return configured
+        return f"{self.valves.sandbox_url.rstrip('/')}/v1/traces/upsert"
+
+    def _new_route_tracer(self, request_id: str, trace_id: str, mode: str) -> Optional[RouteTracer]:
+        if not bool(self.valves.route_trace_enabled):
+            return None
+        try:
+            return RouteTracer(
+                request_id=request_id,
+                trace_id=trace_id,
+                sink_url=self._route_trace_sink_url(),
+                sink_api_key=str(self.valves.route_trace_sink_api_key or self.valves.sandbox_api_key or "").strip(),
+                max_payload_chars=int(self.valves.route_trace_max_payload_chars),
+                persist_path=str(self.valves.route_trace_local_path or "").strip(),
+                meta={
+                    "mode": mode,
+                    "pipeline_id": self.valves.id,
+                    "pipeline_name": self.valves.name,
+                    "model": self.valves.base_llm_model,
+                },
+            )
+        except Exception as exc:
+            logging.warning("event=route_trace_init_failed error=%s", _safe_trunc(str(exc), 200))
+            return None
+
+    def _build_route_trace_url(self, trace_id: str, request_id: str) -> str:
+        base = str(self.valves.route_trace_public_url or "").strip()
+        if not base:
+            return ""
+        sep = "&" if "?" in base else "?"
+        return f"{base}{sep}trace_id={trace_id}&request_id={request_id}"
+
+    def _append_route_trace_link(self, text: str, trace_id: str, request_id: str) -> str:
+        # User-facing answers should not include internal trace links.
+        if not (text or "").strip():
+            return text
+        cleaned = re.sub(
+            r"\n*\s*View route trace:\s*https?://\S+\s*",
+            "",
+            text or "",
+            flags=re.I,
+        )
+        return cleaned.rstrip()
+
     def _sandbox_get_profile(self, df_id: str) -> Optional[dict]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="sandbox_get_profile",
+                stage_name="Sandbox Profile Refresh",
+                purpose="Refresh DataFrame profile for a cached sandbox dataframe id.",
+                input_payload={"df_id": df_id},
+                processing_summary="Call sandbox /v1/dataframe/{df_id}/profile endpoint.",
+            )
         url = f"{self.valves.sandbox_url.rstrip('/')}/v1/dataframe/{df_id}/profile"
         try:
             resp = requests.get(url, headers=self._sandbox_headers(), timeout=10)
             if resp.status_code != 200:
+                if tracer and stage_id:
+                    tracer.end_stage(
+                        stage_id,
+                        status="warn",
+                        output_payload={"status_code": resp.status_code},
+                        processing_summary="Sandbox profile endpoint returned non-200 status.",
+                    )
                 return None
             payload = resp.json()
-        except Exception:
+        except Exception as exc:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="warn",
+                    output_payload={},
+                    processing_summary="Failed to refresh sandbox profile.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
             return None
-        return payload.get("profile") or {}
+        profile = payload.get("profile") or {}
+        if tracer and stage_id:
+            tracer.end_stage(
+                stage_id,
+                status="ok",
+                output_payload={"profile": profile},
+                processing_summary="Sandbox profile refreshed from active dataframe.",
+            )
+        return profile
 
     def _fetch_file_meta(self, file_id: str, file_obj: Optional[dict]) -> dict:
-        if isinstance(file_obj, dict):
-            if (
-                file_obj.get("filename")
-                or file_obj.get("content_type")
-                or file_obj.get("name")
-                or file_obj.get("path")
-            ):
-                return file_obj
-        url = f"{self.valves.webui_base_url.rstrip('/')}/api/v1/files/{file_id}"
-        resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
-        resp.raise_for_status()
-        if resp.headers.get("content-type", "").startswith("application/json"):
-            return resp.json()
-        return {"raw": resp.text}
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="file_meta_fetch",
+                stage_name="File Metadata Fetch",
+                purpose="Resolve file metadata used for downstream sandbox load.",
+                input_payload={"file_id": file_id, "file_obj": file_obj or {}},
+                processing_summary="Read metadata from current payload or OpenWebUI file API.",
+            )
+        try:
+            if isinstance(file_obj, dict):
+                if (
+                    file_obj.get("filename")
+                    or file_obj.get("content_type")
+                    or file_obj.get("name")
+                    or file_obj.get("path")
+                ):
+                    if tracer and stage_id:
+                        tracer.end_stage(
+                            stage_id,
+                            status="ok",
+                            output_payload={"meta_source": "request_file_obj", "meta": file_obj},
+                            processing_summary="Metadata resolved directly from request payload.",
+                        )
+                    return file_obj
+            url = f"{self.valves.webui_base_url.rstrip('/')}/api/v1/files/{file_id}"
+            resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
+            resp.raise_for_status()
+            if resp.headers.get("content-type", "").startswith("application/json"):
+                meta = resp.json()
+                if tracer and stage_id:
+                    tracer.end_stage(
+                        stage_id,
+                        status="ok",
+                        output_payload={"meta_source": "webui_api", "meta": meta},
+                        processing_summary="Metadata fetched from OpenWebUI JSON endpoint.",
+                    )
+                return meta
+            raw_meta = {"raw": resp.text}
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="warn",
+                    output_payload={"meta_source": "webui_api_text", "meta": raw_meta},
+                    processing_summary="Metadata endpoint returned non-JSON payload.",
+                )
+            return raw_meta
+        except Exception as exc:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="error",
+                    output_payload={},
+                    processing_summary="Failed to fetch file metadata.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
 
     def _fetch_file_bytes(self, file_id: str, meta: dict, file_obj: Optional[dict]) -> bytes:
-        if isinstance(file_obj, dict):
-            b64 = file_obj.get("data_b64") or file_obj.get("data") or file_obj.get("content_b64")
-            if b64:
-                return base64.b64decode(b64)
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="file_bytes_fetch",
+                stage_name="File Bytes Fetch",
+                purpose="Retrieve uploaded file bytes for sandbox ingestion.",
+                input_payload={"file_id": file_id, "meta": meta or {}, "file_obj": file_obj or {}},
+                processing_summary="Resolve bytes from inline base64, URL, path, or OpenWebUI content endpoint.",
+            )
+        try:
+            if isinstance(file_obj, dict):
+                b64 = file_obj.get("data_b64") or file_obj.get("data") or file_obj.get("content_b64")
+                if b64:
+                    payload = base64.b64decode(b64)
+                    if tracer and stage_id:
+                        tracer.end_stage(
+                            stage_id,
+                            status="ok",
+                            output_payload={"bytes_len": len(payload), "source": "inline_base64"},
+                            processing_summary="File bytes decoded from inline base64 payload.",
+                        )
+                    return payload
 
-            url = file_obj.get("url") or file_obj.get("content_url")
-            if url:
-                if url.startswith("/"):
-                    url = f"{self.valves.webui_base_url.rstrip('/')}{url}"
-                resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
-                resp.raise_for_status()
-                return resp.content
+                url = file_obj.get("url") or file_obj.get("content_url")
+                if url:
+                    if url.startswith("/"):
+                        url = f"{self.valves.webui_base_url.rstrip('/')}{url}"
+                    resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
+                    resp.raise_for_status()
+                    payload = resp.content
+                    if tracer and stage_id:
+                        tracer.end_stage(
+                            stage_id,
+                            status="ok",
+                            output_payload={"bytes_len": len(payload), "source": "content_url"},
+                            processing_summary="File bytes downloaded from content URL.",
+                        )
+                    return payload
 
-            path = file_obj.get("path") or file_obj.get("filepath") or file_obj.get("file_path")
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    return f.read()
+                path = file_obj.get("path") or file_obj.get("filepath") or file_obj.get("file_path")
+                if path and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        payload = f.read()
+                    if tracer and stage_id:
+                        tracer.end_stage(
+                            stage_id,
+                            status="ok",
+                            output_payload={"bytes_len": len(payload), "source": "local_path"},
+                            processing_summary="File bytes loaded from filesystem path reference.",
+                        )
+                    return payload
 
-        base = self.valves.webui_base_url.rstrip("/")
-        url = f"{base}/api/v1/files/{file_id}/content"
-        resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
-        resp.raise_for_status()
-        return resp.content
+            base = self.valves.webui_base_url.rstrip("/")
+            url = f"{base}/api/v1/files/{file_id}/content"
+            resp = requests.get(url, headers=self._webui_headers(), timeout=DEF_TIMEOUT_S)
+            resp.raise_for_status()
+            payload = resp.content
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="ok",
+                    output_payload={"bytes_len": len(payload), "source": "webui_content_api"},
+                    processing_summary="File bytes downloaded from OpenWebUI content endpoint.",
+                )
+            return payload
+        except Exception as exc:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="error",
+                    output_payload={},
+                    processing_summary="Failed to fetch file bytes.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
 
     def _session_get(self, key: str) -> Optional[Dict[str, Any]]:
         entry = self._session_cache.get(key)
@@ -4159,6 +5235,582 @@ class Pipeline(object):
         self.valves.max_rows = new_max
         if self.valves.preview_rows > new_max:
             self.valves.preview_rows = new_max
+
+    def _intent_from_plan(self, plan: str) -> Optional[str]:
+        m = re.search(r"\bretrieval_intent:([A-Za-z0-9_.:-]+)\b", str(plan or ""))
+        if not m:
+            return None
+        intent_id = str(m.group(1) or "").strip()
+        return intent_id or None
+
+    def _selector_mode_from_plan(self, plan: str) -> str:
+        m = re.search(r"\bselector_mode:([A-Za-z0-9_.:-]+)\b", str(plan or ""))
+        if not m:
+            return ""
+        return str(m.group(1) or "").strip().lower()
+
+    def _result_non_empty(self, result_text: str, result_meta: Dict[str, Any]) -> bool:
+        if str(result_text or "").strip():
+            return True
+        rows = (result_meta or {}).get("rows")
+        if isinstance(rows, int):
+            return rows > 0
+        return False
+
+    def _coerce_unit_score(self, value: Any) -> Optional[float]:
+        try:
+            score = float(value)
+        except Exception:
+            return None
+        if score != score:  # NaN guard
+            return None
+        return max(0.0, min(1.0, score))
+
+    def _median_score(self, values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        items = sorted(float(v) for v in values)
+        n = len(items)
+        mid = n // 2
+        if n % 2 == 1:
+            return float(items[mid])
+        return float((items[mid - 1] + items[mid]) / 2.0)
+
+    def _llm_judge_learning_candidate(
+        self,
+        *,
+        question: str,
+        intent_id: str,
+        analysis_code: str,
+        result_text: str,
+        result_meta: Dict[str, Any],
+    ) -> Tuple[Optional[float], str, str]:
+        """
+        Returns: (score, reason, status_code)
+        status_code in {"disabled","ok","invalid","error"}.
+        """
+        if not bool(self.valves.shortcut_learning_llm_judge_enabled):
+            return None, "llm_judge_disabled", "disabled"
+
+        max_result_chars = int(self.valves.shortcut_learning_llm_judge_max_result_chars)
+        system = (
+            "You are judging whether generated pandas analysis code matches the spreadsheet user intent. "
+            "Return ONLY JSON: "
+            "{\"score\": 0..1, \"reason\": \"<short_reason>\", \"decision\": \"accept|reject\"}. "
+            "Score near 1.0 only when constraints and intent are preserved with high confidence."
+        )
+        payload = {
+            "question": _normalize_query_text(question or ""),
+            "intent_id": str(intent_id or ""),
+            "analysis_code": _safe_trunc(str(analysis_code or ""), int(self.valves.shortcut_learning_max_code_chars)),
+            "result_text_preview": _safe_trunc(str(result_text or ""), max_result_chars),
+            "result_meta": result_meta or {},
+        }
+        try:
+            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
+        except Exception as exc:
+            return None, f"llm_judge_error:{_safe_trunc(str(exc), 120)}", "error"
+        if not isinstance(parsed, dict):
+            return None, "llm_judge_invalid_response", "invalid"
+        score = self._coerce_unit_score(parsed.get("score"))
+        reason = str(parsed.get("reason") or "").strip() or "llm_judge_no_reason"
+        if score is None:
+            return None, reason, "invalid"
+        return score, reason, "ok"
+
+    def _json_safe(self, value: Any) -> Any:
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except Exception:
+            return _safe_trunc(str(value), 1200)
+
+    def _record_llm_call_stat(self, item: Dict[str, Any]) -> None:
+        stats = _LLM_CALL_STATS_CTX.get()
+        if stats is None:
+            return
+        stats.append(self._json_safe(item))
+
+    def _llm_call_usage_summary(self) -> Dict[str, Any]:
+        calls = _LLM_CALL_STATS_CTX.get() or []
+        total_prompt_tokens = 0
+        total_completion_tokens = 0
+        total_tokens = 0
+        total_latency_ms = 0.0
+        has_prompt = False
+        has_completion = False
+        has_total = False
+
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            p = _safe_int(call.get("prompt_tokens"))
+            c = _safe_int(call.get("completion_tokens"))
+            t = _safe_int(call.get("total_tokens"))
+            lat = call.get("latency_ms")
+
+            if p is not None:
+                total_prompt_tokens += p
+                has_prompt = True
+            if c is not None:
+                total_completion_tokens += c
+                has_completion = True
+            if t is not None:
+                total_tokens += t
+                has_total = True
+            else:
+                if p is not None and c is not None:
+                    total_tokens += p + c
+                    has_total = True
+            try:
+                if lat is not None:
+                    total_latency_ms += float(lat)
+            except Exception:
+                pass
+
+        return {
+            "calls_count": len(calls),
+            "prompt_tokens": total_prompt_tokens if has_prompt else None,
+            "completion_tokens": total_completion_tokens if has_completion else None,
+            "total_tokens": total_tokens if has_total else None,
+            "total_latency_ms": round(total_latency_ms, 3) if calls else None,
+            "calls": calls[-20:],
+        }
+
+    def _maybe_record_shortcut_debug_trace(
+        self,
+        *,
+        mode: str,
+        question: str,
+        router_meta: Optional[Dict[str, Any]],
+        analysis_code: str,
+        run_status: str,
+        result_text: str,
+        result_meta: Dict[str, Any],
+        final_answer: str,
+        error: str = "",
+        learning_meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if not bool(self.valves.shortcut_debug_trace_enabled):
+            return
+        path = str(self.valves.shortcut_debug_trace_path or "").strip()
+        if not path:
+            return
+
+        text_limit = int(self.valves.shortcut_debug_trace_max_text_chars)
+        meta = router_meta if isinstance(router_meta, dict) else {}
+        learning = learning_meta if isinstance(learning_meta, dict) else {}
+        llm_usage = self._llm_call_usage_summary()
+        retrieval_candidates = meta.get("retrieval_candidates")
+        if isinstance(retrieval_candidates, list):
+            retrieval_candidates = retrieval_candidates[:12]
+        else:
+            retrieval_candidates = []
+        entry = {
+            "ts": int(time.time()),
+            "request_id": _REQUEST_ID_CTX.get(),
+            "trace_id": _TRACE_ID_CTX.get(),
+            "mode": str(mode or ""),
+            "question": _normalize_query_text(question or ""),
+            "intent_id": str(meta.get("intent_id") or ""),
+            "selector_mode": str(meta.get("selector_mode") or ""),
+            "score": meta.get("score"),
+            "selector_confidence": meta.get("selector_confidence"),
+            "retrieval_query_used": str(meta.get("retrieval_query_used") or ""),
+            "normalized_query": str(meta.get("normalized_query") or ""),
+            "retrieval_threshold": meta.get("retrieval_threshold"),
+            "retrieval_margin": meta.get("retrieval_margin"),
+            "retrieval_candidate_count": meta.get("retrieval_candidate_count"),
+            "retrieval_top_score": meta.get("retrieval_top_score"),
+            "retrieval_second_score": meta.get("retrieval_second_score"),
+            "retrieval_candidates": self._json_safe(retrieval_candidates),
+            "query_ir": self._json_safe(meta.get("query_ir") or {}),
+            "query_ir_summary": self._json_safe(meta.get("query_ir_summary") or {}),
+            "slots": self._json_safe(meta.get("slots") or {}),
+            "result_rows": (result_meta or {}).get("rows"),
+            "run_status": str(run_status or ""),
+            "error": _safe_trunc(str(error or ""), max(200, text_limit // 2)),
+            "analysis_code": _safe_trunc(str(analysis_code or ""), text_limit),
+            "result_text": _safe_trunc(str(result_text or ""), text_limit),
+            "final_answer": _safe_trunc(str(final_answer or ""), text_limit),
+            "llm_judge_enabled": bool(learning.get("llm_judge_enabled", False)),
+            "llm_judge_status": str(learning.get("llm_judge_status") or ""),
+            "llm_judge_score": learning.get("llm_judge_score"),
+            "llm_judge_reason": _safe_trunc(str(learning.get("llm_judge_reason") or ""), 300),
+            "learning_recorded": bool(learning.get("learning_recorded", False)),
+            "llm_calls_count": llm_usage.get("calls_count"),
+            "llm_prompt_tokens": llm_usage.get("prompt_tokens"),
+            "llm_completion_tokens": llm_usage.get("completion_tokens"),
+            "llm_total_tokens": llm_usage.get("total_tokens"),
+            "llm_total_latency_ms": llm_usage.get("total_latency_ms"),
+            "llm_calls": self._json_safe(llm_usage.get("calls") or []),
+        }
+        try:
+            with self._shortcut_debug_trace_lock:
+                rows = _read_jsonl(path)
+                rows.append(entry)
+                max_rows = int(self.valves.shortcut_debug_trace_max_rows)
+                if len(rows) > max_rows:
+                    rows = rows[-max_rows:]
+                _atomic_write_jsonl(path, rows)
+        except Exception as exc:
+            logging.warning("event=shortcut_debug_trace_record_failed error=%s", _safe_trunc(str(exc), 300))
+
+    def _catalog_has_query(self, catalog: Dict[str, Any], query_norm: str) -> bool:
+        if not query_norm:
+            return False
+        for intent in (catalog.get("intents") or []):
+            for ex in (intent.get("examples") or []):
+                if _normalize_learning_query(str(ex or "")) == query_norm:
+                    return True
+            for case in (intent.get("learned_cases") or []):
+                if not isinstance(case, dict):
+                    continue
+                if _normalize_learning_query(str(case.get("query") or "")) == query_norm:
+                    return True
+        return False
+
+    def _append_index_row_for_learned_query(self, intent_id: str, query: str) -> bool:
+        try:
+            if not self._shortcut_router._ensure_loaded():
+                return False
+            index = getattr(self._shortcut_router, "_index", None)
+            meta = getattr(self._shortcut_router, "_meta", None)
+            if index is None or not isinstance(meta, dict):
+                return False
+            rows = meta.get("rows")
+            if not isinstance(rows, list):
+                rows = []
+                meta["rows"] = rows
+
+            q_norm = _normalize_learning_query(query)
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if (
+                    str(row.get("intent_id") or "").strip() == intent_id
+                    and _normalize_learning_query(str(row.get("text") or "")) == q_norm
+                ):
+                    return True
+
+            vec = self._shortcut_router._embed_query(query)
+            if vec is None:
+                return False
+            index.add(vec)
+            rows.append({"intent_id": intent_id, "text": query})
+
+            # Persist index and meta atomically.
+            import faiss  # type: ignore
+
+            os.makedirs(os.path.dirname(self.valves.shortcut_index_path) or ".", exist_ok=True)
+            faiss.write_index(index, self.valves.shortcut_index_path)
+            _atomic_write_json(self.valves.shortcut_meta_path, meta)
+            return True
+        except Exception as exc:
+            logging.warning("event=learning_index_append_failed error=%s", _safe_trunc(str(exc), 300))
+            return False
+
+    def _promote_success_learning_locked(self) -> Dict[str, Any]:
+        pending_path = str(self.valves.shortcut_learning_pending_path or "").strip()
+        if not pending_path:
+            return {"promoted": 0}
+        pending_rows = _read_jsonl(pending_path)
+        if not pending_rows:
+            return {"promoted": 0}
+
+        catalog_path = str(self.valves.shortcut_catalog_path or "").strip()
+        catalog = _read_json_or_default(catalog_path, {})
+        intents = catalog.get("intents") or []
+        if not isinstance(intents, list) or not intents:
+            return {"promoted": 0}
+        intent_map: Dict[str, Dict[str, Any]] = {
+            str(i.get("id") or "").strip(): i for i in intents if isinstance(i, dict) and i.get("id")
+        }
+
+        min_support = int(self.valves.shortcut_learning_min_support)
+        consistency_ratio = float(self.valves.shortcut_learning_consistency_ratio)
+        max_examples = int(self.valves.shortcut_learning_max_examples_per_intent)
+        max_cases = int(self.valves.shortcut_learning_max_cases_per_intent)
+        judge_enabled = bool(self.valves.shortcut_learning_llm_judge_enabled)
+        judge_fail_open = bool(self.valves.shortcut_learning_llm_judge_fail_open)
+        judge_promote_min_score = self._coerce_unit_score(self.valves.shortcut_learning_llm_judge_promote_min_score)
+        if judge_promote_min_score is None:
+            judge_promote_min_score = 0.90
+
+        grouped: Dict[Tuple[str, str], List[Tuple[int, dict]]] = {}
+        for idx, row in enumerate(pending_rows):
+            if not isinstance(row, dict):
+                continue
+            intent_id = str(row.get("intent_id") or "").strip()
+            query_norm = str(row.get("query_norm") or "").strip()
+            if not intent_id or not query_norm:
+                continue
+            grouped.setdefault((intent_id, query_norm), []).append((idx, row))
+
+        processed_indexes: set[int] = set()
+        promoted: List[Tuple[str, str, dict, List[int], Dict[str, Any]]] = []
+
+        for (intent_id, query_norm), items in grouped.items():
+            if len(items) < min_support:
+                continue
+            intent = intent_map.get(intent_id)
+            if not intent:
+                continue
+
+            non_empty_count = sum(1 for _, row in items if bool(row.get("result_non_empty")))
+            if non_empty_count < min_support:
+                continue
+
+            code_counts: Dict[str, int] = {}
+            for _, row in items:
+                code_hash = str(row.get("code_hash") or "").strip()
+                if not code_hash:
+                    continue
+                code_counts[code_hash] = code_counts.get(code_hash, 0) + 1
+            if not code_counts:
+                continue
+            dominant_hash, dominant_count = max(code_counts.items(), key=lambda kv: kv[1])
+            ratio = float(dominant_count) / float(len(items))
+            if ratio < consistency_ratio:
+                continue
+
+            selected_rows = [row for _, row in items if str(row.get("code_hash") or "").strip() == dominant_hash]
+            if not selected_rows:
+                continue
+
+            judge_scores: List[float] = []
+            for row in selected_rows:
+                score = self._coerce_unit_score(row.get("llm_judge_score"))
+                if score is not None:
+                    judge_scores.append(score)
+            judge_median = self._median_score(judge_scores)
+            if judge_enabled:
+                if not judge_scores and not judge_fail_open:
+                    continue
+                if judge_median is not None and judge_median < judge_promote_min_score:
+                    continue
+
+            chosen = selected_rows[-1]
+            query_text = _normalize_query_text(str(chosen.get("query") or ""))
+            query_text = re.sub(r"^\*{1,3}\s*(.*?)\s*\*{1,3}$", r"\1", query_text)
+            query_text = query_text.strip()
+            if not query_text:
+                continue
+
+            if self._catalog_has_query(catalog, query_norm):
+                for idx, _ in items:
+                    processed_indexes.add(idx)
+                continue
+
+            promoted.append(
+                (
+                    intent_id,
+                    query_text,
+                    chosen,
+                    [idx for idx, _ in items],
+                    {
+                        "llm_judge_enabled": judge_enabled,
+                        "llm_judge_count": len(judge_scores),
+                        "llm_judge_median": judge_median,
+                        "llm_judge_min": min(judge_scores) if judge_scores else None,
+                        "llm_judge_max": max(judge_scores) if judge_scores else None,
+                        "llm_judge_promote_threshold": judge_promote_min_score,
+                    },
+                )
+            )
+
+        if not promoted:
+            if len(pending_rows) > int(self.valves.shortcut_learning_max_pending):
+                pending_rows = pending_rows[-int(self.valves.shortcut_learning_max_pending) :]
+                _atomic_write_jsonl(pending_path, pending_rows)
+            return {"promoted": 0}
+
+        promoted_count = 0
+        indexed_count = 0
+        for intent_id, query_text, chosen, item_indexes, judge_stats in promoted:
+            intent = intent_map.get(intent_id)
+            if not intent:
+                continue
+            examples = intent.get("examples")
+            if not isinstance(examples, list):
+                examples = []
+                intent["examples"] = examples
+            examples.append(query_text)
+            if len(examples) > max_examples:
+                intent["examples"] = examples[-max_examples:]
+
+            learned_cases = intent.get("learned_cases")
+            if not isinstance(learned_cases, list):
+                learned_cases = []
+                intent["learned_cases"] = learned_cases
+            learned_cases.append(
+                {
+                    "query": query_text,
+                    "code": _safe_trunc(str(chosen.get("analysis_code") or ""), int(self.valves.shortcut_learning_max_code_chars)),
+                    "code_hash": str(chosen.get("code_hash") or ""),
+                    "support": int(len(item_indexes)),
+                    "result_non_empty_support": int(len(item_indexes)),
+                    "promoted_at": int(time.time()),
+                    "source": "auto_success_learning",
+                    "llm_judge": judge_stats,
+                }
+            )
+            if len(learned_cases) > max_cases:
+                intent["learned_cases"] = learned_cases[-max_cases:]
+
+            for idx in item_indexes:
+                processed_indexes.add(idx)
+
+            promoted_count += 1
+            if self._append_index_row_for_learned_query(intent_id, query_text):
+                indexed_count += 1
+
+        _atomic_write_json(catalog_path, catalog)
+
+        remaining = [row for i, row in enumerate(pending_rows) if i not in processed_indexes]
+        if len(remaining) > int(self.valves.shortcut_learning_max_pending):
+            remaining = remaining[-int(self.valves.shortcut_learning_max_pending) :]
+        _atomic_write_jsonl(pending_path, remaining)
+
+        return {"promoted": promoted_count, "indexed": indexed_count}
+
+    def _maybe_record_success_learning(
+        self,
+        *,
+        question: str,
+        plan: str,
+        analysis_code: str,
+        run_status: str,
+        edit_expected: bool,
+        result_text: str,
+        result_meta: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        learning_meta: Dict[str, Any] = {
+            "llm_judge_enabled": bool(self.valves.shortcut_learning_llm_judge_enabled),
+            "llm_judge_status": "skipped",
+            "llm_judge_score": None,
+            "llm_judge_reason": "",
+            "learning_recorded": False,
+        }
+        if not bool(self.valves.shortcut_learning_enabled):
+            learning_meta["llm_judge_reason"] = "learning_disabled"
+            return learning_meta
+        if run_status != "ok" or edit_expected:
+            learning_meta["llm_judge_reason"] = "not_ok_or_edit_expected"
+            return learning_meta
+        intent_id = self._intent_from_plan(plan)
+        if not intent_id:
+            learning_meta["llm_judge_reason"] = "intent_not_detected"
+            return learning_meta
+        selector_mode = self._selector_mode_from_plan(plan)
+        if selector_mode and selector_mode not in {"retrieval", "retrieval_guarded"}:
+            learning_meta["llm_judge_reason"] = f"selector_mode_blocked:{selector_mode}"
+            return learning_meta
+        query = _normalize_query_text(question or "")
+        query = re.sub(r"^\*{1,3}\s*(.*?)\s*\*{1,3}$", r"\1", query).strip()
+        query_norm = _normalize_learning_query(query)
+        if not query_norm:
+            learning_meta["llm_judge_reason"] = "query_norm_empty"
+            return learning_meta
+        if _has_forbidden_import_nodes(analysis_code):
+            learning_meta["llm_judge_reason"] = "forbidden_import"
+            return learning_meta
+
+        judge_score: Optional[float] = None
+        judge_reason = "llm_judge_disabled"
+        judge_status = "disabled"
+        judge_min_score = self._coerce_unit_score(self.valves.shortcut_learning_llm_judge_min_score)
+        if judge_min_score is None:
+            judge_min_score = 0.90
+        judge_fail_open = bool(self.valves.shortcut_learning_llm_judge_fail_open)
+
+        if bool(self.valves.shortcut_learning_llm_judge_enabled):
+            judge_score, judge_reason, judge_status = self._llm_judge_learning_candidate(
+                question=question,
+                intent_id=intent_id,
+                analysis_code=analysis_code,
+                result_text=result_text,
+                result_meta=result_meta or {},
+            )
+            if judge_score is None:
+                if not judge_fail_open:
+                    logging.info(
+                        "event=learning_record_skipped reason=llm_judge_unavailable fail_open=false intent_id=%s judge_status=%s judge_reason=%s",
+                        intent_id,
+                        judge_status,
+                        _safe_trunc(judge_reason, 160),
+                    )
+                    learning_meta["llm_judge_status"] = judge_status
+                    learning_meta["llm_judge_score"] = judge_score
+                    learning_meta["llm_judge_reason"] = judge_reason
+                    return learning_meta
+            elif judge_score < judge_min_score:
+                logging.info(
+                    "event=learning_record_skipped reason=llm_judge_low_score intent_id=%s score=%.3f threshold=%.3f judge_reason=%s",
+                    intent_id,
+                    judge_score,
+                    judge_min_score,
+                    _safe_trunc(judge_reason, 160),
+                )
+                learning_meta["llm_judge_status"] = judge_status
+                learning_meta["llm_judge_score"] = judge_score
+                learning_meta["llm_judge_reason"] = judge_reason
+                return learning_meta
+
+        entry = {
+            "ts": int(time.time()),
+            "request_id": _REQUEST_ID_CTX.get(),
+            "trace_id": _TRACE_ID_CTX.get(),
+            "intent_id": intent_id,
+            "query": query,
+            "query_norm": query_norm,
+            "analysis_code": _safe_trunc(str(analysis_code or ""), int(self.valves.shortcut_learning_max_code_chars)),
+            "code_hash": hashlib.sha256((analysis_code or "").encode("utf-8")).hexdigest()[:20],
+            "result_non_empty": self._result_non_empty(result_text, result_meta or {}),
+            "support": 1,
+            "result_non_empty_support": 1 if self._result_non_empty(result_text, result_meta or {}) else 0,
+            "llm_judge_enabled": bool(self.valves.shortcut_learning_llm_judge_enabled),
+            "llm_judge_status": judge_status,
+            "llm_judge_score": judge_score,
+            "llm_judge_reason": _safe_trunc(judge_reason, 300),
+        }
+
+        pending_path = str(self.valves.shortcut_learning_pending_path or "").strip()
+        if not pending_path:
+            learning_meta["llm_judge_status"] = judge_status
+            learning_meta["llm_judge_score"] = judge_score
+            learning_meta["llm_judge_reason"] = judge_reason
+            return learning_meta
+
+        try:
+            with self._learning_lock:
+                pending_rows = _read_jsonl(pending_path)
+                pending_rows.append(entry)
+                if len(pending_rows) > int(self.valves.shortcut_learning_max_pending):
+                    pending_rows = pending_rows[-int(self.valves.shortcut_learning_max_pending) :]
+                _atomic_write_jsonl(pending_path, pending_rows)
+
+                self._learning_record_count += 1
+                promote_every = int(self.valves.shortcut_learning_promote_every)
+                if promote_every <= 1 or (self._learning_record_count % promote_every == 0):
+                    promote_res = self._promote_success_learning_locked()
+                    if int(promote_res.get("promoted") or 0) > 0:
+                        logging.info(
+                            "event=learning_promote_success promoted=%s indexed=%s",
+                            int(promote_res.get("promoted") or 0),
+                            int(promote_res.get("indexed") or 0),
+                        )
+        except Exception as exc:
+            logging.warning("event=learning_record_failed error=%s", _safe_trunc(str(exc), 300))
+            learning_meta["llm_judge_status"] = judge_status
+            learning_meta["llm_judge_score"] = judge_score
+            learning_meta["llm_judge_reason"] = f"{judge_reason};record_failed:{_safe_trunc(str(exc), 120)}"
+            return learning_meta
+
+        learning_meta["llm_judge_status"] = judge_status
+        learning_meta["llm_judge_score"] = judge_score
+        learning_meta["llm_judge_reason"] = judge_reason
+        learning_meta["learning_recorded"] = True
+        return learning_meta
 
     def _spreadsheet_skill_file_paths(self, focus: str = "plan") -> List[Tuple[str, str]]:
         skill_dir = str(self.valves.spreadsheet_skill_dir or "").strip()
@@ -4317,25 +5969,214 @@ class Pipeline(object):
         return f"{system}\n\n{header}\n\n{skill_context}"
 
     def _llm_json(self, system: str, user: str) -> dict:
-        skill_injected = _SPREADSHEET_SKILL_PROMPT_MARKER in (system or "")
+        json_only_guard = (
+            "STRICT JSON MODE.\n"
+            "You are a backend formatting component.\n\n"
+            "You must output exactly one JSON object and nothing else.\n"
+            "The first character must be {.\n"
+            "The last character must be }.\n\n"
+            "Forbidden:\n"
+            "- any explanation\n"
+            "- any reasoning\n"
+            "- any markdown\n"
+            "- any code fences\n"
+            "- any comments\n"
+            "- any prefix or suffix text\n"
+            "- any labels like \"Answer\", \"JSON\", \"Result\"\n"
+            "- any extra keys not in schema\n\n"
+            "If unsure, output a valid JSON object with empty values allowed by schema.\n"
+            "Never ask questions.\n"
+            "Never refuse.\n"
+            "Never describe the schema.\n"
+            "Never echo the user query."
+        )
+        guarded_system = f"{json_only_guard}\n\n{system or ''}".strip()
+        user_keys: List[str] = []
+        user_size = 0
+        try:
+            user_size = len((user or "").encode("utf-8", errors="ignore"))
+        except Exception:
+            user_size = len(str(user or ""))
+        try:
+            user_obj = json.loads(user or "{}")
+            if isinstance(user_obj, dict):
+                user_keys = [str(k) for k in list(user_obj.keys())[:80]]
+        except Exception:
+            user_keys = []
+
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="llm_json_call",
+                stage_name="LLM Structured JSON Call",
+                purpose="Send system/user messages to base model and parse strict JSON object output.",
+                input_payload={
+                    "model": self.valves.base_llm_model,
+                    "temperature": 0,
+                    "system_chars": len(guarded_system or ""),
+                    "user_chars": len(user or ""),
+                    "user_size_bytes": user_size,
+                    "user_keys": user_keys,
+                },
+                processing_summary="Call chat.completions with deterministic settings and parse JSON payload.",
+                details={
+                    "llm": {
+                        "model": self.valves.base_llm_model,
+                        "temperature": 0,
+                        "messages": [
+                            {"role": "system", "chars": len(guarded_system or ""), "content_preview": _safe_trunc(guarded_system, 1200)},
+                            {"role": "user", "chars": len(user or ""), "content_preview": _safe_trunc(user, 1200)},
+                        ],
+                    }
+                },
+            )
+        skill_injected = _SPREADSHEET_SKILL_PROMPT_MARKER in (guarded_system or "")
         logging.info(
             "event=llm_json_skill_injection active=%s prompt_hash=%s",
             skill_injected,
-            hashlib.sha256((system or "").encode("utf-8")).hexdigest()[:16],
+            hashlib.sha256((guarded_system or "").encode("utf-8")).hexdigest()[:16],
         )
         logging.info(
             "event=llm_json_request system_preview=%s user_preview=%s",
-            _safe_trunc(system, 800),
+            _safe_trunc(guarded_system, 800),
             _safe_trunc(user, 1200),
         )
-        resp = self._llm.chat.completions.create(
-            model=self.valves.base_llm_model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0,
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        logging.info("event=llm_json_response preview=%s", _safe_trunc(text, 1200))
-        return _parse_json_dict_from_llm(text)
+        def _chat_json_completion(messages: List[Dict[str, str]], max_tokens: int, force_json_mode: bool = False):
+            kwargs: Dict[str, Any] = {
+                "model": self.valves.base_llm_model,
+                "messages": messages,
+                "temperature": 0,
+                "max_tokens": int(max_tokens),
+            }
+            if force_json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            try:
+                return self._llm.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if not force_json_mode:
+                    raise
+                err = str(exc).lower()
+                if not any(token in err for token in ("response_format", "json_object", "unsupported")):
+                    raise
+                logging.info(
+                    "event=llm_json_response_format_fallback reason=unsupported_json_mode model=%s",
+                    self.valves.base_llm_model,
+                )
+                kwargs.pop("response_format", None)
+                return self._llm.chat.completions.create(**kwargs)
+
+        raw_text = ""
+        started = time.monotonic()
+        est_prompt_tokens = len(re.findall(r"\S+", f"{guarded_system or ''}\n{user or ''}"))
+        try:
+            messages = [{"role": "system", "content": guarded_system}, {"role": "user", "content": user}]
+            resp = _chat_json_completion(
+                messages=messages,
+                max_tokens=int(self.valves.llm_json_max_tokens),
+                force_json_mode=True,
+            )
+            raw_text = (resp.choices[0].message.content or "").strip()
+            try:
+                parsed = _parse_json_dict_from_llm(raw_text)
+            except Exception as first_parse_exc:
+                logging.warning(
+                    "event=llm_json_parse_retry reason=first_parse_failed error=%s raw_preview=%s",
+                    str(first_parse_exc),
+                    _safe_trunc(raw_text, 800),
+                )
+                retry_guard = (
+                    "STRICT JSON RETRY MODE. "
+                    "Output exactly one minified JSON object. "
+                    "No prose, no markdown, no explanations, no <think>, no extra keys, no prefix/suffix."
+                )
+                retry_messages = [
+                    {"role": "system", "content": f"{retry_guard}\n\n{guarded_system}"},
+                    {"role": "user", "content": user},
+                ]
+                resp = _chat_json_completion(
+                    messages=retry_messages,
+                    max_tokens=max(int(self.valves.llm_json_max_tokens), 384),
+                    force_json_mode=True,
+                )
+                raw_text = (resp.choices[0].message.content or "").strip()
+                parsed = _parse_json_dict_from_llm(raw_text)
+            latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+            usage = _extract_llm_usage(resp)
+            est_completion_tokens = len(re.findall(r"\S+", raw_text or ""))
+            self._record_llm_call_stat(
+                {
+                    "status": "ok",
+                    "model": self.valves.base_llm_model,
+                    "latency_ms": latency_ms,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "total_tokens": usage.get("total_tokens"),
+                    "prompt_tokens_estimate": est_prompt_tokens,
+                    "completion_tokens_estimate": est_completion_tokens,
+                    "user_keys": user_keys[:20],
+                }
+            )
+            logging.info("event=llm_json_response preview=%s", _safe_trunc(parsed, 1200))
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="ok",
+                    output_payload={"parsed": parsed},
+                    processing_summary="LLM returned JSON and parser accepted object schema.",
+                    details={
+                        "llm": {
+                            "model": self.valves.base_llm_model,
+                            "temperature": 0,
+                            "latency_ms": latency_ms,
+                            "usage": usage,
+                            "raw_response": _safe_trunc(raw_text, 4000),
+                            "parsed_output": parsed,
+                        }
+                    },
+                )
+            return parsed
+        except Exception as exc:
+            latency_ms = round((time.monotonic() - started) * 1000.0, 3)
+            est_completion_tokens = len(re.findall(r"\S+", raw_text or ""))
+            self._record_llm_call_stat(
+                {
+                    "status": "error",
+                    "model": self.valves.base_llm_model,
+                    "latency_ms": latency_ms,
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "total_tokens": None,
+                    "prompt_tokens_estimate": est_prompt_tokens,
+                    "completion_tokens_estimate": est_completion_tokens,
+                    "user_keys": user_keys[:20],
+                    "error_type": type(exc).__name__,
+                }
+            )
+            if raw_text:
+                logging.warning("event=llm_json_non_json_response preview=%s", _safe_trunc(raw_text, 1200))
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="error",
+                    output_payload={"raw_response_preview": _safe_trunc(raw_text, 1200)},
+                    processing_summary="LLM call or JSON parsing failed.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                    details={
+                        "llm": {
+                            "model": self.valves.base_llm_model,
+                            "temperature": 0,
+                            "raw_response": _safe_trunc(raw_text, 4000),
+                            "parse_error": str(exc),
+                        }
+                    },
+                )
+            logging.warning(
+                "event=llm_json_fail_open error_type=%s error=%s",
+                type(exc).__name__,
+                str(exc),
+            )
+            return {}
 
     def _plan_code(
         self,
@@ -4349,7 +6190,7 @@ class Pipeline(object):
             profile,
             focus="plan",
         )
-        payload_obj: Dict[str, Any] = {"question": question, "df_profile": profile}
+        payload_obj: Dict[str, Any] = {"question": question, "schema": _compact_profile_for_llm(profile)}
         if isinstance(lookup_hints, dict) and lookup_hints:
             system += (
                 " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
@@ -4365,6 +6206,80 @@ class Pipeline(object):
             (parsed.get("op") or "read"),
             commit_df if isinstance(commit_df, bool) else None,
         )
+
+    def _plan_code_with_rlm_tool(
+        self,
+        question: str,
+        profile: dict,
+        lookup_hints: Optional[Dict[str, Any]] = None,
+        retry_reason: str = "",
+        previous_code: str = "",
+        runtime_error: str = "",
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        if not bool(self.valves.rlm_codegen_enabled):
+            return "", "", "read", None
+
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("rlm_codegen_system", DEFAULT_RLM_CODEGEN_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
+        op_guess = _infer_op_from_question(question)
+        commit_guess: Optional[bool] = True if op_guess == "edit" else False
+
+        def _validator(code: str) -> Tuple[str, bool, Optional[str]]:
+            normalized = _strip_llm_think_sections(textwrap.dedent(str(code or "")).strip())
+            if not normalized:
+                return "", False, "empty_or_non_code_output"
+            if _has_forbidden_import_nodes(normalized):
+                return normalized, False, "forbidden_import_detected"
+            if op_guess != "edit" and not _has_result_assignment(normalized):
+                return normalized, False, "missing_result_assignment"
+            return normalized, bool(op_guess == "edit"), None
+
+        core = RLMCore(
+            system_prompt=system,
+            lm_handler_factory=lambda: LMHandler(
+                openai_client=self._llm,
+                model=self.valves.base_llm_model,
+                host="127.0.0.1",
+                port=0,
+                temperature=0.0,
+            ),
+            code_extractor=_extract_analysis_code_from_llm_no_think,
+            code_validator=_validator,
+            max_iterations=int(self.valves.rlm_codegen_max_turns),
+            max_tokens=int(self.valves.rlm_codegen_max_tokens),
+            fallback_enabled=False,
+        )
+        payload_obj: Dict[str, Any] = {
+            "question": question,
+            "schema": _compact_profile_for_llm(profile),
+            "op_hint": op_guess,
+        }
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            payload_obj["lookup_hints"] = lookup_hints
+        if retry_reason:
+            payload_obj["retry_reason"] = retry_reason
+        if previous_code:
+            payload_obj["previous_code"] = _safe_trunc(previous_code, 3000)
+        if runtime_error:
+            payload_obj["previous_error"] = _safe_trunc(runtime_error, 1200)
+
+        res = core.completion(payload_obj)
+        for it in res.iterations:
+            logging.info(
+                "event=rlm_codegen_iteration turn=%s validation_error=%s response_preview=%s",
+                it.turn,
+                _safe_trunc(it.validation_error, 120),
+                _safe_trunc(it.response, 320),
+            )
+        analysis_code = str(res.analysis_code or "").strip()
+        if not analysis_code:
+            return "", "", op_guess, commit_guess
+        plan = f"rlm_codegen_tool:turn_{max(1, len(res.iterations))}"
+        return analysis_code, plan, op_guess, commit_guess
 
     def _plan_code_retry_missing_result(
         self,
@@ -4382,7 +6297,7 @@ class Pipeline(object):
         )
         payload_obj: Dict[str, Any] = {
             "question": question,
-            "df_profile": profile,
+            "schema": _compact_profile_for_llm(profile),
             "retry_reason": reason,
             "previous_analysis_code": previous_code,
             "retry_constraints": [
@@ -4423,12 +6338,55 @@ class Pipeline(object):
         )
         payload_obj: Dict[str, Any] = {
             "question": question,
-            "df_profile": profile,
+            "schema": _compact_profile_for_llm(profile),
             "retry_reason": reason,
             "previous_analysis_code": previous_code,
             "retry_constraints": [
                 "CRITICAL: for subset questions (among/for/with/where/тільки/лише/серед), filter df first and only then aggregate.",
                 "Use explicit pandas filter (e.g., str.contains, query, boolean mask) before min/max/mean/sum/count.",
+                "CRITICAL: final answer must be assigned to variable `result`.",
+                "No import/from statements.",
+            ],
+        }
+        if isinstance(lookup_hints, dict) and lookup_hints:
+            system += (
+                " CRITICAL LOOKUP HINTS: if lookup_hints.filters are present, you MUST preserve them "
+                "in analysis_code and combine them with any additional constraints from the question."
+            )
+            payload_obj["lookup_hints"] = lookup_hints
+        payload = json.dumps(payload_obj, ensure_ascii=False)
+        parsed = self._llm_json(system, payload)
+        commit_df = parsed.get("commit_df")
+        return (
+            parsed.get("analysis_code", ""),
+            parsed.get("short_plan", ""),
+            (parsed.get("op") or "read"),
+            commit_df if isinstance(commit_df, bool) else None,
+        )
+
+    def _plan_code_retry_subset_guard_conflict(
+        self,
+        question: str,
+        profile: dict,
+        previous_code: str,
+        reason: str,
+        lookup_hints: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, str, str, Optional[bool]]:
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("plan_code_system", DEFAULT_PLAN_CODE_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
+        payload_obj: Dict[str, Any] = {
+            "question": question,
+            "schema": _compact_profile_for_llm(profile),
+            "retry_reason": reason,
+            "previous_analysis_code": previous_code,
+            "retry_constraints": [
+                "CRITICAL: this query does NOT require subset filtering.",
+                "For grouped queries (by/per/по/за each), aggregate over full df unless an explicit filter is requested.",
+                "Do not inject subset filters from ambiguous soft hints.",
                 "CRITICAL: final answer must be assigned to variable `result`.",
                 "No import/from statements.",
             ],
@@ -4465,7 +6423,7 @@ class Pipeline(object):
         )
         payload_obj: Dict[str, Any] = {
             "question": question,
-            "df_profile": profile,
+            "schema": _compact_profile_for_llm(profile),
             "retry_reason": reason,
             "previous_analysis_code": previous_code,
             "retry_constraints": [
@@ -4509,7 +6467,7 @@ class Pipeline(object):
         retry_constraints = [
             "CRITICAL: final answer must be assigned to variable `result`.",
             "No import/from statements.",
-            "Use exact column names from df_profile only.",
+            "Use exact column names from schema.columns only.",
             "Do not access dict key 'import' directly.",
             "Prefer robust pandas code that handles missing/invalid values safely.",
         ]
@@ -4521,7 +6479,7 @@ class Pipeline(object):
         payload = json.dumps(
             {
                 "question": question,
-                "df_profile": profile,
+                "schema": _compact_profile_for_llm(profile),
                 "retry_reason": runtime_error,
                 "previous_analysis_code": previous_code,
                 "retry_constraints": retry_constraints,
@@ -4537,6 +6495,93 @@ class Pipeline(object):
             commit_df if isinstance(commit_df, bool) else None,
         )
 
+    def _rlm_core_repl_repair(
+        self,
+        question: str,
+        profile: dict,
+        df_id: str,
+        failed_code: str,
+        failed_error: str,
+        op: Optional[str],
+        commit_df: Optional[bool],
+    ) -> Optional[Dict[str, Any]]:
+        if not bool(self.valves.rlm_core_repl_enabled):
+            return None
+        # Keep edit flow on existing deterministic path for now.
+        if _infer_op_from_question(question) == "edit":
+            return None
+
+        system = self._with_spreadsheet_skill_prompt(
+            self._prompts.get("rlm_core_repl_system", DEFAULT_RLM_CORE_REPL_SYSTEM),
+            question,
+            profile,
+            focus="plan",
+        )
+        def _validator(code: str) -> Tuple[str, bool, Optional[str]]:
+            normalized, retry_edit_expected, finalize_err = _finalize_code_for_sandbox(
+                question,
+                code,
+                op,
+                commit_df,
+                df_profile=profile,
+            )
+            if finalize_err:
+                return normalized, retry_edit_expected, finalize_err
+            if _has_forbidden_import_nodes(normalized):
+                return normalized, retry_edit_expected, "forbidden_import_detected"
+            normalized, _ = self._resolve_shortcut_placeholders(normalized, "", question, profile)
+            normalized = textwrap.dedent(normalized or "").strip() + "\n"
+            if "df_profile" in (normalized or ""):
+                normalized = f"df_profile = {_compact_profile_for_llm(profile)!r}\n" + normalized
+            normalized = _normalize_generated_code(normalized)
+            return normalized, retry_edit_expected, None
+
+        core = RLMCore(
+            system_prompt=system,
+            lm_handler_factory=lambda: LMHandler(
+                openai_client=self._llm,
+                model=self.valves.base_llm_model,
+                host="127.0.0.1",
+                port=0,
+                temperature=0.0,
+            ),
+            environment_factory=lambda _prompt: SandboxREPL(
+                executor=lambda code: self._sandbox_run(df_id, code),
+                context_payload=_prompt if isinstance(_prompt, dict) else {"prompt": _prompt},
+                persistent=True,
+            ),
+            code_extractor=_extract_analysis_code_from_llm_no_think,
+            code_validator=_validator,
+            max_iterations=int(self.valves.rlm_core_repl_max_iterations),
+            max_tokens=int(self.valves.rlm_core_repl_max_tokens),
+            fallback_enabled=False,
+        )
+
+        payload = {
+            "question": question,
+            "schema": _compact_profile_for_llm(profile),
+            "previous_code": _safe_trunc(failed_code, 3000),
+            "previous_error": _safe_trunc(failed_error, 1500),
+            "op_hint": str(op or ""),
+        }
+        res = core.completion(payload)
+        for it in res.iterations:
+            logging.info(
+                "event=rlm_core_repl_iteration turn=%s validation_error=%s repl_status=%s repl_error=%s",
+                it.turn,
+                _safe_trunc(it.validation_error, 120),
+                _safe_trunc(it.repl_status, 40),
+                _safe_trunc(it.repl_error, 180),
+            )
+        run_resp = dict(res.run_resp or {})
+        if str(run_resp.get("status") or "") != "ok":
+            return None
+        return {
+            "analysis_code": str(res.analysis_code or ""),
+            "run_resp": run_resp,
+            "edit_expected": bool(res.edit_expected),
+        }
+
     def _llm_pick_column_for_shortcut(self, question: str, profile: dict) -> Optional[str]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
         if not columns:
@@ -4549,8 +6594,7 @@ class Pipeline(object):
         payload = {
             "question": question,
             "columns": columns[:200],
-            "dtypes": (profile or {}).get("dtypes") or {},
-            "df_profile": profile or {},
+            "numeric_columns": _profile_numeric_columns(profile, limit=200),
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
@@ -4589,7 +6633,7 @@ class Pipeline(object):
         system = (
             "Resolve a semantic alias from a user request to the closest dataframe column name. "
             "Return ONLY JSON: {\"column\": \"<exact column name from list or empty>\", \"confidence\": 0..1}. "
-            "Use semantic similarity from question, alias, column names, dtypes, and preview values. "
+            "Use semantic similarity from question, alias, column names, and numeric column hints. "
             "If uncertain, return empty column and confidence 0."
         )
         system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
@@ -4598,8 +6642,7 @@ class Pipeline(object):
             "alias": alias,
             "role": role,
             "columns": columns[:200],
-            "dtypes": (profile or {}).get("dtypes") or {},
-            "preview": ((profile or {}).get("preview") or [])[:20],
+            "numeric_columns": _profile_numeric_columns(profile, limit=200),
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
@@ -4660,8 +6703,6 @@ class Pipeline(object):
             "question": question,
             "columns": columns[:200],
             "numeric_columns": numeric_cols[:200],
-            "dtypes": dtypes,
-            "df_profile": profile or {},
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
@@ -4701,8 +6742,6 @@ class Pipeline(object):
             "question": question,
             "columns": columns[:200],
             "numeric_columns": numeric_cols[:200],
-            "dtypes": dtypes,
-            "preview": ((profile or {}).get("preview") or [])[:20],
             "rows": (profile or {}).get("rows"),
         }
         try:
@@ -4740,11 +6779,7 @@ class Pipeline(object):
         out["order"] = "asc" if order in {"asc", "ascending", "lowest", "smallest"} else "desc"
 
         top_n_raw = (parsed or {}).get("top_n")
-        top_n: Optional[int] = None
-        if isinstance(top_n_raw, (int, float)):
-            top_n = max(1, int(top_n_raw))
-        elif isinstance(top_n_raw, str) and top_n_raw.strip().isdigit():
-            top_n = max(1, int(top_n_raw.strip()))
+        top_n = _normalize_optional_top_n(top_n_raw)
         if top_n is not None:
             out["top_n"] = top_n
 
@@ -4766,7 +6801,27 @@ class Pipeline(object):
             re.search(
                 r"(?:==|=)"
                 r"|\b(дорівн\w*|рівн\w*|exact(?:ly)?|точно|саме)\b"
-                r"|\b(?:id|sku|код|артикул)\s*[:=]?\s*\d+\b",
+                r"|\b(?:id|sku|код|артикул)\s*[:=]?\s*[a-zа-яіїєґ0-9._\-]+\b",
+                q_low,
+                re.I,
+            )
+        )
+
+    def _lookup_has_prefix_cue(self, question: str) -> bool:
+        q_low = (question or "").lower()
+        return bool(
+            re.search(
+                r"\b(starts?\s+with|begin(?:s|ning)?\s+with|почина\w*\s+на|на\s+літер\w*|з\s+літер\w*)\b",
+                q_low,
+                re.I,
+            )
+        )
+
+    def _lookup_has_suffix_cue(self, question: str) -> bool:
+        q_low = (question or "").lower()
+        return bool(
+            re.search(
+                r"\b(ends?\s+with|закінчу\w*\s+на|на\s+кінц\w*)\b",
                 q_low,
                 re.I,
             )
@@ -4786,16 +6841,42 @@ class Pipeline(object):
             return False
         return bool(re.search(r"(status|статус|available|наявн|stock|склад|доступн|inventory|warehouse|запас|залишк)", c))
 
+    def _lookup_quoted_literals(self, question: str) -> List[str]:
+        q = str(question or "")
+        if not q:
+            return []
+        out: List[str] = []
+        for m in re.finditer(r"['\"]([^'\"]+)['\"]", q):
+            s = str(m.group(1) or "").strip().lower()
+            if s and s not in out:
+                out.append(s)
+        return out
+
+    def _lookup_question_requests_exact_value(self, question: str, value: Any) -> bool:
+        s = str(value or "").strip().lower()
+        if not s:
+            return False
+        if self._lookup_has_explicit_eq_cue(question):
+            return True
+        quoted = self._lookup_quoted_literals(question)
+        return s in set(quoted)
+
     def _lookup_status_pattern(self, value: Any) -> Optional[str]:
         s = str(value or "").strip().lower()
         if not s:
             return None
-        # Positive availability intent.
-        if re.search(r"(на\s+склад|в\s+наявн|наявн|в\s+запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|резерв|закінч\w*)", s):
-            return r"(?:в\s*наявн|наявн|в\s*запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|на\s*склад|резерв\w*|закінч\w*)"
+        # Low-stock intent (must stay separate from generic "in stock").
+        if re.search(r"(закінч\w*|заканч\w*|майже\s+скінч\w*|running\s*out|low\s*stock|limited\s*stock)", s, re.I):
+            return r"(?:закінч\w*|заканч\w*|майже\s+скінч\w*|running\s*out|low\s*stock|limited\s*stock)"
         # Negative availability intent.
         if re.search(r"(нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)", s):
             return r"(?:нема|відсутн|out\s*of\s*stock|unavailable|not\s*available)"
+        # Under-order intent.
+        if re.search(r"(під\s*замовлення|under\s*order|backorder)", s):
+            return r"(?:під\s*замовлення|under\s*order|backorder)"
+        # Positive availability intent.
+        if re.search(r"(на\s+склад|в\s+наявн|наявн|в\s+запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|резерв)", s):
+            return r"(?:в\s*наявн|наявн|в\s*запас\w*|запас\w*|залишк\w*|in\s*stock|available|inventory|warehouse|доступн|на\s*склад|резерв\w*)"
         return None
 
     def _lookup_filter_value_is_entity_like(self, value: Any) -> bool:
@@ -4808,6 +6889,64 @@ class Pipeline(object):
             return False
         return bool(re.search(r"[A-Za-zА-Яа-яІіЇїЄєҐґ]", s))
 
+    def _lookup_ambiguous_filter_candidate_columns(
+        self,
+        question: str,
+        filter_col: str,
+        value: Any,
+        columns: List[str],
+        dtypes: Dict[str, Any],
+    ) -> List[str]:
+        if not columns:
+            return []
+        if not (isinstance(filter_col, str) and filter_col in columns):
+            return []
+        if not self._lookup_filter_value_is_entity_like(value):
+            return []
+        if self._lookup_filter_is_exact_field(filter_col):
+            return []
+        explicit_col = _find_explicit_column_in_text(question, columns)
+        if explicit_col:
+            return []
+        mentioned_cols = _find_columns_in_text(question, columns)
+        if filter_col in mentioned_cols:
+            return []
+
+        text_cols = [
+            c
+            for c in columns
+            if not str((dtypes or {}).get(c, "")).lower().startswith(("int", "float", "uint"))
+            and not self._lookup_is_status_like_column(c)
+        ]
+        if filter_col not in text_cols:
+            return []
+
+        entity_col_pat = r"(категор|category|тип|type|group|груп|клас|class|product|товар|модел|model|назв|name|опис|desc|description|spec|характер|бренд|brand)"
+        candidate_pool = [c for c in text_cols if re.search(entity_col_pat, c.lower())]
+        if not candidate_pool:
+            return []
+
+        priority_patterns = (
+            r"(категор|category|тип|type|group|груп|class|клас|product|товар)",
+            r"(модел|model|назв|name|бренд|brand)",
+            r"(опис|desc|description|spec|характер)",
+        )
+        ordered: List[str] = []
+        for pat in priority_patterns:
+            for col in candidate_pool:
+                if col == filter_col:
+                    continue
+                if col in ordered:
+                    continue
+                if re.search(pat, col.lower()):
+                    ordered.append(col)
+        for col in candidate_pool:
+            if col == filter_col:
+                continue
+            if col not in ordered:
+                ordered.append(col)
+        return ordered[:4]
+
     def _normalize_lookup_filters(
         self,
         question: str,
@@ -4815,6 +6954,8 @@ class Pipeline(object):
         dtypes: Dict[str, Any],
     ) -> List[Dict[str, Any]]:
         explicit_eq = self._lookup_has_explicit_eq_cue(question)
+        has_prefix_cue = self._lookup_has_prefix_cue(question)
+        has_suffix_cue = self._lookup_has_suffix_cue(question)
         out: List[Dict[str, Any]] = []
         for f in filters:
             cur = dict(f)
@@ -4824,6 +6965,29 @@ class Pipeline(object):
             dtype = str((dtypes or {}).get(col, "")).lower()
             is_numeric = dtype.startswith(("int", "float", "uint"))
             is_status_like = self._lookup_is_status_like_column(col)
+            exact_value_requested = self._lookup_question_requests_exact_value(question, val)
+            text_val = str(val).strip() if isinstance(val, str) else ""
+
+            if op == "contains" and text_val:
+                if text_val.startswith("^") and len(text_val) > 1:
+                    cur["op"] = "startswith"
+                    cur["value"] = text_val[1:]
+                    op = "startswith"
+                elif text_val.endswith("$") and len(text_val) > 1:
+                    cur["op"] = "endswith"
+                    cur["value"] = text_val[:-1]
+                    op = "endswith"
+                elif has_prefix_cue:
+                    cur["op"] = "startswith"
+                    op = "startswith"
+                elif has_suffix_cue:
+                    cur["op"] = "endswith"
+                    op = "endswith"
+
+            if op == "eq" and is_status_like and exact_value_requested:
+                cur["match_mode"] = "exact"
+                out.append(cur)
+                continue
 
             if (
                 op == "eq"
@@ -4831,10 +6995,12 @@ class Pipeline(object):
                 and is_status_like
                 and self._lookup_filter_value_is_entity_like(val)
             ):
-                cur["op"] = "contains"
+                cur["op"] = "startswith" if has_prefix_cue else ("endswith" if has_suffix_cue else "contains")
+                cur["match_mode"] = "semantic"
                 logging.info(
-                    "event=lookup_filter_operator_adjust column=%s from=eq to=contains reason=status_semantic value_preview=%s",
+                    "event=lookup_filter_operator_adjust column=%s from=eq to=%s reason=status_semantic value_preview=%s",
                     col,
+                    cur["op"],
                     _safe_trunc(val, 80),
                 )
                 out.append(cur)
@@ -4847,10 +7013,11 @@ class Pipeline(object):
                 and not self._lookup_filter_is_exact_field(col)
                 and self._lookup_filter_value_is_entity_like(val)
             ):
-                cur["op"] = "contains"
+                cur["op"] = "startswith" if has_prefix_cue else ("endswith" if has_suffix_cue else "contains")
                 logging.info(
-                    "event=lookup_filter_operator_adjust column=%s from=eq to=contains value_preview=%s",
+                    "event=lookup_filter_operator_adjust column=%s from=eq to=%s value_preview=%s",
                     col,
+                    cur["op"],
                     _safe_trunc(val, 80),
                 )
             out.append(cur)
@@ -4906,6 +7073,67 @@ class Pipeline(object):
                 return True
         return False
 
+    def _lookup_infer_aggregation_from_question(self, question: str) -> str:
+        q = (question or "").lower()
+        if not q:
+            return "none"
+        if re.search(r"\b(найб\w*|макс\w*|max(?:imum)?|highest|largest|найвищ\w*)\b", q, re.I):
+            return "max"
+        if re.search(r"\b(наймен\w*|мін\w*|min(?:imum)?|lowest|smallest|найниж\w*)\b", q, re.I):
+            return "min"
+        if re.search(r"\b(середн\w*|average|avg|mean)\b", q, re.I):
+            return "mean"
+        if re.search(r"\b(медіан\w*|median)\b", q, re.I):
+            return "median"
+        if re.search(r"\b(сума|sum|total|підсум\w*|загальн\w*)\b", q, re.I):
+            return "sum"
+        return "none"
+
+    def _lookup_pick_aggregation_column(
+        self,
+        question: str,
+        profile: dict,
+        filters: List[Dict[str, Any]],
+        output_columns: List[str],
+    ) -> Optional[str]:
+        columns = [str(c) for c in ((profile or {}).get("columns") or [])]
+        dtypes = (profile or {}).get("dtypes") or {}
+        numeric_cols = [c for c in columns if _is_numeric_dtype_text(dtypes.get(c, ""))]
+        if not numeric_cols:
+            return None
+
+        numeric_out = [c for c in output_columns if c in numeric_cols]
+        if numeric_out:
+            return numeric_out[0]
+
+        explicit_col = _find_explicit_column_in_text(question, columns)
+        if explicit_col in numeric_cols:
+            return explicit_col
+
+        metric_hint = self._llm_pick_numeric_metric_column(question, profile)
+        if metric_hint in numeric_cols:
+            return metric_hint
+
+        price_col = _pick_price_like_column(profile)
+        qty_col = _pick_quantity_like_column(profile)
+        if re.search(r"\b(цін\w*|price|cost|варт\w*)\b", question or "", re.I) and price_col in numeric_cols:
+            return price_col
+        if re.search(r"\b(кільк\w*|qty|quantity|units?|stock|залишк\w*)\b", question or "", re.I) and qty_col in numeric_cols:
+            return qty_col
+
+        filter_numeric_cols = [
+            str(f.get("column") or "").strip()
+            for f in (filters or [])
+            if str(f.get("column") or "").strip() in numeric_cols
+        ]
+        if filter_numeric_cols:
+            return filter_numeric_cols[0]
+
+        non_id_numeric = [c for c in numeric_cols if not _is_id_like_col_name(c)]
+        if non_id_numeric:
+            return non_id_numeric[0]
+        return numeric_cols[0]
+
     def _llm_pick_lookup_slots(self, question: str, profile: dict) -> Dict[str, Any]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
         if not columns:
@@ -4913,26 +7141,34 @@ class Pipeline(object):
         dtypes = (profile or {}).get("dtypes") or {}
         system = (
             "Map the query to table lookup slots. "
-            "Return ONLY JSON with keys: mode, filters, output_columns, limit. "
+            "Return ONLY JSON with keys: mode, filters, output_columns, limit, aggregation. "
             "mode must be 'lookup' or 'other'. "
             "filters must be a list of objects with keys: column, op, value. "
-            "column must be exact from columns. op must be one of: eq, ne, gt, ge, lt, le, contains. "
+            "column must be exact from columns. op must be one of: eq, ne, gt, ge, lt, le, contains, startswith, endswith. "
             "output_columns must be a list of exact column names from columns. "
             "limit must be integer or null. "
+            "aggregation must be one of: none, count, sum, mean, min, max, median. "
             "CRITICAL FILTER RULES: "
             "Use 'eq' for exact IDs/status/boolean flags and explicit exact-match asks. "
             "Use 'contains' for brand/model/product names, features/materials, colors, categories/types. "
+            "If user asks 'starts with / починаються / на літеру', use op='startswith' with the prefix. "
+            "If user asks 'ends with / закінчується на', use op='endswith' with the suffix. "
+            "Do NOT use regex anchors like '^' or '$' in values. "
+            "'contains' is plain substring matching, not regex. "
             "When in doubt between 'eq' and 'contains' for text values, prefer 'contains'. "
             "If query likely needs search across multiple text columns, set mode='other'. "
             "Use mode='lookup' when query asks to find/show rows by conditions (e.g., where price equals X). "
-            "For single-value questions like 'яка модель ...', set limit=1."
+            "For single-value row questions like 'яка модель ...', set limit=1 and aggregation='none'. "
+            "For metric questions with aggregate intent (max/min/sum/avg/count), set aggregation accordingly and limit=null. "
+            "Never emulate max/min/sum/avg/count via limit=1. "
+            "AMBIGUITY RULE: if an entity value is given without explicit column (e.g., 'товар Миша'), "
+            "prefer category/type columns over model/description when assigning filter column."
         )
         system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
         payload = {
             "question": question,
             "columns": columns[:200],
-            "dtypes": dtypes,
-            "preview": ((profile or {}).get("preview") or [])[:20],
+            "numeric_columns": _profile_numeric_columns(profile, limit=200),
             "rows": (profile or {}).get("rows"),
         }
         try:
@@ -4966,7 +7202,7 @@ class Pipeline(object):
                 op = str(f.get("op") or "").strip().lower()
                 if col not in columns:
                     continue
-                if op not in {"eq", "ne", "gt", "ge", "lt", "le", "contains"}:
+                if op not in LOOKUP_ALLOWED_FILTER_OPS:
                     continue
                 val = f.get("value")
                 filters.append({"column": col, "op": op, "value": val})
@@ -4991,13 +7227,27 @@ class Pipeline(object):
                     out_cols.append(s)
         out["output_columns"] = out_cols
 
+        aggregation = str((parsed or {}).get("aggregation") or "").strip().lower()
+        if aggregation not in LOOKUP_ALLOWED_AGGREGATIONS:
+            aggregation = "none"
+        inferred_agg = self._lookup_infer_aggregation_from_question(question)
+        if aggregation == "none" and inferred_agg != "none":
+            aggregation = inferred_agg
+        out["aggregation"] = aggregation
+
         limit_raw = (parsed or {}).get("limit")
         if isinstance(limit_raw, (int, float)):
             out["limit"] = max(1, int(limit_raw))
         elif isinstance(limit_raw, str) and limit_raw.strip().isdigit():
             out["limit"] = max(1, int(limit_raw.strip()))
+        if aggregation != "none":
+            out.pop("limit", None)
 
-        if mode == "lookup" and self._lookup_requires_multicol_fallback(question, filters, columns, dtypes):
+        if (
+            mode == "lookup"
+            and aggregation == "none"
+            and self._lookup_requires_multicol_fallback(question, filters, columns, dtypes)
+        ):
             logging.info("event=lookup_slots_fallback mode=other reason=multi_column_keyword_search")
             out["mode"] = "other"
             out["fallback_reason"] = "multi_column_keyword_search"
@@ -5010,6 +7260,7 @@ class Pipeline(object):
         filters = [dict(f) for f in ((slots or {}).get("filters") or []) if isinstance(f, dict)]
         out_cols = [str(c) for c in ((slots or {}).get("output_columns") or []) if str(c).strip()]
         limit = (slots or {}).get("limit")
+        aggregation = str((slots or {}).get("aggregation") or "").strip().lower()
         fallback_reason = str((slots or {}).get("fallback_reason") or "").strip()
         mode = str((slots or {}).get("mode") or "").strip().lower()
         if not filters and not out_cols:
@@ -5022,9 +7273,59 @@ class Pipeline(object):
             hints["output_columns"] = out_cols
         if isinstance(limit, int) and limit > 0:
             hints["limit"] = limit
+        if aggregation in LOOKUP_ALLOWED_AGGREGATIONS and aggregation != "none":
+            hints["aggregation"] = aggregation
         if fallback_reason:
             hints["reason"] = fallback_reason
         return hints
+
+    def _lookup_question_has_detail_rows_cue(self, question: str) -> bool:
+        q = (question or "").lower()
+        if not q:
+            return False
+        return bool(
+            re.search(
+                r"\b(усі\s+рядк\w*|всі\s+рядк\w*|all\s+rows?|every\s+row|"
+                r"кож\w*\s+товар\w*|every\s+item|детальн\w*|повн\w*\s+інформац\w*|"
+                r"full\s+details?|всі\s+колонк\w*|all\s+columns?)\b",
+                q,
+                re.I,
+            )
+        )
+
+    def _lookup_question_has_unique_cue(self, question: str) -> bool:
+        q = (question or "").lower()
+        if not q:
+            return False
+        return bool(
+            re.search(
+                r"\b(унікальн\w*|без\s+дублік\w*|distinct|unique|different|deduplicat\w*)\b",
+                q,
+                re.I,
+            )
+        )
+
+    def _lookup_should_deduplicate_output(
+        self,
+        question: str,
+        output_columns: List[str],
+        profile: dict,
+    ) -> bool:
+        cols = [str(c) for c in (output_columns or []) if str(c).strip()]
+        if not cols:
+            return False
+        if self._lookup_question_has_unique_cue(question):
+            return True
+        if self._lookup_question_has_detail_rows_cue(question):
+            return False
+
+        dtypes = (profile or {}).get("dtypes") or {}
+        for col in cols:
+            if _is_id_like_col_name(col):
+                return False
+            if _is_numeric_dtype_text(dtypes.get(col, "")):
+                return False
+        return True
 
     def _lookup_shortcut_code_from_slots(
         self,
@@ -5039,16 +7340,76 @@ class Pipeline(object):
             return None
 
         columns = [str(c) for c in ((profile or {}).get("columns") or [])]
-        output_columns = [str(c) for c in ((slots or {}).get("output_columns") or []) if str(c) in columns]
-        if not output_columns:
-            mentioned = _find_columns_in_text(question, columns)
-            output_columns = [c for c in mentioned if c not in [str(f.get("column")) for f in filters]]
-        if not output_columns:
-            dtypes = (profile or {}).get("dtypes") or {}
-            text_cols = [c for c in columns if not str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))]
-            output_columns = text_cols[:2] if text_cols else columns[:1]
+        dtypes = (profile or {}).get("dtypes") or {}
+        aggregation = str((slots or {}).get("aggregation") or "").strip().lower()
+        if aggregation not in LOOKUP_ALLOWED_AGGREGATIONS:
+            aggregation = "none"
+        inferred_aggregation = self._lookup_infer_aggregation_from_question(question)
+        if aggregation == "none" and inferred_aggregation != "none":
+            aggregation = inferred_aggregation
 
+        output_columns = [str(c) for c in ((slots or {}).get("output_columns") or []) if str(c) in columns]
+        if aggregation == "count":
+            output_columns = []
+        elif aggregation != "none":
+            if not output_columns:
+                agg_col = self._lookup_pick_aggregation_column(question, profile, filters, output_columns)
+                if agg_col:
+                    output_columns = [agg_col]
+        else:
+            if not output_columns:
+                mentioned = _find_columns_in_text(question, columns)
+                output_columns = [c for c in mentioned if c not in [str(f.get("column")) for f in filters]]
+            if not output_columns:
+                text_cols = [c for c in columns if not str(dtypes.get(c, "")).lower().startswith(("int", "float", "uint"))]
+                output_columns = text_cols[:2] if text_cols else columns[:1]
+
+        dedupe_output = aggregation == "none" and self._lookup_should_deduplicate_output(question, output_columns, profile)
         limit = (slots or {}).get("limit")
+        if aggregation != "none":
+            limit = None
+        fallback_candidates_by_idx: Dict[int, List[str]] = {}
+        explicit_col = _find_explicit_column_in_text(question, columns)
+        if not explicit_col:
+            for i, f in enumerate(filters):
+                col = str(f.get("column") or "").strip()
+                op = str(f.get("op") or "").strip().lower()
+                val = f.get("value")
+                if op not in {"eq", "contains"}:
+                    continue
+                if isinstance(val, (int, float)):
+                    continue
+                candidates = self._lookup_ambiguous_filter_candidate_columns(
+                    question=question,
+                    filter_col=col,
+                    value=val,
+                    columns=columns,
+                    dtypes=dtypes,
+                )
+                if candidates:
+                    fallback_candidates_by_idx[i] = candidates
+
+        op_text = {
+            "eq": "=",
+            "ne": "!=",
+            "gt": ">",
+            "ge": ">=",
+            "lt": "<",
+            "le": "<=",
+            "contains": "contains",
+            "startswith": "startswith",
+            "endswith": "endswith",
+        }
+        filter_hint_parts: List[str] = []
+        for f in filters:
+            col = str(f.get("column") or "").strip()
+            op = str(f.get("op") or "").strip().lower()
+            val = "" if f.get("value") is None else str(f.get("value"))
+            if not col or not val:
+                continue
+            filter_hint_parts.append(f"{col} {op_text.get(op, op)} {val}")
+        filter_hint = "; ".join(filter_hint_parts) if filter_hint_parts else "задані умови"
+
         lines: List[str] = [
             "_work = df.copy(deep=False)",
         ]
@@ -5056,7 +7417,14 @@ class Pipeline(object):
             col = str(f.get("column"))
             op = str(f.get("op")).lower()
             val = f.get("value")
+            match_mode = str(f.get("match_mode") or "").strip().lower()
+            if op not in LOOKUP_ALLOWED_FILTER_OPS:
+                continue
             mask_name = f"_m{i}"
+            fallback_cols = fallback_candidates_by_idx.get(i) or []
+            fallback_enabled = bool(fallback_cols and op in {"eq", "contains"} and not isinstance(val, (int, float)))
+            if fallback_enabled:
+                lines.append(f"_base{i} = _work.copy()")
             lines.append(f"_c{i} = {col!r}")
             if op in {"gt", "ge", "lt", "le"}:
                 try:
@@ -5071,6 +7439,12 @@ class Pipeline(object):
                 lines.append(f"_num{i} = _clean{i}.where(_masknum{i}, np.nan).astype(float)")
                 op_map = {"gt": ">", "ge": ">=", "lt": "<", "le": "<="}
                 lines.append(f"{mask_name} = _num{i} {op_map[op]} {num_val!r}")
+            elif op == "startswith":
+                sval = "" if val is None else str(val)
+                lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.lower().str.startswith(str({sval!r}).lower(), na=False)")
+            elif op == "endswith":
+                sval = "" if val is None else str(val)
+                lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.lower().str.endswith(str({sval!r}).lower(), na=False)")
             elif op == "contains":
                 sval = "" if val is None else str(val)
                 status_pat = self._lookup_status_pattern(val) if self._lookup_is_status_like_column(col) else None
@@ -5078,7 +7452,7 @@ class Pipeline(object):
                     lines.append(f"_pat{i} = {status_pat!r}")
                     lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.contains(_pat{i}, case=False, regex=True, na=False)")
                 else:
-                    lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.contains({sval!r}, case=False, na=False)")
+                    lines.append(f"{mask_name} = _work[_c{i}].astype(str).str.contains({sval!r}, case=False, regex=False, na=False)")
             else:
                 # eq/ne: decide numeric or string compare by value shape
                 if isinstance(val, (int, float)):
@@ -5093,7 +7467,18 @@ class Pipeline(object):
                 else:
                     sval = "" if val is None else str(val)
                     cmp_op = "==" if op == "eq" else "!="
-                    status_pat = self._lookup_status_pattern(val) if self._lookup_is_status_like_column(col) else None
+                    strict_status_eq = (
+                        self._lookup_is_status_like_column(col)
+                        and (
+                            match_mode == "exact"
+                            or self._lookup_question_requests_exact_value(question, val)
+                        )
+                    )
+                    status_pat = (
+                        None
+                        if strict_status_eq
+                        else (self._lookup_status_pattern(val) if self._lookup_is_status_like_column(col) else None)
+                    )
                     if status_pat:
                         lines.append(f"_pat{i} = {status_pat!r}")
                         lines.append(f"_hit{i} = _work[_c{i}].astype(str).str.contains(_pat{i}, case=False, regex=True, na=False)")
@@ -5106,15 +7491,104 @@ class Pipeline(object):
                             f"{mask_name} = _work[_c{i}].astype(str).str.strip().str.lower() {cmp_op} {sval!r}.strip().lower()"
                         )
             lines.append(f"_work = _work.loc[{mask_name}].copy()")
+            if fallback_enabled:
+                sval = "" if val is None else str(val)
+                lines.append(f"_resolved_col{i} = _c{i}")
+                lines.append(f"if len(_work) == 0:")
+                lines.append(f"    _alt_cols{i} = {fallback_cols!r}")
+                lines.append(f"    for _alt_col{i} in _alt_cols{i}:")
+                if op == "contains":
+                    lines.append(
+                        f"        _alt_mask{i} = _base{i}[_alt_col{i}].astype(str).str.contains({sval!r}, case=False, regex=False, na=False)"
+                    )
+                else:
+                    lines.append(
+                        f"        _alt_eq{i} = _base{i}[_alt_col{i}].astype(str).str.strip().str.lower() == {sval!r}.strip().lower()"
+                    )
+                    lines.append(f"        _alt_mask{i} = _alt_eq{i}")
+                    lines.append(f"        if not bool(_alt_mask{i}.any()):")
+                    lines.append(
+                        f"            _alt_mask{i} = _base{i}[_alt_col{i}].astype(str).str.contains({sval!r}, case=False, regex=False, na=False)"
+                    )
+                lines.append(f"        _alt_work{i} = _base{i}.loc[_alt_mask{i}].copy()")
+                lines.append(f"        if len(_alt_work{i}) > 0:")
+                lines.append(f"            _work = _alt_work{i}")
+                lines.append(f"            _resolved_col{i} = _alt_col{i}")
+                lines.append("            break")
+
+        if aggregation != "none":
+            if aggregation == "count":
+                lines.append("result = int(len(_work))")
+                plan = "Відфільтрувати рядки за умовами та порахувати їх кількість."
+                logging.info("event=lookup_shortcut_llm slots=%s", _safe_trunc(slots, 600))
+                return "\n".join(lines) + "\n", plan
+
+            agg_col = output_columns[0] if output_columns else None
+            if not agg_col:
+                agg_col = self._lookup_pick_aggregation_column(question, profile, filters, output_columns)
+            if not agg_col or agg_col not in columns:
+                logging.info(
+                    "event=lookup_shortcut_skip reason=missing_aggregation_column aggregation=%s question=%s",
+                    aggregation,
+                    _safe_trunc(question, 200),
+                )
+                return None
+            if not _is_numeric_dtype_text(dtypes.get(agg_col, "")):
+                logging.info(
+                    "event=lookup_shortcut_skip reason=non_numeric_aggregation_column aggregation=%s column=%s",
+                    aggregation,
+                    agg_col,
+                )
+                return None
+            lines.append(f"_filter_hint = {filter_hint!r}")
+            lines.append("if len(_work) == 0:")
+            lines.append("    result = f\"Не знайдено рядків для фільтра: {_filter_hint}\"")
+            lines.append("else:")
+            lines.append(f"    _agg_col = {agg_col!r}")
+            lines.append("    _raw_agg = _work[_agg_col].astype(str)")
+            lines.append(
+                r"    _clean_agg = _raw_agg.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')"
+            )
+            lines.append(r"    _masknum_agg = _clean_agg.str.match(r'^-?(\d+(\.\d*)?|\.\d+)$')")
+            lines.append("    _num_agg = _clean_agg.where(_masknum_agg, np.nan).astype(float)")
+            lines.append("    _num_non_na = _num_agg.dropna()")
+            lines.append("    if len(_num_non_na) == 0:")
+            lines.append("        result = f\"Не знайдено числових значень у колонці {_agg_col} для вибраних рядків.\"")
+            lines.append("    else:")
+            if aggregation == "max":
+                lines.append("        _agg_value = _num_non_na.max()")
+            elif aggregation == "min":
+                lines.append("        _agg_value = _num_non_na.min()")
+            elif aggregation == "sum":
+                lines.append("        _agg_value = _num_non_na.sum()")
+            elif aggregation == "mean":
+                lines.append("        _agg_value = _num_non_na.mean()")
+            elif aggregation == "median":
+                lines.append("        _agg_value = _num_non_na.median()")
+            else:
+                lines.append("        _agg_value = _num_non_na.max()")
+            lines.append("        result = float(_agg_value)")
+            agg_label = {
+                "max": "максимум",
+                "min": "мінімум",
+                "sum": "суму",
+                "mean": "середнє",
+                "median": "медіану",
+            }.get(aggregation, aggregation)
+            plan = f"Відфільтрувати рядки за умовами та обчислити {agg_label} по колонці {agg_col}."
+            logging.info("event=lookup_shortcut_llm slots=%s", _safe_trunc(slots, 600))
+            return "\n".join(lines) + "\n", plan
 
         lines.append(f"_out_cols = {output_columns!r}")
         lines.append("_out_cols = [c for c in _out_cols if c in _work.columns]")
-        if isinstance(limit, int) and limit > 0:
-            lines.append(f"_work = _work.head({limit})")
         lines.append("if _out_cols:")
         lines.append("    _out = _work[_out_cols]")
         lines.append("else:")
         lines.append("    _out = _work")
+        if dedupe_output:
+            lines.append("_out = _out.drop_duplicates()")
+        if isinstance(limit, int) and limit > 0:
+            lines.append(f"_out = _out.head({limit})")
         lines.append("if len(_out) == 0:")
         lines.append("    result = []")
         lines.append("elif len(_out.columns) == 1 and len(_out) == 1:")
@@ -5123,6 +7597,8 @@ class Pipeline(object):
         lines.append("    result = _out")
 
         plan = "Виконати пошук рядків за умовами та повернути релевантні колонки."
+        if dedupe_output:
+            plan = "Виконати пошук рядків за умовами та повернути унікальні значення релевантних колонок."
         logging.info("event=lookup_shortcut_llm slots=%s", _safe_trunc(slots, 600))
         return "\n".join(lines) + "\n", plan
 
@@ -5136,7 +7612,8 @@ class Pipeline(object):
         if mode not in {"row_ranking", "group_ranking"}:
             return None
         top_n_slot = (slots or {}).get("top_n")
-        if top_n_slot is None:
+        top_n = _normalize_optional_top_n(top_n_slot)
+        if top_n is None:
             logging.info("event=ranking_shortcut_skip reason=missing_top_n mode=%s", mode)
             return None
 
@@ -5146,11 +7623,9 @@ class Pipeline(object):
             if not _has_ranking_cues(question) and _looks_like_value_filter_query(question):
                 logging.info("event=ranking_shortcut_skip reason=filter_like_query mode=row")
                 return None
-            top_n = int(top_n_slot)
-            top_n = max(1, top_n)
+            top_n = int(top_n)
         else:
-            top_n = int(top_n_slot)
-            top_n = max(1, top_n)
+            top_n = int(top_n)
         order = "asc" if str((slots or {}).get("order") or "").lower() == "asc" else "desc"
         require_available = bool((slots or {}).get("require_available"))
         availability_col = str((slots or {}).get("availability_col") or "").strip() or None
@@ -5185,7 +7660,9 @@ class Pipeline(object):
                 entity_cols = text_cols[:3]
 
             out_cols: List[str] = []
-            for c in ("ID", *entity_cols, metric_col):
+            id_col = _pick_id_like_column([str(c) for c in columns])
+            preferred_cols = ([id_col] if id_col else []) + entity_cols + [metric_col]
+            for c in preferred_cols:
                 if c in columns and c not in out_cols:
                     out_cols.append(c)
             if not out_cols:
@@ -5233,7 +7710,10 @@ class Pipeline(object):
         lines.append(f"_agg = {agg!r}")
         lines.append(f"_target_col = {target_col!r}" if target_col else "_target_col = None")
         lines.append("if _agg == 'count':")
-        lines.append("    _res = _work.groupby(_group_col).size().reset_index(name='count')")
+        lines.append("    if _target_col:")
+        lines.append("        _res = _work.groupby(_group_col)[_target_col].nunique(dropna=True).reset_index(name='count')")
+        lines.append("    else:")
+        lines.append("        _res = _work.groupby(_group_col).size().reset_index(name='count')")
         lines.append("else:")
         lines.append("    _num_raw = _work[_target_col].astype(str)")
         lines.append(r"    _num_clean = _num_raw.str.replace(r'[\s\xa0]', '', regex=True).str.replace(r'[^0-9,.\-]', '', regex=True).str.replace(',', '.')")
@@ -5260,14 +7740,18 @@ class Pipeline(object):
         logging.info("event=ranking_shortcut_llm mode=group slots=%s", _safe_trunc(slots, 600))
         return "\n".join(lines) + "\n", plan
 
-    def _llm_extract_subset_terms(self, question: str, profile: dict) -> List[str]:
+    def _llm_pick_subset_plan_slots(self, question: str, profile: dict) -> Dict[str, Any]:
         columns = [str(c) for c in (profile or {}).get("columns") or []]
         if not columns:
-            return []
+            return {"terms": [], "slots": {}}
+        numeric_columns = _profile_numeric_columns(profile, limit=200)
         system = (
-            "Extract only subset-filter terms from user query for dataframe filtering. "
-            "Return ONLY JSON: {\"terms\": [..]}. "
-            "Include product/entity/category/feature terms only. "
+            "Map subset filtering query to one compact plan. "
+            "Return ONLY JSON with keys: agg, metric_col, filter_terms, availability_mode, availability_col. "
+            "agg must be one of: count, sum, mean, min, max, median. "
+            "metric_col and availability_col must be exact names from columns or empty string. "
+            "availability_mode must be one of: in, out, any, none. "
+            "filter_terms must include product/entity/category/feature terms only. "
             "Exclude metric words and aggregation words like max/min/avg/sum/count/price/ціна/кількість. "
             "If useful, include 1-2 short aliases in other likely languages (uk/ru/en) that may appear in table values. "
             "Prefer 1-6 concise terms."
@@ -5276,14 +7760,14 @@ class Pipeline(object):
         payload = {
             "question": question,
             "columns": columns[:200],
-            "preview": ((profile or {}).get("preview") or [])[:20],
+            "numeric_columns": numeric_columns,
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
         except Exception:
-            return []
-        out: List[str] = []
-        raw = (parsed or {}).get("terms")
+            return {"terms": [], "slots": {}}
+        out_terms: List[str] = []
+        raw = (parsed or {}).get("filter_terms")
         if isinstance(raw, list):
             for t in raw:
                 s = str(t).strip()
@@ -5291,52 +7775,34 @@ class Pipeline(object):
                     continue
                 if re.fullmatch(r"[\d\s.,:%\-]+", s):
                     continue
-                if s not in out:
-                    out.append(s)
-        logging.info("event=subset_terms_llm terms=%s", _safe_trunc(out, 240))
-        return out[:6]
-
-    def _llm_pick_subset_metric_slots(self, question: str, profile: dict) -> Dict[str, Any]:
-        columns = [str(c) for c in (profile or {}).get("columns") or []]
-        if not columns:
-            return {}
-        system = (
-            "Map subset filtering query to aggregation slots. "
-            "Return ONLY JSON with keys: agg, metric_col, availability_mode, availability_col. "
-            "agg must be one of: count, sum, mean, min, max, median. "
-            "metric_col and availability_col must be exact names from columns or empty string. "
-            "availability_mode must be one of: in, out, any, none. "
-            "Use agg='sum' when user asks total quantity/amount in subset. "
-            "Use agg='count' only when user asks number of matching rows/items."
-        )
-        system = self._with_spreadsheet_skill_prompt(system, question, profile, focus="column")
-        payload = {
-            "question": question,
-            "columns": columns[:200],
-            "dtypes": (profile or {}).get("dtypes") or {},
-            "preview": ((profile or {}).get("preview") or [])[:20],
-        }
-        try:
-            parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
-        except Exception:
-            return {}
-        if not isinstance(parsed, dict):
-            return {}
-        out: Dict[str, Any] = {}
+                if s not in out_terms:
+                    out_terms.append(s)
+        out_slots: Dict[str, Any] = {}
         agg = str((parsed or {}).get("agg") or "").strip().lower()
         metric_col = str((parsed or {}).get("metric_col") or "").strip()
         availability_mode = str((parsed or {}).get("availability_mode") or "").strip().lower()
         availability_col = str((parsed or {}).get("availability_col") or "").strip()
         if agg in {"count", "sum", "mean", "min", "max", "median"}:
-            out["agg"] = agg
+            out_slots["agg"] = agg
         if metric_col in columns:
-            out["metric_col"] = metric_col
+            out_slots["metric_col"] = metric_col
         if availability_mode in {"in", "out", "any", "none"}:
-            out["availability_mode"] = availability_mode
+            out_slots["availability_mode"] = availability_mode
         if availability_col in columns:
-            out["availability_col"] = availability_col
-        logging.info("event=subset_slots_llm slots=%s", _safe_trunc(out, 260))
-        return out
+            out_slots["availability_col"] = availability_col
+        logging.info(
+            "event=subset_plan_llm terms=%s slots=%s",
+            _safe_trunc(out_terms, 240),
+            _safe_trunc(out_slots, 280),
+        )
+        return {"terms": out_terms[:6], "slots": out_slots}
+
+    def _llm_extract_subset_terms(self, question: str, profile: dict) -> List[str]:
+        return list((self._llm_pick_subset_plan_slots(question, profile) or {}).get("terms") or [])
+
+    def _llm_pick_subset_metric_slots(self, question: str, profile: dict) -> Dict[str, Any]:
+        slots = (self._llm_pick_subset_plan_slots(question, profile) or {}).get("slots")
+        return dict(slots) if isinstance(slots, dict) else {}
 
     def _build_subset_keyword_metric_shortcut(
         self,
@@ -5344,8 +7810,20 @@ class Pipeline(object):
         profile: dict,
         preferred_col: Optional[str] = None,
     ) -> Optional[Tuple[str, str]]:
-        terms_hint = self._llm_extract_subset_terms(question, profile)
-        slots_hint = self._llm_pick_subset_metric_slots(question, profile)
+        # Heuristic-first path avoids extra LLM latency and is robust to non-JSON "thinking" outputs.
+        shortcut = _subset_keyword_metric_shortcut_code(
+            question,
+            profile,
+            preferred_col=preferred_col,
+            terms_hint=[],
+            slots_hint={},
+        )
+        if shortcut:
+            return shortcut
+
+        subset_plan = self._llm_pick_subset_plan_slots(question, profile)
+        terms_hint = list((subset_plan or {}).get("terms") or [])
+        slots_hint = dict((subset_plan or {}).get("slots") or {})
         return _subset_keyword_metric_shortcut_code(
             question,
             profile,
@@ -5368,7 +7846,7 @@ class Pipeline(object):
         candidate_hit = None if has_edit else self._shortcut_router.shortcut_to_sandbox_code(question, profile)
         if candidate_hit:
             candidate_code, candidate_meta = candidate_hit
-            if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta, question):
+            if _should_reject_router_hit_for_read(has_edit, candidate_code, candidate_meta, question, profile):
                 logging.warning(
                     "event=shortcut_router status=rejected reason=read_guard intent_id=%s question=%s",
                     (candidate_meta or {}).get("intent_id"),
@@ -5394,7 +7872,13 @@ class Pipeline(object):
         aggregate_intent = _is_aggregate_query_intent(question)
 
         metric_col_hint: Optional[str] = None
-        if inferred_op == "read" and not is_meta and not has_edit and metrics:
+        if (
+            inferred_op == "read"
+            and not is_meta
+            and not has_edit
+            and metrics
+            and not (len(metrics) == 1 and metrics[0] == "count")
+        ):
             metric_col_hint = self._llm_pick_numeric_metric_column(question, profile)
 
         # Prefer deterministic subset+aggregation shortcut for aggregate filtered requests.
@@ -5492,7 +7976,7 @@ class Pipeline(object):
                 _safe_trunc(non_status_mentions, 200),
             )
             return False
-        # Entity-like tokens (e.g., NVIDIA, RTX4090) usually indicate filtered subset.
+        # Entity-like tokens (brand/model codes) usually indicate filtered subset.
         if re.search(r"\b[A-Z][A-Z0-9_-]{1,}\b", question or ""):
             logging.info("event=availability_shortcut_scope source=heuristic scope=filtered reason=entity_token")
             return False
@@ -5511,8 +7995,7 @@ class Pipeline(object):
         payload = {
             "question": question,
             "columns": columns[:200],
-            "dtypes": (profile or {}).get("dtypes") or {},
-            "preview": ((profile or {}).get("preview") or [])[:20],
+            "numeric_columns": _profile_numeric_columns(profile, limit=200),
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
@@ -5542,8 +8025,7 @@ class Pipeline(object):
         payload = {
             "question": question,
             "columns": columns[:200],
-            "dtypes": (profile or {}).get("dtypes") or {},
-            "df_profile": profile or {},
+            "numeric_columns": _profile_numeric_columns(profile, limit=200),
         }
         try:
             parsed = self._llm_json(system, json.dumps(payload, ensure_ascii=False))
@@ -5557,10 +8039,9 @@ class Pipeline(object):
             out["group_by"] = group_by
         if aggregate and aggregate in columns:
             out["aggregate"] = aggregate
-        if isinstance(top_n_raw, (int, float)):
-            out["top_n"] = max(1, int(top_n_raw))
-        elif isinstance(top_n_raw, str) and top_n_raw.strip().isdigit():
-            out["top_n"] = max(1, int(top_n_raw.strip()))
+        top_n = _normalize_optional_top_n(top_n_raw)
+        if top_n is not None:
+            out["top_n"] = top_n
         return out
 
     def _resolve_shortcut_placeholders(
@@ -5657,6 +8138,10 @@ class Pipeline(object):
         except Exception:
             return None
 
+        top_n_norm = int(top_n) if isinstance(top_n, int) else 0
+        if top_n_norm <= 0:
+            top_n_norm = 0
+
         lines: List[str] = []
         if isinstance(data, dict):
             items = list(data.items())
@@ -5664,7 +8149,7 @@ class Pipeline(object):
                 items.sort(key=lambda kv: float(kv[1]) if kv[1] is not None else float("-inf"), reverse=True)
             except Exception:
                 pass
-            rows = items[: max(1, top_n)]
+            rows = items if top_n_norm == 0 else items[:top_n_norm]
             if rows:
                 header = "| Ключ | Значення |"
                 sep = "|---|---|"
@@ -5676,7 +8161,7 @@ class Pipeline(object):
             if keys:
                 header = "| " + " | ".join(keys) + " |"
                 sep = "| " + " | ".join(["---"] * len(keys)) + " |"
-                top_rows = data[: max(1, top_n)]
+                top_rows = data if top_n_norm == 0 else data[:top_n_norm]
                 body = []
                 for row in top_rows:
                     body.append("| " + " | ".join(str(row.get(k, "")) for k in keys) + " |")
@@ -5694,8 +8179,11 @@ class Pipeline(object):
             data = json.loads(text)
         except Exception:
             return None
+        top_n_norm = int(top_n) if isinstance(top_n, int) else 0
+        if top_n_norm <= 0:
+            top_n_norm = 0
         if isinstance(data, dict):
-            rows = list(data.items())[: max(1, top_n)]
+            rows = list(data.items()) if top_n_norm == 0 else list(data.items())[:top_n_norm]
             if not rows:
                 return None
             header = "| Ключ | Значення |"
@@ -5708,7 +8196,7 @@ class Pipeline(object):
                 return None
             header = "| " + " | ".join(keys) + " |"
             sep = "| " + " | ".join(["---"] * len(keys)) + " |"
-            top_rows = data[: max(1, top_n)]
+            top_rows = data if top_n_norm == 0 else data[:top_n_norm]
             body = []
             for row in top_rows:
                 body.append("| " + " | ".join(str(row.get(k, "")) for k in keys) + " |")
@@ -5989,11 +8477,13 @@ class Pipeline(object):
                 return f"Значення в рядку {row_idx} — {scalar}."
             return scalar
 
-        list_answer = self._format_scalar_list_from_result(result_text)
+        list_answer = self._format_scalar_list_from_result(
+            result_text, max_items=int(self.valves.answer_list_max_items)
+        )
         if list_answer:
             return list_answer
 
-        table = self._format_table_from_result(result_text)
+        table = self._format_table_from_result(result_text, top_n=int(self.valves.answer_table_max_rows))
         is_preview_request = bool(
             re.search(r"\b(перш\w*|head|first|покаж\w*|show|preview|прев'ю|превю)\b", q)
         )
@@ -6031,10 +8521,10 @@ class Pipeline(object):
         if table:
             return table
         if is_grouping and (wants_counts or wants_pairs):
-            return self._format_top_pairs_from_result(result_text, top_n=100)
+            return self._format_top_pairs_from_result(result_text, top_n=int(self.valves.answer_pairs_max_rows))
         if not (wants_pairs and wants_counts):
             return None
-        return self._format_top_pairs_from_result(result_text, top_n=15)
+        return self._format_top_pairs_from_result(result_text, top_n=int(self.valves.answer_pairs_max_rows))
 
     def _fmt_cell_value(self, value: Any) -> str:
         if value is None:
@@ -6140,7 +8630,7 @@ class Pipeline(object):
         if col:
             parts.append(f"колонка {col}")
         if item_id is not None:
-            parts.append(f"ID {item_id}")
+            parts.append(f"ідентифікатор {item_id}")
         if new_value is not None:
             parts.append(f"нове значення: {new_value}")
         if parts:
@@ -6166,8 +8656,110 @@ class Pipeline(object):
         mutation_flags: Optional[dict],
         error: str,
     ) -> str:
+        tracer = current_route_tracer()
+
         def _log_return(mode: str, text: str) -> None:
             logging.info("event=final_answer_return mode=%s preview=%s", mode, _safe_trunc(text, 300))
+
+        def _question_is_error_diagnostic(q: str) -> bool:
+            return bool(
+                re.search(
+                    r"\b("
+                    r"помил\w*|error|exception|traceback|debug|діагност\w*|"
+                    r"чому\s+.*(?:помил|error)|"
+                    r"why\s+.*(?:error|fail)"
+                    r")\b",
+                    q or "",
+                    re.I,
+                )
+            )
+
+        def _answer_looks_like_unprompted_code_diagnostic(ans: str, q: str) -> bool:
+            if not (ans or "").strip():
+                return False
+            if _question_is_error_diagnostic(q):
+                return False
+            a = ans.lower()
+            strong_signals = [
+                "analysis_code",
+                "у коді",
+                "виникла помилка",
+                "потрібно замінити",
+                "```python",
+            ]
+            if any(sig in a for sig in strong_signals):
+                return True
+            return False
+
+        def _rewrite_from_result_text(reason: str) -> Optional[str]:
+            if not (result_text or "").strip():
+                return None
+            rewrite_system = self._prompts.get("final_rewrite_system", DEFAULT_FINAL_REWRITE_SYSTEM)
+            rewrite_payload = {"question": question, "result_text": result_text}
+            llm_stage_id = ""
+            if tracer:
+                llm_stage_id = tracer.start_stage(
+                    stage_key="llm_final_rewrite",
+                    stage_name="LLM Final Rewrite",
+                    purpose="Rewrite result_text into concise user-facing answer when primary answer is unsafe.",
+                    input_payload={
+                        "model": self.valves.base_llm_model,
+                        "temperature": 0.1,
+                        "messages": [
+                            {"role": "system", "content": rewrite_system},
+                            {"role": "user", "content": json.dumps(rewrite_payload, ensure_ascii=False)},
+                        ],
+                    },
+                    processing_summary="Call model with rewrite prompt and validate safe narrative output.",
+                    details={
+                        "llm": {
+                            "model": self.valves.base_llm_model,
+                            "temperature": 0.1,
+                            "messages": [
+                                {"role": "system", "content": rewrite_system},
+                                {"role": "user", "content": json.dumps(rewrite_payload, ensure_ascii=False)},
+                            ],
+                            "reason": reason,
+                        }
+                    },
+                )
+            try:
+                rewrite_resp = self._llm.chat.completions.create(
+                    model=self.valves.base_llm_model,
+                    messages=[
+                        {"role": "system", "content": rewrite_system},
+                        {"role": "user", "content": json.dumps(rewrite_payload, ensure_ascii=False)},
+                    ],
+                    temperature=0.1,
+                    max_tokens=int(self.valves.final_answer_max_tokens),
+                )
+                rewrite = (rewrite_resp.choices[0].message.content or "").strip()
+                if tracer and llm_stage_id:
+                    tracer.end_stage(
+                        llm_stage_id,
+                        status="ok",
+                        output_payload={"rewrite": rewrite},
+                        processing_summary="Rewrite response generated.",
+                        details={"llm": {"raw_response": rewrite}},
+                    )
+                if rewrite:
+                    logging.info(
+                        "event=final_answer mode=rewrite reason=%s preview=%s",
+                        reason,
+                        _safe_trunc(rewrite, 300),
+                    )
+                    return rewrite
+            except Exception as exc:
+                if tracer and llm_stage_id:
+                    tracer.end_stage(
+                        llm_stage_id,
+                        status="error",
+                        output_payload={},
+                        processing_summary="Rewrite model call failed.",
+                        error={"type": type(exc).__name__, "message": str(exc)},
+                    )
+                logging.warning("event=final_rewrite_failed reason=%s err=%s", reason, str(exc))
+            return None
 
         if run_status == "ok" and edit_expected and "COMMIT_DF = True" in (code or "") and not error:
             has_mutation = self._has_meaningful_mutation(mutation_summary, mutation_flags)
@@ -6199,23 +8791,48 @@ class Pipeline(object):
             msg = "Оновлено таблицю."
             _log_return("edit_fallback", msg)
             return msg
-        if run_status == "ok" and not (error or "").strip() and not (result_text or "").strip():
-            msg = "За умовою запиту не знайдено значень."
-            _log_return("empty_result", msg)
-            return msg
-        deterministic = self._deterministic_answer(question, result_text, profile)
-        if deterministic:
-            logging.info("event=final_answer mode=deterministic preview=%s", _safe_trunc(deterministic, 300))
-            _log_return("deterministic", deterministic)
-            return deterministic
+        # Strict success mode: format answer only from result_text without free-form LLM generation.
+        if run_status == "ok" and not (error or "").strip():
+            if not (result_text or "").strip():
+                msg = "За умовою запиту не знайдено значень."
+                _log_return("empty_result", msg)
+                return msg
+            if _scalar_text_is_nan_like(result_text):
+                filter_hint = _extract_filter_hint_from_analysis_code(code)
+                if filter_hint:
+                    msg = f"Не знайдено рядків для фільтра: {filter_hint}."
+                    _log_return("nan_filter_empty", msg)
+                    return msg
+                msg = "За умовою запиту не знайдено значень."
+                _log_return("nan_result", msg)
+                return msg
+            deterministic = self._deterministic_answer(question, result_text, profile)
+            if deterministic:
+                logging.info("event=final_answer mode=deterministic preview=%s", _safe_trunc(deterministic, 300))
+                _log_return("deterministic", deterministic)
+                return deterministic
+            table = self._format_table_from_result(result_text, top_n=int(self.valves.answer_table_max_rows))
+            if table:
+                _log_return("table_fallback", table)
+                return table
+            scalar_list = self._format_scalar_list_from_result(
+                result_text, max_items=int(self.valves.answer_list_max_items)
+            )
+            if scalar_list:
+                _log_return("list_fallback", scalar_list)
+                return scalar_list
+            raw = (result_text or "").strip()
+            if raw:
+                _log_return("raw_result_text", raw)
+                return raw
         system = self._prompts.get("final_answer_system", DEFAULT_FINAL_ANSWER_SYSTEM)
         payload = {
             "question": question,
-            "df_profile": profile,
+            "schema": _compact_profile_for_llm(profile),
             "plan": plan,
-            "analysis_code": code,
+            "analysis_code": _safe_trunc(code, 1600),
             "exec_status": run_status,
-            "stdout": stdout,
+            "stdout": _safe_trunc(stdout, 1200),
             "result_text": result_text,
             "result_meta": result_meta,
             "error": error,
@@ -6225,16 +8842,83 @@ class Pipeline(object):
             _safe_trunc(question, 400),
             _safe_trunc(json.dumps(payload, ensure_ascii=False), 1200),
         )
-        resp = self._llm.chat.completions.create(
-            model=self.valves.base_llm_model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ],
-            temperature=0.2,
-        )
-        answer = (resp.choices[0].message.content or "").strip()
+        final_llm_stage_id = ""
+        if tracer:
+            final_llm_stage_id = tracer.start_stage(
+                stage_key="llm_final_answer",
+                stage_name="LLM Final Answer",
+                purpose="Generate final natural language answer from execution payload.",
+                input_payload={
+                    "model": self.valves.base_llm_model,
+                    "temperature": 0.2,
+                    "system_chars": len(system or ""),
+                    "user_chars": len(json.dumps(payload, ensure_ascii=False)),
+                    "payload_keys": list(payload.keys()),
+                },
+                processing_summary="Call base model for final answer when deterministic formatter did not return.",
+                details={
+                    "llm": {
+                        "model": self.valves.base_llm_model,
+                        "temperature": 0.2,
+                        "messages": [
+                            {"role": "system", "chars": len(system or ""), "content_preview": _safe_trunc(system, 1200)},
+                            {
+                                "role": "user",
+                                "chars": len(json.dumps(payload, ensure_ascii=False)),
+                                "content_preview": _safe_trunc(json.dumps(payload, ensure_ascii=False), 1200),
+                            },
+                        ],
+                    }
+                },
+            )
+        answer = ""
+        try:
+            resp = self._llm.chat.completions.create(
+                model=self.valves.base_llm_model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                max_tokens=int(self.valves.final_answer_max_tokens),
+            )
+            answer = (resp.choices[0].message.content or "").strip()
+            if tracer and final_llm_stage_id:
+                tracer.end_stage(
+                    final_llm_stage_id,
+                    status="ok",
+                    output_payload={"answer": answer},
+                    processing_summary="Final-answer model call completed.",
+                    details={"llm": {"raw_response": answer}},
+                )
+        except Exception as exc:
+            if tracer and final_llm_stage_id:
+                tracer.end_stage(
+                    final_llm_stage_id,
+                    status="error",
+                    output_payload={"answer": answer},
+                    processing_summary="Final-answer model call failed.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
         logging.info("event=llm_final_response preview=%s", _safe_trunc(answer, 1200))
+        if run_status == "ok" and not (error or "").strip():
+            if _answer_looks_like_unprompted_code_diagnostic(answer, question):
+                logging.warning("event=final_answer mode=llm_unprompted_code_diagnostic")
+                rewrite = _rewrite_from_result_text("unprompted_code_diagnostic")
+                if rewrite:
+                    _log_return("rewrite_unprompted_code_diagnostic", rewrite)
+                    return rewrite
+                fallback = (
+                    self._deterministic_answer(question, result_text, profile)
+                    or self._format_table_from_result(result_text, top_n=int(self.valves.answer_table_max_rows))
+                    or self._format_scalar_list_from_result(
+                        result_text, max_items=int(self.valves.answer_list_max_items)
+                    )
+                )
+                if fallback:
+                    _log_return("fallback_unprompted_code_diagnostic", fallback)
+                    return fallback
         if result_text and re.search(r"\d+", result_text or ""):
             real_numbers = set(re.findall(r"\d+", result_text))
             llm_numbers = set(re.findall(r"\d+", answer))
@@ -6242,26 +8926,12 @@ class Pipeline(object):
                 logging.warning(
                     "event=final_answer mode=llm_hallucinated real=%s llm=%s", real_numbers, llm_numbers
                 )
-                rewrite_system = self._prompts.get("final_rewrite_system", DEFAULT_FINAL_REWRITE_SYSTEM)
-                rewrite_payload = {"question": question, "result_text": result_text}
-                try:
-                    rewrite_resp = self._llm.chat.completions.create(
-                        model=self.valves.base_llm_model,
-                        messages=[
-                            {"role": "system", "content": rewrite_system},
-                            {"role": "user", "content": json.dumps(rewrite_payload, ensure_ascii=False)},
-                        ],
-                        temperature=0.1,
-                    )
-                    rewrite = (rewrite_resp.choices[0].message.content or "").strip()
-                    if rewrite:
-                        rewrite_numbers = set(re.findall(r"\d+", rewrite))
-                        if not rewrite_numbers or (real_numbers & rewrite_numbers):
-                            logging.info("event=final_answer mode=rewrite preview=%s", _safe_trunc(rewrite, 300))
-                            _log_return("rewrite", rewrite)
-                            return rewrite
-                except Exception as exc:
-                    logging.warning("event=final_rewrite_failed err=%s", str(exc))
+                rewrite = _rewrite_from_result_text("numeric_mismatch")
+                if rewrite:
+                    rewrite_numbers = set(re.findall(r"\d+", rewrite))
+                    if not rewrite_numbers or (real_numbers & rewrite_numbers):
+                        _log_return("rewrite", rewrite)
+                        return rewrite
                 msg = "Не можу безпечно сформувати відповідь. Спробуйте уточнити запит."
                 _log_return("unsafe_numbers", msg)
                 return msg
@@ -6315,6 +8985,23 @@ class Pipeline(object):
         )
 
     def _sandbox_load(self, file_id: str, meta: dict, data: bytes) -> Dict[str, Any]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="sandbox_load",
+                stage_name="Sandbox DataFrame Load",
+                purpose="Decode uploaded file and create sandbox DataFrame with schema profile.",
+                input_payload={
+                    "file_id": file_id,
+                    "filename": _guess_filename(meta),
+                    "content_type": (meta or {}).get("content_type") or (meta or {}).get("mime"),
+                    "bytes_len": len(data or b""),
+                    "max_rows": self.valves.max_rows,
+                    "preview_rows": self.valves.preview_rows,
+                },
+                processing_summary="POST /v1/dataframe/load to sandbox service.",
+            )
         url = f"{self.valves.sandbox_url.rstrip('/')}/v1/dataframe/load"
         payload = {
             "file_id": file_id,
@@ -6324,11 +9011,49 @@ class Pipeline(object):
             "max_rows": self.valves.max_rows,
             "preview_rows": self.valves.preview_rows,
         }
-        resp = requests.post(url, headers=self._sandbox_headers(), json=payload, timeout=DEF_TIMEOUT_S)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = requests.post(url, headers=self._sandbox_headers(), json=payload, timeout=DEF_TIMEOUT_S)
+            resp.raise_for_status()
+            out = resp.json()
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="ok",
+                    output_payload=out,
+                    processing_summary="Sandbox accepted file and returned df_id/profile.",
+                )
+            return out
+        except Exception as exc:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="error",
+                    output_payload={},
+                    processing_summary="Sandbox load failed.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            raise
 
     def _sandbox_run(self, df_id: str, code: str) -> Dict[str, Any]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        started = time.monotonic()
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="sandbox_run",
+                stage_name="Sandbox Code Execution",
+                purpose="Execute generated pandas code inside isolated sandbox runtime.",
+                input_payload={
+                    "df_id": df_id,
+                    "timeout_s": self.valves.code_timeout_s,
+                    "preview_rows": self.valves.preview_rows,
+                    "max_cell_chars": self.valves.max_cell_chars,
+                    "max_stdout_chars": self.valves.max_stdout_chars,
+                    "analysis_code": code,
+                },
+                processing_summary="POST /v1/dataframe/run with compiled analysis code.",
+                details={"sandbox": {"code": code}},
+            )
         url = f"{self.valves.sandbox_url.rstrip('/')}/v1/dataframe/run"
         payload = {
             "df_id": df_id,
@@ -6338,9 +9063,56 @@ class Pipeline(object):
             "max_cell_chars": self.valves.max_cell_chars,
             "max_stdout_chars": self.valves.max_stdout_chars,
         }
-        resp = requests.post(url, headers=self._sandbox_headers(), json=payload, timeout=DEF_TIMEOUT_S)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = requests.post(url, headers=self._sandbox_headers(), json=payload, timeout=DEF_TIMEOUT_S)
+            resp.raise_for_status()
+            out = resp.json()
+            if tracer and stage_id:
+                sandbox_status = str(out.get("status") or "")
+                if sandbox_status == "ok":
+                    exit_code = 0
+                elif sandbox_status == "timeout":
+                    exit_code = 124
+                else:
+                    exit_code = 1
+                tracer.end_stage(
+                    stage_id,
+                    status="ok" if sandbox_status == "ok" else "warn",
+                    output_payload=_compact_sandbox_run_output(out),
+                    processing_summary="Sandbox execution completed.",
+                    details={
+                        "sandbox": {
+                            "code": code,
+                            "runtime_ms": round((time.monotonic() - started) * 1000.0, 3),
+                            "status": sandbox_status,
+                            "exit_code": exit_code,
+                            "stdout": out.get("stdout", ""),
+                            "stderr": out.get("error", "") if sandbox_status != "ok" else "",
+                            "error": out.get("error", ""),
+                            "artifacts": out.get("artifacts", []) if isinstance(out.get("artifacts"), list) else [],
+                        }
+                    },
+                )
+            return out
+        except Exception as exc:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="error",
+                    output_payload={},
+                    processing_summary="Sandbox execution request failed.",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                    details={
+                        "sandbox": {
+                            "code": code,
+                            "runtime_ms": round((time.monotonic() - started) * 1000.0, 3),
+                            "exit_code": 1,
+                            "stderr": str(exc),
+                            "artifacts": [],
+                        }
+                    },
+                )
+            raise
 
     def _prepare_analysis_code_for_question(
         self,
@@ -6348,6 +9120,36 @@ class Pipeline(object):
         profile: dict,
         has_edit: bool,
     ) -> Dict[str, Any]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="analysis_planning",
+                stage_name="Analysis Plan And Code Build",
+                purpose="Select shortcut or planner path and produce validated sandbox code.",
+                input_payload={
+                    "question": question,
+                    "has_edit": has_edit,
+                    "profile": _compact_profile_for_trace(profile),
+                },
+                processing_summary="Route query through shortcut router or LLM planner and validate generated code.",
+            )
+
+        def _finish(result: Dict[str, Any], status: str = "ok", processing: str = "") -> Dict[str, Any]:
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status=status,
+                    output_payload=_compact_plan_result_for_trace(result),
+                    processing_summary=processing
+                    or (
+                        "Planning finished successfully."
+                        if status == "ok"
+                        else "Planning failed before sandbox execution."
+                    ),
+                )
+            return result
+
         events: List[Tuple[str, Dict[str, Any]]] = []
         events.append(("codegen", {"question": _safe_trunc(question, 200)}))
 
@@ -6355,52 +9157,125 @@ class Pipeline(object):
         op: Optional[str] = None
         commit_df: Optional[bool] = None
         plan = ""
+        analysis_code = ""
+        used_router = False
+        used_shortcut = False
 
         router_hit, shortcut, router_meta, planner_hints = self._select_router_or_shortcut(question, profile, has_edit)
         lookup_hints = planner_hints.get("lookup_hints") if isinstance(planner_hints, dict) else None
         if router_hit:
             analysis_code, router_meta = router_hit
-            plan = f"retrieval_intent:{router_meta.get('intent_id')}"
+            plan = (
+                f"retrieval_intent:{router_meta.get('intent_id')};"
+                f"selector_mode:{router_meta.get('selector_mode') or ''}"
+            )
             events.append(("codegen_shortcut", {"intent_id": router_meta.get("intent_id")}))
-        elif shortcut:
-            analysis_code, plan = shortcut
-            events.append(("codegen_shortcut", {}))
+            used_router = True
         else:
-            analysis_code, plan, op, commit_df = self._plan_code(question, profile, lookup_hints=lookup_hints)
+            rlm_primary_enabled = bool(self.valves.rlm_primary_planner_enabled) and bool(self.valves.rlm_codegen_enabled)
+            if rlm_primary_enabled:
+                rlm_code, rlm_plan, rlm_op, rlm_commit = self._plan_code_with_rlm_tool(
+                    question=question,
+                    profile=profile,
+                    lookup_hints=lookup_hints,
+                    retry_reason="primary_planner",
+                    previous_code="",
+                )
+                if (rlm_code or "").strip():
+                    analysis_code, plan, op, commit_df = rlm_code, rlm_plan, rlm_op, rlm_commit
+                    events.append(("codegen_rlm_tool", {"phase": "primary_planner"}))
+            if not (analysis_code or "").strip() and shortcut:
+                analysis_code, plan = shortcut
+                used_shortcut = True
+                events.append(("codegen_shortcut", {}))
+
+            try:
+                if not (analysis_code or "").strip():
+                    analysis_code, plan, op, commit_df = self._plan_code(question, profile, lookup_hints=lookup_hints)
+            except Exception as exc:
+                logging.warning("event=plan_code_error error=%s", str(exc))
+                analysis_code = ""
+                plan = ""
+                op = None
+                commit_df = None
+                read_fallback: Optional[Tuple[str, str]] = None
+                if _infer_op_from_question(question) == "read":
+                    read_fallback = (
+                        self._build_subset_keyword_metric_shortcut(question, profile, preferred_col=None)
+                        or _stats_shortcut_code(question, profile)
+                        or _template_shortcut_code(question, profile)
+                    )
+                if read_fallback:
+                    analysis_code, plan = read_fallback
+                    used_shortcut = True
+                    events.append(("codegen_shortcut", {"fallback": "plan_error"}))
+            if not (analysis_code or "").strip():
+                rlm_code, rlm_plan, rlm_op, rlm_commit = self._plan_code_with_rlm_tool(
+                    question=question,
+                    profile=profile,
+                    lookup_hints=lookup_hints,
+                    retry_reason="planner_empty_or_error",
+                    previous_code=analysis_code,
+                )
+                if (rlm_code or "").strip():
+                    analysis_code, plan, op, commit_df = rlm_code, rlm_plan, rlm_op, rlm_commit
+                    events.append(("codegen_rlm_tool", {"phase": "primary"}))
+            if not (analysis_code or "").strip() and _infer_op_from_question(question) == "read":
+                read_fallback = (
+                    self._build_subset_keyword_metric_shortcut(question, profile, preferred_col=None)
+                    or _stats_shortcut_code(question, profile)
+                    or _template_shortcut_code(question, profile)
+                )
+                if read_fallback:
+                    analysis_code, plan = read_fallback
+                    used_shortcut = True
+                    events.append(("codegen_shortcut", {"fallback": "plan_empty"}))
             if not (analysis_code or "").strip():
                 events.append(("codegen_empty", {}))
-                return {
+                return _finish({
                     "ok": False,
                     "events": events,
                     "status": "codegen_empty",
                     "message_sync": "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше.",
                     "message_stream": "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання.",
-                }
+                }, status="warn", processing="LLM planner returned empty analysis_code.")
 
         analysis_code, count_err = _enforce_count_code(question, analysis_code)
         if count_err:
-            return {
+            return _finish({
                 "ok": False,
                 "events": events,
                 "status": "invalid_code",
                 "message_sync": f"Неможливо виконати запит: {count_err}",
                 "message_stream": f"Неможливо виконати: {count_err}",
-            }
+            }, status="warn", processing="Generated code failed count-intent guardrails.")
         analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
 
         analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
             question, analysis_code, op, commit_df, df_profile=profile
         )
+        subset_guard_applies = _missing_subset_filter_guard_applies(finalize_err, question, profile)
+        subset_guard_conflict = bool(
+            finalize_err and "missing_subset_filter" in str(finalize_err or "") and not subset_guard_applies
+        )
         need_retry_missing_result = bool(
-            finalize_err and "missing_result_assignment" in finalize_err and not shortcut and not router_hit
+            finalize_err and "missing_result_assignment" in finalize_err and not used_shortcut and not used_router
         )
-        need_retry_missing_filter = bool(finalize_err and "missing_subset_filter" in finalize_err)
+        need_retry_missing_filter = bool(subset_guard_applies)
+        need_retry_subset_guard_conflict = bool(subset_guard_conflict)
         need_retry_read_mutation = bool(
-            finalize_err and "read-запиту змінює таблицю" in finalize_err and not shortcut and not router_hit
+            finalize_err and "read-запиту змінює таблицю" in finalize_err and not used_shortcut and not used_router
         )
-        if need_retry_missing_result or need_retry_missing_filter or need_retry_read_mutation:
+        if (
+            need_retry_missing_result
+            or need_retry_missing_filter
+            or need_retry_subset_guard_conflict
+            or need_retry_read_mutation
+        ):
             if need_retry_missing_filter:
                 retry_reason = "missing_subset_filter"
+            elif need_retry_subset_guard_conflict:
+                retry_reason = "subset_guard_conflict_non_subset"
             elif need_retry_read_mutation:
                 retry_reason = "read_mutation"
             else:
@@ -6408,6 +9283,14 @@ class Pipeline(object):
             events.append(("codegen_retry", {"reason": retry_reason}))
             if need_retry_missing_filter:
                 analysis_code, plan, op, commit_df = self._plan_code_retry_missing_filter(
+                    question=question,
+                    profile=profile,
+                    previous_code=analysis_code,
+                    reason=finalize_err or "",
+                    lookup_hints=lookup_hints,
+                )
+            elif need_retry_subset_guard_conflict:
+                analysis_code, plan, op, commit_df = self._plan_code_retry_subset_guard_conflict(
                     question=question,
                     profile=profile,
                     previous_code=analysis_code,
@@ -6431,68 +9314,130 @@ class Pipeline(object):
                     lookup_hints=lookup_hints,
                 )
             if not (analysis_code or "").strip():
+                rlm_code, rlm_plan, rlm_op, rlm_commit = self._plan_code_with_rlm_tool(
+                    question=question,
+                    profile=profile,
+                    lookup_hints=lookup_hints,
+                    retry_reason=retry_reason,
+                    previous_code=analysis_code,
+                )
+                if (rlm_code or "").strip():
+                    analysis_code, plan, op, commit_df = rlm_code, rlm_plan, rlm_op, rlm_commit
+                    events.append(("codegen_rlm_tool", {"phase": "retry"}))
+            if not (analysis_code or "").strip() and _infer_op_from_question(question) == "read":
+                read_fallback = (
+                    self._build_subset_keyword_metric_shortcut(question, profile, preferred_col=None)
+                    or _stats_shortcut_code(question, profile)
+                    or _template_shortcut_code(question, profile)
+                )
+                if read_fallback:
+                    analysis_code, plan = read_fallback
+                    op = None
+                    commit_df = None
+                    used_shortcut = True
+                    events.append(("codegen_shortcut", {"fallback": "retry_plan_empty"}))
+            if not (analysis_code or "").strip():
                 events.append(("codegen_empty", {}))
-                return {
+                return _finish({
                     "ok": False,
                     "events": events,
                     "status": "codegen_empty",
                     "message_sync": "Я не зміг згенерувати код для цього запиту. Спробуйте сформулювати інакше.",
                     "message_stream": "Не вдалося згенерувати код аналізу. Спробуйте інше формулювання.",
-                }
+                }, status="warn", processing="Retry planner attempt returned empty code.")
             analysis_code, count_err = _enforce_count_code(question, analysis_code)
             if count_err:
-                return {
+                return _finish({
                     "ok": False,
                     "events": events,
                     "status": "invalid_code",
                     "message_sync": f"Неможливо виконати запит: {count_err}",
                     "message_stream": f"Неможливо виконати: {count_err}",
-                }
+                }, status="warn", processing="Retry code failed count-intent guardrails.")
             analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
             analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
                 question, analysis_code, op, commit_df, df_profile=profile
             )
 
         if finalize_err:
+            if not used_shortcut and not used_router:
+                rlm_code, rlm_plan, rlm_op, rlm_commit = self._plan_code_with_rlm_tool(
+                    question=question,
+                    profile=profile,
+                    lookup_hints=lookup_hints,
+                    retry_reason=str(finalize_err or ""),
+                    previous_code=analysis_code,
+                )
+                if (rlm_code or "").strip():
+                    events.append(("codegen_rlm_tool", {"phase": "finalize_error"}))
+                    analysis_code, plan, op, commit_df = rlm_code, rlm_plan, rlm_op, rlm_commit
+                    analysis_code, count_err = _enforce_count_code(question, analysis_code)
+                    if count_err:
+                        return _finish({
+                            "ok": False,
+                            "events": events,
+                            "status": "invalid_code",
+                            "message_sync": f"Неможливо виконати запит: {count_err}",
+                            "message_stream": f"Неможливо виконати: {count_err}",
+                        }, status="warn", processing="RLM tool code failed count-intent guardrails.")
+                    analysis_code = _enforce_entity_nunique_code(question, analysis_code, profile)
+                    analysis_code, edit_expected, finalize_err = _finalize_code_for_sandbox(
+                        question, analysis_code, op, commit_df, df_profile=profile
+                    )
+
+        if finalize_err:
             if "missing_result_assignment" in finalize_err:
                 status = "invalid_missing_result"
             elif "missing_subset_filter" in finalize_err:
-                status = "invalid_subset_filter"
+                if _missing_subset_filter_guard_applies(finalize_err, question, profile):
+                    status = "invalid_subset_filter"
+                else:
+                    status = "invalid_guardrail_conflict"
+                    finalize_err = (
+                        "Guardrail conflict: query does not request subset filtering. "
+                        "Use full-table aggregation/group-by unless an explicit subset is requested."
+                    )
             else:
                 status = "invalid_read_mutation"
-            return {
+            return _finish({
                 "ok": False,
                 "events": events,
                 "status": status,
                 "message_sync": f"Неможливо виконати запит: {finalize_err}",
                 "message_stream": f"Неможливо виконати: {finalize_err}",
-            }
+            }, status="warn", processing="Code finalization failed guardrail validation.")
 
         if _has_forbidden_import_nodes(analysis_code):
-            return {
+            return _finish({
                 "ok": False,
                 "events": events,
                 "status": "invalid_import",
                 "message_sync": "Неможливо виконати запит: згенерований код містить заборонений import.",
                 "message_stream": "Неможливо виконати: згенерований код містить заборонений import.",
-            }
+            }, status="warn", processing="Forbidden import detected in generated code.")
 
         analysis_code, plan = self._resolve_shortcut_placeholders(analysis_code, plan, question, profile)
         analysis_code = textwrap.dedent(analysis_code or "").strip() + "\n"
         if "df_profile" in (analysis_code or ""):
-            analysis_code = f"df_profile = {profile!r}\n" + analysis_code
+            analysis_code = f"df_profile = {_compact_profile_for_llm(profile)!r}\n" + analysis_code
         analysis_code = _normalize_generated_code(analysis_code)
         logging.info("event=analysis_code preview=%s", _safe_trunc(analysis_code, 4000))
         if _has_forbidden_import_nodes(analysis_code):
-            return {
+            return _finish({
                 "ok": False,
                 "events": events,
                 "status": "invalid_import",
                 "message_sync": "Неможливо виконати запит: згенерований код містить заборонений import.",
                 "message_stream": "Неможливо виконати: згенерований код містить заборонений import.",
-            }
+            }, status="warn", processing="Forbidden import detected after placeholder resolution.")
 
-        return {
+        router_meta = dict(router_meta or {})
+        router_meta["confidence_guard_enabled"] = False
+        router_meta["confidence_guard_status"] = "removed"
+        router_meta["confidence_guard_score"] = None
+        router_meta["confidence_guard_reason"] = "removed"
+
+        return _finish({
             "ok": True,
             "events": events,
             "analysis_code": analysis_code,
@@ -6500,7 +9445,8 @@ class Pipeline(object):
             "op": op,
             "commit_df": commit_df,
             "edit_expected": edit_expected,
-        }
+            "router_meta": router_meta,
+        }, status="ok", processing="Code prepared and validated for sandbox execution.")
 
     def _run_analysis_with_retry(
         self,
@@ -6513,12 +9459,56 @@ class Pipeline(object):
         commit_df: Optional[bool],
         edit_expected: bool,
     ) -> Dict[str, Any]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="analysis_execute",
+                stage_name="Analysis Execution And Retry",
+                purpose="Execute analysis code in sandbox and optionally retry for retryable runtime errors.",
+                input_payload={
+                    "question": question,
+                    "df_id": df_id,
+                    "analysis_code": analysis_code,
+                    "plan": plan,
+                    "op": op,
+                    "commit_df": commit_df,
+                    "edit_expected": edit_expected,
+                },
+                processing_summary="Run sandbox execution, inspect status/error, and trigger one retry when allowed.",
+            )
         events: List[Tuple[str, Dict[str, Any]]] = []
         events.append(("sandbox_run", {"df_id": df_id}))
         run_resp = self._sandbox_run(df_id, analysis_code)
 
         run_status = run_resp.get("status", "")
         run_error = run_resp.get("error", "") or ""
+        if run_status != "ok":
+            try:
+                repl_repair = self._rlm_core_repl_repair(
+                    question=question,
+                    profile=profile,
+                    df_id=df_id,
+                    failed_code=analysis_code,
+                    failed_error=run_error,
+                    op=op,
+                    commit_df=commit_df,
+                )
+                if repl_repair:
+                    events.append(("codegen_rlm_tool", {"phase": "core_repl"}))
+                    events.append(("sandbox_run", {"df_id": df_id, "retry": "rlm_core_repl"}))
+                    run_resp = dict(repl_repair.get("run_resp") or {})
+                    analysis_code = str(repl_repair.get("analysis_code") or analysis_code)
+                    edit_expected = bool(repl_repair.get("edit_expected", edit_expected))
+                    logging.info("event=analysis_code_retry_rlm_core preview=%s", _safe_trunc(analysis_code, 4000))
+                    run_status = run_resp.get("status", "")
+                    run_error = run_resp.get("error", "") or ""
+            except Exception as retry_exc:
+                logging.warning(
+                    "event=sandbox_retry_failed reason=rlm_core_repl error=%s",
+                    _safe_trunc(str(retry_exc), 500),
+                )
+
         if run_status != "ok" and _is_retryable_import_keyerror(run_error):
             try:
                 logging.warning("event=sandbox_retry reason=import_keyerror error=%s", _safe_trunc(run_error, 500))
@@ -6554,7 +9544,7 @@ class Pipeline(object):
                         )
                         retry_code = textwrap.dedent(retry_code or "").strip() + "\n"
                         if "df_profile" in (retry_code or ""):
-                            retry_code = f"df_profile = {profile!r}\n" + retry_code
+                            retry_code = f"df_profile = {_compact_profile_for_llm(profile)!r}\n" + retry_code
                         retry_code = _normalize_generated_code(retry_code)
                         logging.info("event=analysis_code_retry preview=%s", _safe_trunc(retry_code, 4000))
 
@@ -6570,14 +9560,72 @@ class Pipeline(object):
                     "event=sandbox_retry_failed reason=import_keyerror error=%s",
                     _safe_trunc(str(retry_exc), 500),
                 )
+        run_status = run_resp.get("status", "")
+        run_error = run_resp.get("error", "") or ""
+        if run_status != "ok" and bool(self.valves.rlm_codegen_runtime_retry_enabled):
+            try:
+                logging.warning(
+                    "event=sandbox_retry reason=rlm_codegen_runtime status=%s error=%s",
+                    run_status,
+                    _safe_trunc(run_error, 500),
+                )
+                events.append(("codegen_rlm_tool", {"phase": "runtime_error"}))
+                retry_code, retry_plan, retry_op, retry_commit = self._plan_code_with_rlm_tool(
+                    question=question,
+                    profile=profile,
+                    retry_reason=f"runtime_error:{run_status}",
+                    previous_code=analysis_code,
+                    runtime_error=run_error,
+                )
+                if (retry_code or "").strip():
+                    retry_code, retry_edit_expected, retry_finalize_err = _finalize_code_for_sandbox(
+                        question, retry_code, retry_op, retry_commit, df_profile=profile
+                    )
+                    if not retry_finalize_err and not _has_forbidden_import_nodes(retry_code):
+                        retry_code, retry_plan = self._resolve_shortcut_placeholders(
+                            retry_code, retry_plan, question, profile
+                        )
+                        retry_code = textwrap.dedent(retry_code or "").strip() + "\n"
+                        if "df_profile" in (retry_code or ""):
+                            retry_code = f"df_profile = {_compact_profile_for_llm(profile)!r}\n" + retry_code
+                        retry_code = _normalize_generated_code(retry_code)
+                        logging.info("event=analysis_code_retry_rlm preview=%s", _safe_trunc(retry_code, 4000))
+                        events.append(("sandbox_run", {"df_id": df_id, "retry": "rlm_codegen"}))
+                        retry_resp = self._sandbox_run(df_id, retry_code)
+                        if retry_resp is not None:
+                            run_resp = retry_resp
+                            analysis_code = retry_code
+                            plan = retry_plan
+                            edit_expected = retry_edit_expected
+            except Exception as retry_exc:
+                logging.warning(
+                    "event=sandbox_retry_failed reason=rlm_codegen_runtime error=%s",
+                    _safe_trunc(str(retry_exc), 500),
+                )
 
-        return {
+        result = {
             "events": events,
             "run_resp": run_resp,
             "analysis_code": analysis_code,
             "plan": plan,
             "edit_expected": edit_expected,
         }
+        if tracer and stage_id:
+            run_status = str((run_resp or {}).get("status") or "")
+            tracer.end_stage(
+                stage_id,
+                status="ok" if run_status == "ok" else "warn",
+                output_payload={
+                    "events": events,
+                    "run_resp": _compact_sandbox_run_output(run_resp),
+                    "analysis_code_chars": len(str(analysis_code or "")),
+                    "analysis_code_preview": _safe_trunc(str(analysis_code or ""), 600),
+                    "plan_preview": _safe_trunc(str(plan or ""), 400),
+                    "edit_expected": bool(edit_expected),
+                },
+                processing_summary="Sandbox execution stage completed with retry handling.",
+            )
+        return result
 
     def _postprocess_run_result(
         self,
@@ -6591,6 +9639,22 @@ class Pipeline(object):
         file_id: str,
         df_id: str,
     ) -> Dict[str, Any]:
+        tracer = current_route_tracer()
+        stage_id = ""
+        if tracer:
+            stage_id = tracer.start_stage(
+                stage_key="postprocess_result",
+                stage_name="Postprocess Execution Result",
+                purpose="Apply commit rules, refresh profile/session cache, and map sandbox status to pipeline status.",
+                input_payload={
+                    "run_resp": _compact_sandbox_run_output(run_resp),
+                    "edit_expected": edit_expected,
+                    "file_id": file_id,
+                    "df_id": df_id,
+                    "cached_profile_fingerprint": cached_fp,
+                },
+                processing_summary="Inspect commit flags and profile diffs, then derive pipeline post-status.",
+            )
         profile_out = (run_resp or {}).get("profile")
         was_committed = bool((run_resp or {}).get("committed"))
         structure_changed = bool((run_resp or {}).get("structure_changed"))
@@ -6614,7 +9678,7 @@ class Pipeline(object):
         run_status = str((run_resp or {}).get("status", ""))
         if run_status != "ok":
             error = (run_resp or {}).get("error", "") or "Sandbox execution failed."
-            return {
+            result = {
                 "ok": False,
                 "status": run_status,
                 "profile": profile,
@@ -6627,6 +9691,14 @@ class Pipeline(object):
                     "profile_changed": profile_changed,
                 },
             }
+            if tracer and stage_id:
+                tracer.end_stage(
+                    stage_id,
+                    status="warn",
+                    output_payload=_compact_postprocess_result_for_trace(result),
+                    processing_summary="Sandbox did not return ok status; mapped to pipeline error response.",
+                )
+            return result
 
         has_commit_marker = "COMMIT_DF" in (analysis_code or "")
         auto_committed = bool((run_resp or {}).get("auto_committed"))
@@ -6642,7 +9714,7 @@ class Pipeline(object):
 
         if edit_expected and has_commit_marker:
             if not (was_committed or auto_committed or structure_changed or profile_changed):
-                return {
+                result = {
                     "ok": False,
                     "status": "commit_failed",
                     "profile": profile,
@@ -6655,8 +9727,16 @@ class Pipeline(object):
                         "profile_changed": profile_changed,
                     },
                 }
+                if tracer and stage_id:
+                    tracer.end_stage(
+                        stage_id,
+                        status="warn",
+                        output_payload=_compact_postprocess_result_for_trace(result),
+                        processing_summary="Edit was expected but commit signals show no persisted mutation.",
+                    )
+                return result
 
-        return {
+        result = {
             "ok": True,
             "status": run_status,
             "profile": profile,
@@ -6667,6 +9747,14 @@ class Pipeline(object):
                 "profile_changed": profile_changed,
             },
         }
+        if tracer and stage_id:
+            tracer.end_stage(
+                stage_id,
+                status="ok",
+                output_payload=_compact_postprocess_result_for_trace(result),
+                processing_summary="Postprocess complete; result accepted.",
+            )
+        return result
 
     def pipe(
         self,
@@ -6688,6 +9776,10 @@ class Pipeline(object):
         request_id, trace_id = _extract_request_trace_ids(body)
         request_token = _REQUEST_ID_CTX.set(request_id)
         trace_token = _TRACE_ID_CTX.set(trace_id)
+        llm_stats_token = _LLM_CALL_STATS_CTX.set([])
+        route_tracer = self._new_route_tracer(request_id=request_id, trace_id=trace_id, mode="sync")
+        route_trace_token = set_active_route_tracer(route_tracer) if route_tracer else None
+        route_trace_status = "ok"
         try:
             logging.info("event=request_context mode=sync")
             self._emit(event_emitter, "start", {"model_id": model_id, "has_messages": bool(messages)})
@@ -6700,6 +9792,20 @@ class Pipeline(object):
                 _safe_trunc(question, 200),
                 not bool(question),
             )
+            if route_tracer:
+                route_tracer.record_stage(
+                    stage_key="request_intake",
+                    stage_name="Request Intake",
+                    purpose="Normalize user query and determine if this request should run the spreadsheet pipeline.",
+                    input_payload={
+                        "user_message_preview": _safe_trunc(user_message, 300),
+                        "messages_count": len(messages or []),
+                        "model_id": model_id,
+                    },
+                    output_payload={"question": question, "selected_empty": not bool(question)},
+                    processing_summary="Extract effective user query and skip pure meta-task traffic.",
+                    status="ok" if bool(question) else "warn",
+                )
             if self.valves.debug:
                 logging.info("event=query_selection_tail payload=%s", _safe_trunc(_query_selection_debug(messages), 1200))
             if not question:
@@ -6707,10 +9813,12 @@ class Pipeline(object):
                 reason = "meta_without_user_query" if _is_meta_task_text(raw_user_message) else "no_user_query_found"
                 logging.info("event=skip_meta_task_sync reason=%s", reason)
                 self._emit(event_emitter, "final_answer", {"status": "skipped_no_user_query"})
+                route_trace_status = "warn"
                 return ""
             if _is_search_query_meta_task(question):
                 logging.info("event=skip_meta_task_sync reason=search_query_meta_task")
                 self._emit(event_emitter, "final_answer", {"status": "skipped_meta_task"})
+                route_trace_status = "warn"
                 return ""
 
             logging.info("event=question_selected source=effective_user_query preview=%s", _safe_trunc(question, 200))
@@ -6727,11 +9835,30 @@ class Pipeline(object):
                 file_id,
                 ignored_history_file_id,
             )
+            if route_tracer:
+                route_tracer.record_stage(
+                    stage_key="file_selection",
+                    stage_name="File Selection",
+                    purpose="Choose active file reference for this turn with session/history guards.",
+                    input_payload={
+                        "body": body,
+                        "messages": messages,
+                        "session": session or {},
+                    },
+                    output_payload={
+                        "file_id": file_id,
+                        "file_source": file_source,
+                        "ignored_history_file_id": ignored_history_file_id,
+                    },
+                    processing_summary="Resolved explicit turn file, session file, or history fallback.",
+                    status="ok" if bool(file_id) else "warn",
+                )
 
             self._emit(event_emitter, "file_id", {"file_id": file_id})
             if not file_id:
                 self._emit(event_emitter, "no_file", {"body_keys": list((body or {}).keys())})
                 self._debug_body(body, messages)
+                route_trace_status = "warn"
                 return "Будь ласка, прикріпіть файл CSV/XLSX для аналізу."
 
             if session and session.get("file_id") == file_id and session.get("df_id"):
@@ -6756,6 +9883,7 @@ class Pipeline(object):
                 profile = load_resp.get("profile") or {}
                 if not df_id:
                     self._emit(event_emitter, "sandbox_load_failed", {"file_id": file_id})
+                    route_trace_status = "error"
                     return "Не вдалося завантажити таблицю в пісочницю (sandbox)."
                 self._apply_dynamic_limits(profile)
                 self._session_set(session_key, file_id, df_id, profile)
@@ -6763,6 +9891,8 @@ class Pipeline(object):
             edit_expected = False
             op = None
             commit_df = None
+            router_meta: Dict[str, Any] = {}
+            learning_meta: Dict[str, Any] = {}
             
             has_edit = _has_edit_triggers(question)
             prep = self._prepare_analysis_code_for_question(question, profile, has_edit)
@@ -6772,13 +9902,29 @@ class Pipeline(object):
                 status = str(prep.get("status") or "")
                 if status in {"invalid_missing_result", "invalid_subset_filter", "invalid_read_mutation", "invalid_import"}:
                     self._emit(event_emitter, "final_answer", {"status": status})
-                return str(prep.get("message_sync") or "Неможливо виконати запит.")
+                message_sync = str(prep.get("message_sync") or "Неможливо виконати запит.")
+                prep_router_meta = prep.get("router_meta") if isinstance(prep.get("router_meta"), dict) else {}
+                self._maybe_record_shortcut_debug_trace(
+                    mode="sync",
+                    question=question,
+                    router_meta=prep_router_meta,
+                    analysis_code="",
+                    run_status=status or "prepare_error",
+                    result_text="",
+                    result_meta={},
+                    final_answer=message_sync,
+                    error=status,
+                    learning_meta=learning_meta,
+                )
+                route_trace_status = "warn"
+                return message_sync
 
             analysis_code = str(prep.get("analysis_code") or "")
             plan = str(prep.get("plan") or "")
             op = prep.get("op")
             commit_df = prep.get("commit_df")
             edit_expected = bool(prep.get("edit_expected"))
+            router_meta = prep.get("router_meta") if isinstance(prep.get("router_meta"), dict) else {}
 
             run_stage = self._run_analysis_with_retry(
                 question=question,
@@ -6810,13 +9956,51 @@ class Pipeline(object):
             run_status = str(post.get("status") or "")
             if not post.get("ok"):
                 self._emit(event_emitter, "final_answer", {"status": run_status})
-                return str(post.get("message_sync") or "Не вдалося виконати аналіз.")
+                message_sync = str(post.get("message_sync") or "Не вдалося виконати аналіз.")
+                self._maybe_record_shortcut_debug_trace(
+                    mode="sync",
+                    question=question,
+                    router_meta=router_meta,
+                    analysis_code=analysis_code,
+                    run_status=run_status,
+                    result_text=run_resp.get("result_text", ""),
+                    result_meta=run_resp.get("result_meta", {}) or {},
+                    final_answer=message_sync,
+                    error=run_resp.get("error", ""),
+                    learning_meta=learning_meta,
+                )
+                route_trace_status = "warn"
+                return message_sync
 
             mutation_flags = dict(post.get("mutation_flags") or {})
-            self._emit(event_emitter, "final_answer", {"status": run_status})
+            learning_meta = self._maybe_record_success_learning(
+                question=question,
+                plan=plan,
+                analysis_code=analysis_code,
+                run_status=run_status,
+                edit_expected=edit_expected,
+                result_text=run_resp.get("result_text", ""),
+                result_meta=run_resp.get("result_meta", {}) or {},
+            )
             wait = self._start_wait(event_emitter, "final_answer")
+            final_answer_text = ""
+            final_stage_id = ""
+            if route_tracer:
+                final_stage_id = route_tracer.start_stage(
+                    stage_key="response_render",
+                    stage_name="Response Rendering",
+                    purpose="Build final user-visible response text from execution outputs.",
+                    input_payload={
+                        "question": question,
+                        "run_status": run_status,
+                        "result_text": run_resp.get("result_text", ""),
+                        "result_meta": run_resp.get("result_meta", {}) or {},
+                        "mutation_summary": run_resp.get("mutation_summary", {}) or {},
+                    },
+                    processing_summary="Run deterministic formatter with optional LLM fallback.",
+                )
             try:
-                return self._final_answer(
+                final_answer_text = self._final_answer(
                     question=question,
                     profile=profile,
                     plan=plan,
@@ -6830,8 +10014,40 @@ class Pipeline(object):
                     mutation_flags=mutation_flags,
                     error=run_resp.get("error", ""),
                 )
+                if route_tracer and final_stage_id:
+                    route_tracer.end_stage(
+                        final_stage_id,
+                        status="ok",
+                        output_payload={"final_answer_text": final_answer_text},
+                        processing_summary="Final answer rendered.",
+                    )
+            except Exception as final_exc:
+                if route_tracer and final_stage_id:
+                    route_tracer.end_stage(
+                        final_stage_id,
+                        status="error",
+                        output_payload={},
+                        processing_summary="Final answer rendering failed.",
+                        error={"type": type(final_exc).__name__, "message": str(final_exc)},
+                    )
+                raise
             finally:
                 self._stop_wait(wait)
+            final_answer_text = self._append_route_trace_link(final_answer_text, trace_id, request_id)
+            self._maybe_record_shortcut_debug_trace(
+                mode="sync",
+                question=question,
+                router_meta=router_meta,
+                analysis_code=analysis_code,
+                run_status=run_status,
+                result_text=run_resp.get("result_text", ""),
+                result_meta=run_resp.get("result_meta", {}) or {},
+                final_answer=final_answer_text,
+                error=run_resp.get("error", ""),
+                learning_meta=learning_meta,
+            )
+            self._emit(event_emitter, "final_answer", {"status": run_status})
+            return final_answer_text
 
         except Exception as exc:
             logging.error("event=pipe_sync_error error=%s", str(exc))
@@ -6840,8 +10056,14 @@ class Pipeline(object):
                 self._emit(event_emitter, "error", {"error": str(exc)})
             except Exception:
                 pass
+            route_trace_status = "error"
             return f"Сталася помилка в пайплайні: {type(exc).__name__}: {exc}\n\n{tb}"
         finally:
+            if route_tracer:
+                route_tracer.finalize(status=route_trace_status)
+            if route_trace_token is not None:
+                reset_active_route_tracer(route_trace_token)
+            _LLM_CALL_STATS_CTX.reset(llm_stats_token)
             _REQUEST_ID_CTX.reset(request_token)
             _TRACE_ID_CTX.reset(trace_token)
 
@@ -6868,6 +10090,10 @@ class Pipeline(object):
         request_id, trace_id = _extract_request_trace_ids(body)
         request_token = _REQUEST_ID_CTX.set(request_id)
         trace_token = _TRACE_ID_CTX.set(trace_id)
+        llm_stats_token = _LLM_CALL_STATS_CTX.set([])
+        route_tracer = self._new_route_tracer(request_id=request_id, trace_id=trace_id, mode="stream")
+        route_trace_token = set_active_route_tracer(route_tracer) if route_tracer else None
+        route_trace_status = "ok"
         status_queue: List[str] = []
 
         def emit(event: str, payload: Dict[str, Any]) -> None:
@@ -6890,6 +10116,20 @@ class Pipeline(object):
                 _safe_trunc(question, 200),
                 not bool(question),
             )
+            if route_tracer:
+                route_tracer.record_stage(
+                    stage_key="request_intake",
+                    stage_name="Request Intake",
+                    purpose="Normalize user query and determine if this request should run the spreadsheet pipeline.",
+                    input_payload={
+                        "user_message_preview": _safe_trunc(user_message, 300),
+                        "messages_count": len(messages or []),
+                        "model_id": model_id,
+                    },
+                    output_payload={"question": question, "selected_empty": not bool(question)},
+                    processing_summary="Extract effective user query and skip pure meta-task traffic.",
+                    status="ok" if bool(question) else "warn",
+                )
             if self.valves.debug:
                 logging.info("event=query_selection_tail payload=%s", _safe_trunc(_query_selection_debug(messages), 1200))
             if not question:
@@ -6898,11 +10138,13 @@ class Pipeline(object):
                 logging.info("event=skip_meta_task_stream reason=%s", reason)
                 emit("final_answer", {"status": "skipped_no_user_query"})
                 yield from drain()
+                route_trace_status = "warn"
                 return
             if _is_search_query_meta_task(question):
                 logging.info("event=skip_meta_task_stream reason=search_query_meta_task")
                 emit("final_answer", {"status": "skipped_meta_task"})
                 yield from drain()
+                route_trace_status = "warn"
                 return
 
             logging.info("event=question_selected source=effective_user_query preview=%s", _safe_trunc(question, 200))
@@ -6919,6 +10161,24 @@ class Pipeline(object):
                 file_id,
                 ignored_history_file_id,
             )
+            if route_tracer:
+                route_tracer.record_stage(
+                    stage_key="file_selection",
+                    stage_name="File Selection",
+                    purpose="Choose active file reference for this turn with session/history guards.",
+                    input_payload={
+                        "body": body,
+                        "messages": messages,
+                        "session": session or {},
+                    },
+                    output_payload={
+                        "file_id": file_id,
+                        "file_source": file_source,
+                        "ignored_history_file_id": ignored_history_file_id,
+                    },
+                    processing_summary="Resolved explicit turn file, session file, or history fallback.",
+                    status="ok" if bool(file_id) else "warn",
+                )
 
             emit("file_id", {"file_id": file_id})
             yield from drain()
@@ -6927,6 +10187,7 @@ class Pipeline(object):
                 emit("no_file", {"body_keys": list((body or {}).keys())})
                 yield from drain()
                 self._debug_body(body, messages)
+                route_trace_status = "warn"
                 yield "Будь ласка, прикріпіть файл (CSV/XLSX) для аналізу."
                 return
 
@@ -6951,6 +10212,7 @@ class Pipeline(object):
                 if not df_id:
                     emit("sandbox_load_failed", {"file_id": file_id})
                     yield from drain()
+                    route_trace_status = "error"
                     yield "Не вдалося завантажити файл у sandbox."
                     return
                 
@@ -6960,6 +10222,8 @@ class Pipeline(object):
             edit_expected = False
             op = None
             commit_df = None
+            router_meta: Dict[str, Any] = {}
+            learning_meta: Dict[str, Any] = {}
             
             has_edit = _has_edit_triggers(question)
             prep = self._prepare_analysis_code_for_question(question, profile, has_edit)
@@ -6971,7 +10235,22 @@ class Pipeline(object):
                 if status in {"invalid_code", "invalid_missing_result", "invalid_subset_filter", "invalid_read_mutation", "invalid_import"}:
                     emit("final_answer", {"status": status})
                     yield from drain()
-                yield str(prep.get("message_stream") or "Неможливо виконати запит.")
+                message_stream = str(prep.get("message_stream") or "Неможливо виконати запит.")
+                prep_router_meta = prep.get("router_meta") if isinstance(prep.get("router_meta"), dict) else {}
+                self._maybe_record_shortcut_debug_trace(
+                    mode="stream",
+                    question=question,
+                    router_meta=prep_router_meta,
+                    analysis_code="",
+                    run_status=status or "prepare_error",
+                    result_text="",
+                    result_meta={},
+                    final_answer=message_stream,
+                    error=status,
+                    learning_meta=learning_meta,
+                )
+                route_trace_status = "warn"
+                yield message_stream
                 return
 
             analysis_code = str(prep.get("analysis_code") or "")
@@ -6979,6 +10258,7 @@ class Pipeline(object):
             op = prep.get("op")
             commit_df = prep.get("commit_df")
             edit_expected = bool(prep.get("edit_expected"))
+            router_meta = prep.get("router_meta") if isinstance(prep.get("router_meta"), dict) else {}
 
             run_stage = self._run_analysis_with_retry(
                 question=question,
@@ -7012,35 +10292,111 @@ class Pipeline(object):
             if not post.get("ok"):
                 emit("final_answer", {"status": run_status})
                 yield from drain()
-                yield str(post.get("message_stream") or "Помилка виконання у sandbox.")
+                message_stream = str(post.get("message_stream") or "Помилка виконання у sandbox.")
+                self._maybe_record_shortcut_debug_trace(
+                    mode="stream",
+                    question=question,
+                    router_meta=router_meta,
+                    analysis_code=analysis_code,
+                    run_status=run_status,
+                    result_text=run_resp.get("result_text", ""),
+                    result_meta=run_resp.get("result_meta", {}) or {},
+                    final_answer=message_stream,
+                    error=run_resp.get("error", ""),
+                    learning_meta=learning_meta,
+                )
+                route_trace_status = "warn"
+                yield message_stream
                 return
 
             mutation_flags = dict(post.get("mutation_flags") or {})
-            emit("final_answer", {"status": run_status})
-            yield from drain()
-            
-            yield self._final_answer(
+            learning_meta = self._maybe_record_success_learning(
                 question=question,
-                profile=profile,
                 plan=plan,
-                code=analysis_code,
-                edit_expected=edit_expected,
+                analysis_code=analysis_code,
                 run_status=run_status,
-                stdout=run_resp.get("stdout", ""),
+                edit_expected=edit_expected,
                 result_text=run_resp.get("result_text", ""),
                 result_meta=run_resp.get("result_meta", {}) or {},
-                mutation_summary=run_resp.get("mutation_summary", {}) or {},
-                mutation_flags=mutation_flags,
-                error=run_resp.get("error", ""),
             )
+            final_stage_id = ""
+            if route_tracer:
+                final_stage_id = route_tracer.start_stage(
+                    stage_key="response_render",
+                    stage_name="Response Rendering",
+                    purpose="Build final user-visible response text from execution outputs.",
+                    input_payload={
+                        "question": question,
+                        "run_status": run_status,
+                        "result_text": run_resp.get("result_text", ""),
+                        "result_meta": run_resp.get("result_meta", {}) or {},
+                        "mutation_summary": run_resp.get("mutation_summary", {}) or {},
+                    },
+                    processing_summary="Run deterministic formatter with optional LLM fallback.",
+                )
+            final_answer_text = ""
+            try:
+                final_answer_text = self._final_answer(
+                    question=question,
+                    profile=profile,
+                    plan=plan,
+                    code=analysis_code,
+                    edit_expected=edit_expected,
+                    run_status=run_status,
+                    stdout=run_resp.get("stdout", ""),
+                    result_text=run_resp.get("result_text", ""),
+                    result_meta=run_resp.get("result_meta", {}) or {},
+                    mutation_summary=run_resp.get("mutation_summary", {}) or {},
+                    mutation_flags=mutation_flags,
+                    error=run_resp.get("error", ""),
+                )
+                if route_tracer and final_stage_id:
+                    route_tracer.end_stage(
+                        final_stage_id,
+                        status="ok",
+                        output_payload={"final_answer_text": final_answer_text},
+                        processing_summary="Final answer rendered.",
+                    )
+            except Exception as final_exc:
+                if route_tracer and final_stage_id:
+                    route_tracer.end_stage(
+                        final_stage_id,
+                        status="error",
+                        output_payload={},
+                        processing_summary="Final answer rendering failed.",
+                        error={"type": type(final_exc).__name__, "message": str(final_exc)},
+                    )
+                raise
+            final_answer_text = self._append_route_trace_link(final_answer_text, trace_id, request_id)
+            self._maybe_record_shortcut_debug_trace(
+                mode="stream",
+                question=question,
+                router_meta=router_meta,
+                analysis_code=analysis_code,
+                run_status=run_status,
+                result_text=run_resp.get("result_text", ""),
+                result_meta=run_resp.get("result_meta", {}) or {},
+                final_answer=final_answer_text,
+                error=run_resp.get("error", ""),
+                learning_meta=learning_meta,
+            )
+            emit("final_answer", {"status": run_status})
+            yield from drain()
+            yield final_answer_text
 
         except Exception as exc:
             logging.error("event=pipe_stream_error error=%s", str(exc))
             tb = _safe_trunc(traceback.format_exc(), 2000)
             emit("error", {"error": str(exc)})
             yield from drain()
+            route_trace_status = "error"
             yield f"Pipeline error: {type(exc).__name__}: {exc}\n\n{tb}"
         finally:
+            if route_tracer:
+                route_tracer.finalize(status=route_trace_status)
+            if route_trace_token is not None:
+                reset_active_route_tracer(route_trace_token)
+            _LLM_CALL_STATS_CTX.reset(llm_stats_token)
             _REQUEST_ID_CTX.reset(request_token)
             _TRACE_ID_CTX.reset(trace_token)
 

@@ -1,3 +1,5 @@
+import json
+
 from pipelines.spreadsheet_analyst_pipeline import (
     AGG_COL_PLACEHOLDER,
     GROUP_COL_PLACEHOLDER,
@@ -10,6 +12,7 @@ from pipelines.spreadsheet_analyst_pipeline import (
     _find_columns_in_text,
     _is_top_expensive_available_intent,
     _looks_like_value_filter_query,
+    _rewrite_top_expensive_available_code,
     _stats_shortcut_code,
     _template_shortcut_code,
     _total_inventory_value_shortcut_code,
@@ -188,6 +191,59 @@ def test_top_expensive_available_intent_detected() -> None:
     assert _is_top_expensive_available_intent(q) is True
 
 
+def test_top_expensive_available_rewrite_uses_inventory_value_mode_for_total_value_query() -> None:
+    profile = {
+        "columns": ["ID", "Модель", "Ціна_UAH", "Кількість", "Статус"],
+        "dtypes": {
+            "ID": "float64",
+            "Модель": "str",
+            "Ціна_UAH": "float64",
+            "Кількість": "int64",
+            "Статус": "str",
+        },
+    }
+    rewritten = _rewrite_top_expensive_available_code(
+        "result = df.head(5)\n",
+        "Топ-5 товарів за сумарною вартістю на складі",
+        profile,
+    )
+    assert "_rank_mode = 'inventory_value'" in rewritten
+    assert "_top_df['_inventory_value'] = _top_df[_price_col] * _top_df[_qty_col]" in rewritten
+    assert "_top_df = _top_df.nlargest(_top_n, '_inventory_value')" in rewritten
+
+
+def test_top_expensive_available_rewrite_skips_when_code_already_has_inventory_metric() -> None:
+    profile = {
+        "columns": ["Модель", "Ціна_UAH", "Кількість", "Статус"],
+        "dtypes": {"Модель": "str", "Ціна_UAH": "float64", "Кількість": "int64", "Статус": "str"},
+    }
+    code = (
+        "_work['_metric'] = _left * _right\n"
+        "result = _work.groupby(_group_col)['_metric'].sum().reset_index(name='metric_sum')\n"
+        "result = result.sort_values('metric_sum', ascending=False).head(5)\n"
+    )
+    rewritten = _rewrite_top_expensive_available_code(
+        code,
+        "Топ-5 товарів за сумарною вартістю на складі",
+        profile,
+    )
+    assert rewritten == code
+
+
+def test_top_expensive_available_rewrite_skips_grouping_queries() -> None:
+    profile = {
+        "columns": ["Категорія", "Ціна_UAH", "Кількість", "Статус"],
+        "dtypes": {"Категорія": "str", "Ціна_UAH": "float64", "Кількість": "int64", "Статус": "str"},
+    }
+    code = "result = df.head(5)\n"
+    rewritten = _rewrite_top_expensive_available_code(
+        code,
+        "Топ-5 категорій за сумарною вартістю на складі",
+        profile,
+    )
+    assert rewritten == code
+
+
 def test_stats_shortcut_prefers_llm_metric_column_hint() -> None:
     profile = {
         "columns": ["ID", "Ціна_UAH", "Кількість"],
@@ -340,6 +396,45 @@ def test_ranking_shortcut_code_group_ranking_count_from_llm_slots() -> None:
     assert "groupby(_group_col).size().reset_index(name='count')" in code
 
 
+def test_ranking_shortcut_code_group_ranking_count_with_target_uses_nunique() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "Бренд",
+        "target_col": "Модель",
+        "agg": "count",
+        "top_n": 5,
+        "order": "desc",
+    }
+    profile = {
+        "columns": ["Бренд", "Модель", "Ціна_UAH"],
+        "dtypes": {"Бренд": "str", "Модель": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Топ-5 брендів за кількістю моделей", profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_agg == 'count'" in code
+    assert "groupby(_group_col)[_target_col].nunique(dropna=True).reset_index(name='count')" in code
+
+
+def test_ranking_shortcut_skips_when_top_n_is_zero() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "group_ranking",
+        "group_col": "Бренд",
+        "target_col": "Модель",
+        "agg": "count",
+        "top_n": 0,
+        "order": "desc",
+    }
+    profile = {
+        "columns": ["Бренд", "Модель"],
+        "dtypes": {"Бренд": "str", "Модель": "str"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Топ брендів за кількістю моделей", profile)
+    assert shortcut is None
+
+
 def test_ranking_shortcut_skips_filter_like_query_without_topn() -> None:
     pipeline = Pipeline()
     pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
@@ -377,6 +472,26 @@ def test_ranking_shortcut_generated_code_has_no_pd_to_numeric_calls() -> None:
     assert "pd.to_numeric(" not in code
 
 
+def test_ranking_shortcut_code_includes_generic_id_like_column_in_output() -> None:
+    pipeline = Pipeline()
+    pipeline._llm_pick_ranking_slots = lambda _q, _p: {  # type: ignore[method-assign]
+        "query_mode": "row_ranking",
+        "metric_col": "unit_price",
+        "top_n": 3,
+        "order": "desc",
+        "require_available": False,
+        "entity_cols": ["item_name"],
+    }
+    profile = {
+        "columns": ["record_id", "item_name", "unit_price"],
+        "dtypes": {"record_id": "int64", "item_name": "str", "unit_price": "float64"},
+    }
+    shortcut = pipeline._ranking_shortcut_code("Top 3 most expensive items", profile)
+    assert shortcut is not None
+    code, _ = shortcut
+    assert "_out_cols = ['record_id', 'item_name', 'unit_price']" in code
+
+
 def test_filter_like_detector_hits_price_equality_query() -> None:
     assert _looks_like_value_filter_query("Поверни всі моделі мишей які мають ціну 5200") is True
 
@@ -411,6 +526,42 @@ def test_lookup_shortcut_code_generates_filter_path_from_llm_slots() -> None:
     assert "pd.to_numeric(" not in code
 
 
+def test_lookup_shortcut_code_deduplicates_text_projection_by_default() -> None:
+    pipeline = Pipeline()
+    slots = {
+        "mode": "lookup",
+        "filters": [{"column": "Ціна_UAH", "op": "lt", "value": 3000}],
+        "output_columns": ["Категорія"],
+        "limit": None,
+    }
+    profile = {
+        "columns": ["ID", "Категорія", "Ціна_UAH"],
+        "dtypes": {"ID": "float64", "Категорія": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._lookup_shortcut_code_from_slots("Товари дешевші за 3000, категорії", profile, slots)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_out = _out.drop_duplicates()" in code
+
+
+def test_lookup_shortcut_code_keeps_duplicates_for_detail_rows_query() -> None:
+    pipeline = Pipeline()
+    slots = {
+        "mode": "lookup",
+        "filters": [{"column": "Ціна_UAH", "op": "lt", "value": 3000}],
+        "output_columns": ["Категорія"],
+        "limit": None,
+    }
+    profile = {
+        "columns": ["ID", "Категорія", "Ціна_UAH"],
+        "dtypes": {"ID": "float64", "Категорія": "str", "Ціна_UAH": "float64"},
+    }
+    shortcut = pipeline._lookup_shortcut_code_from_slots("Покажи всі рядки товарів дешевших за 3000, категорії", profile, slots)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_out = _out.drop_duplicates()" not in code
+
+
 def test_lookup_shortcut_code_returns_none_for_non_lookup_mode() -> None:
     pipeline = Pipeline()
     pipeline._llm_pick_lookup_slots = lambda _q, _p: {  # type: ignore[method-assign]
@@ -419,3 +570,21 @@ def test_lookup_shortcut_code_returns_none_for_non_lookup_mode() -> None:
     }
     profile = {"columns": ["ID", "Модель"], "dtypes": {"ID": "float64", "Модель": "str"}}
     assert pipeline._lookup_shortcut_code("Які 5 найдорожчих товарів?", profile) is None
+
+
+def test_format_table_from_result_unlimited_when_top_n_zero() -> None:
+    pipeline = Pipeline()
+    data = [{"ID": i, "Категорія": "Тест"} for i in range(1, 26)]
+    out = pipeline._format_table_from_result(json.dumps(data, ensure_ascii=False), top_n=0)
+    assert out is not None
+    lines = out.splitlines()
+    assert len(lines) == 27
+
+
+def test_format_top_pairs_from_result_unlimited_when_top_n_zero() -> None:
+    pipeline = Pipeline()
+    data = {f"k{i}": i for i in range(1, 31)}
+    out = pipeline._format_top_pairs_from_result(json.dumps(data, ensure_ascii=False), top_n=0)
+    assert out is not None
+    lines = out.splitlines()
+    assert len(lines) == 32

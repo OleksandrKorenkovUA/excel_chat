@@ -28,5 +28,16 @@ def test_edit_shortcut_id_update_handles_float_id_and_clean_status_value() -> No
     assert shortcut is not None
     code, _plan = shortcut
     assert "_id_col_norm = _id_col.str.replace(r'\\.0+$', '', regex=True)" in code
-    assert "_mask = (_id_col == _id_target) | (_id_col_norm == _id_target)" in code
+    assert "_mask = (_id_col == _id_target) | (_id_col_norm == _id_target_norm)" in code
     assert "df.loc[_mask, 'Статус'] = 'На складі'" in code
+
+
+def test_edit_shortcut_identifier_update_works_with_sku_like_column() -> None:
+    profile = {"columns": ["sku_code", "status_text", "name"]}
+    q = "Змін status_text товару SKU ABC-42 на статус “На складі”"
+    shortcut = _edit_shortcut_code(q, profile)
+    assert shortcut is not None
+    code, _plan = shortcut
+    assert "_id_column = 'sku_code'" in code
+    assert "_id = 'ABC-42'" in code
+    assert "df.loc[_mask, 'status_text'] = 'На складі'" in code

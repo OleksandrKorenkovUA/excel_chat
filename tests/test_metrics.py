@@ -1,6 +1,11 @@
 import pytest
 
-from pipelines.spreadsheet_analyst_pipeline import _detect_metrics, _enforce_entity_nunique_code, _has_edit_triggers
+from pipelines.spreadsheet_analyst_pipeline import (
+    _detect_metrics,
+    _enforce_count_code,
+    _enforce_entity_nunique_code,
+    _has_edit_triggers,
+)
 
 
 def test_detect_metrics_ukr_mean_min_max_order():
@@ -80,3 +85,23 @@ def test_enforce_entity_nunique_skips_grouped_requests() -> None:
     code = "result = df['Brand'].value_counts().to_dict()\n"
     guarded = _enforce_entity_nunique_code("Покажи кількість для кожного бренду", code, profile)
     assert guarded == code
+
+
+def test_enforce_count_code_keeps_revenue_product_sum() -> None:
+    question = "Виручка по категоріях (Ціна × Кількість)"
+    code = (
+        "_work['_metric'] = _left * _right\n"
+        "result = _work.groupby(_group_col)['_metric'].sum().reset_index(name='revenue_sum')\n"
+    )
+    guarded, err = _enforce_count_code(question, code)
+    assert err is None
+    assert "['_metric'].sum()" in guarded
+    assert "['_metric'].size()" not in guarded
+
+
+def test_enforce_count_code_rewrites_sum_for_count_intent() -> None:
+    question = "Скільки товарів по категоріях?"
+    code = "result = df.groupby('Категорія')['ID'].sum().reset_index(name='cnt')\n"
+    guarded, err = _enforce_count_code(question, code)
+    assert err is None
+    assert ".size()" in guarded

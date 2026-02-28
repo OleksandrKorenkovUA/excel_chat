@@ -32,6 +32,10 @@ C. PANDAS I/O RESTRICTIONS:
 
 ### 2. REQUIRED OUTPUT FORMAT
 You must return ONLY a valid JSON object with no markdown formatting.
+Hard JSON mode:
+- First output character MUST be `{` and last character MUST be `}`.
+- Do NOT output `<think>`, reasoning, analysis text, markdown, labels, or any extra prose.
+- Do NOT add keys outside: `analysis_code`, `short_plan`, `op`, `commit_df`.
 Structure:
 {
   "analysis_code": "string", // The Python code to execute

@@ -1,942 +1,1110 @@
 {
-	"catalog_version": "0.2.0",
-	"language": "uk",
-	"embedding": {
-		"provider": "openai_compatible",
-		"base_url": "http://192.168.200.129:8031/v1",
-		"model": "bge-m3",
-		"dimensions": null,
-		"timeout_s": 30
-	},
-	"intents": [
-		{
-			"id": "stats_shape",
-			"name": "Розмір таблиці",
-			"description": "Повертає загальну інформацію про розмірність даних (рядки та стовпці).",
-			"examples": [
-				"Скільки рядків і стовпців у таблиці?",
-				"Порахуй кількість рядків та колонок",
-				"Який розмір таблиці?",
-				"Скажи shape таблиці",
-				"Скільки рядків у таблиці і скільки колонок?",
-				"Дай розмірність датафрейму",
-				"Покажи кількість записів і полів",
-				"Скільки всього рядків і колонок тут?",
-				"Порахуй rows і columns",
-				"Мені треба знати об'єм даних",
-				"Скільки всього записів?",
-				"Яка структура таблиці по розміру?",
-				"Виведи кількість стрічок і стовпчиків",
-				"Напишіть розміри df",
-				"Скільки даних завантажено?"
-			],
-			"slots": {},
-			"plan": [
-				{
-					"op": "stats_shape",
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "head_tail",
-			"name": "Перегляд рядків",
-			"description": "Показує перші або останні N рядків таблиці (head/tail).",
-			"examples": [
-				"Покажи перші 5 рядків",
-				"Виведи останні 10 записів",
-				"Дай хед таблиці",
-				"Подивитись початок таблиці",
-				"Покажи кінець списку",
-				"Виведи 3 приклада даних",
-				"Покажи топ 10 рядків",
-				"Глянути на останні 5 стрічок",
-				"Зроби head(20)",
-				"Покажи зразки даних зверху"
-			],
-			"slots": {
-				"n": {
-					"type": "int",
-					"required": false,
-					"default": 5
-				},
-				"side": {
-					"type": "enum",
-					"required": false,
-					"default": "head",
-					"values": ["head", "tail"]
-				}
-			},
-			"plan": [
-				{
-					"op": "head_tail",
-					"args": {
-						"n": "{n}",
-						"side": "{side}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "stats_nulls",
-			"name": "Аналіз пропусків",
-			"description": "Рахує кількість пропусків (null/NaN) по колонках або для конкретної колонки.",
-			"examples": [
-				"Порахуй пропуски по всіх колонках",
-				"Скільки пустих значень у таблиці?",
-				"Покажи null count по колонках",
-				"Дай кількість NaN по кожній колонці",
-				"Чи є пропуски? Дай статистику",
-				"Скільки пропусків у колонці price?",
-				"Порахуй пусті значення у полі date",
-				"Покажи де найбільше пропусків",
-				"Виведи колонки з пропусками",
-				"Зроби звіт по missing values",
-				"Перевір чи є нульові значення в id",
-				"Скільки незаповнених полів у address?",
-				"Чи є нани в колонці score?",
-				"Де у нас не вистачає даних?",
-				"Порахуй NaNs"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": false
-				},
-				"top_n": {
-					"type": "int",
-					"required": false,
-					"default": 0
-				}
-			},
-			"plan": [
-				{
-					"op": "stats_nulls",
-					"args": {
-						"column": "{column}",
-						"top_n": "{top_n}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "unique_nunique",
-			"name": "Унікальні значення",
-			"description": "Рахує кількість унікальних значень у колонці або по всіх колонках.",
-			"examples": [
-				"Скільки унікальних значень у колонці brand?",
-				"Порахуй унікальні імена клієнтів",
-				"Скільки різних категорій є в таблиці?",
-				"Дай nunique для user_id",
-				"Покажи кількість унікальних значень для кожної колонки",
-				"Скільки унікальних міст?",
-				"Порахуй різні значення в колонці status",
-				"Скільки унікальних записів у полі product_code?",
-				"Дай список колонок і кількість унікальних значень",
-				"Порахуй distinct values для manager",
-				"Як багато різних значень приймає колонка type?",
-				"Порахуй варіативність у колонці group",
-				"Скільки неповторюваних записів у email?",
-				"Виведи кількість унікальних для всіх стовпців",
-				"Дай статистику унікальності"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": false
-				}
-			},
-			"plan": [
-				{
-					"op": "stats_nunique",
-					"args": {
-						"column": "{column}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "stats_aggregation",
-			"name": "Агрегація (сума, середнє, мін, макс)",
-			"description": "Обчислює статистичні показники (сума, середнє, медіана, мінімум, максимум) для числової колонки.",
-			"examples": [
-				"Порахуй середнє значення ціни",
-				"Яка максимальна зарплата?",
-				"Знайди мінімальний вік",
-				"Дай суму продажів",
-				"Порахуй медіану по колонці score",
-				"Який середній чек (mean) по column 'total'?",
-				"Знайди max для temperature",
-				"Підсумуй значення у колонці amount",
-				"Яке найменше значення quantity?",
-				"Порахуй total sum для profit",
-				"Середня оцінка (average) по класу",
-				"Який максимум у стовпці height?",
-				"Мінімум по weight",
-				"Дай загальну суму витрат"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"metric": {
-					"type": "enum",
-					"required": true,
-					"values": ["mean", "sum", "min", "max", "median"]
-				}
-			},
-			"plan": [
-				{
-					"op": "stats_aggregation",
-					"args": {
-						"column": "{column}",
-						"metric": "{metric}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "groupby_count",
-			"name": "Групування та підрахунок",
-			"description": "Групує дані по колонці і рахує кількість записів у кожній групі.",
-			"examples": [
-				"Надай кількість товарів для кожного бренду",
-				"Порахуй скільки рядків на кожен region",
-				"Згрупуй по department і порахуй кількість",
-				"Скільки співробітників у кожному відділі?",
-				"Дай count по category",
-				"Покажи кількість записів для кожного значення status",
-				"Зроби групування по year з кількістю",
-				"Порахуй кількість по колонці country",
-				"Згрупуй по gender і порахуй скільки",
-				"Побудуй таблицю: місто → кількість клієнтів",
-				"Розподіл замовлень по менеджерах",
-				"Скільки разів зустрічається кожне значення в col1?",
-				"Згрупувати за типом та порахувати",
-				"Статистика кількості по групах товарів",
-				"ТОП категорій за кількістю записів",
-				"Розподіл рядків за категоріями"
-			],
-			"slots": {
-				"group_col": {
-					"type": "column",
-					"required": true
-				},
-				"sort": {
-					"type": "enum",
-					"required": false,
-					"default": "desc",
-					"values": ["asc", "desc", "none"]
-				},
-				"top_n": {
-					"type": "int",
-					"required": false,
-					"default": 0
-				},
-				"out_col": {
-					"type": "str",
-					"required": false,
-					"default": "count"
-				}
-			},
-			"plan": [
-				{
-					"op": "groupby_count",
-					"args": {
-						"group_col": "{group_col}",
-						"out_col": "{out_col}",
-						"sort": "{sort}",
-						"top_n": "{top_n}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "filter_equals",
-			"name": "Фільтр точної рівності",
-			"description": "Фільтрує рядки, де значення в колонці точно дорівнює заданому тексту або числу.",
-			"examples": [
-				"Відфільтруй рядки де city = Kyiv",
-				"Покажи тільки записи з category = shoes",
-				"Залиш рядки де status дорівнює active",
-				"Вибери всі записи де id = 12345",
-				"Покажи дані для manager 'Ivanov'",
-				"Зроби фільтр по type 'Samsung'",
-				"Виведи рядки де gender = M",
-				"Покажи тільки ті рядки де currency = UAH",
-				"Знайди всі записи де department = IT",
-				"Відобрази рядки з color = Red",
-				"Дай мені тільки ті де success = True",
-				"Фільтрувати по колонці name значення John",
-				"Вибрати де рік дорівнює 2023"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"value": {
-					"type": "str",
-					"required": true
-				},
-				"case_insensitive": {
-					"type": "bool",
-					"required": false,
-					"default": true
-				}
-			},
-			"plan": [
-				{
-					"op": "filter_equals",
-					"args": {
-						"column": "{column}",
-						"value": "{value}",
-						"case_insensitive": "{case_insensitive}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "filter_comparison",
-			"name": "Фільтр порівняння (числовий)",
-			"description": "Фільтрує рядки за числовою умовою (більше, менше, більше-рівне, менше-рівне).",
-			"examples": [
-				"Покажи рядки де ціна більше 1000",
-				"Відфільтруй де age < 18",
-				"Залиш записи де score більше або дорівнює 90",
-				"Виведи товари з кількістю менше 5",
-				"Знайди де salary > 5000",
-				"Фільтруй: year >= 2020",
-				"Покажи де discount менше 10%",
-				"Вибери записи з рейтингом вище 4.5",
-				"Прибери все де value <= 0",
-				"Покажи транзакції більше 100 грн",
-				"Де температура нижче 0?",
-				"Фільтр по height більше 180"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"operator": {
-					"type": "enum",
-					"required": true,
-					"values": [">", "<", ">=", "<=", "="]
-				},
-				"value": {
-					"type": "float",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "filter_comparison",
-					"args": {
-						"column": "{column}",
-						"operator": "{operator}",
-						"value": "{value}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "sort_by_column",
-			"name": "Сортування",
-			"description": "Сортує таблицю за вказаною колонкою (за зростанням або спаданням).",
-			"examples": [
-				"Відсортуй таблицю по price за спаданням",
-				"Відсортуй по date за зростанням",
-				"Зроби сортування по прізвищу",
-				"Посортуй по quantity desc",
-				"Сортуй по колонці rating",
-				"Відсортуй за salary від більшої до меншої",
-				"Зроби order by id",
-				"Сортуй за name по алфавіту",
-				"Відсортуй по created_at у зворотному порядку",
-				"Покажи таблицю відсортовану по total",
-				"Впорядкуй дані за віком",
-				"Сортування таблиці: стовпець X, descending"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"order": {
-					"type": "enum",
-					"required": false,
-					"default": "asc",
-					"values": ["asc", "desc"]
-				}
-			},
-			"plan": [
-				{
-					"op": "sort_values",
-					"args": {
-						"column": "{column}",
-						"order": "{order}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "select_columns",
-			"name": "Вибір колонок",
-			"description": "Залишає в таблиці тільки вказані колонки (проекція).",
-			"examples": [
-				"Залиш тільки колонки name та email",
-				"Покажи мені лише price і product",
-				"Вибери стовпці: date, amount, status",
-				"Прибери зайві колонки, залиш тільки id",
-				"Створи таблицю тільки з колонок A і B",
-				"Мені потрібні лише поля first_name та last_name",
-				"Відфільтруй стовпці: залиш city та country",
-				"Виведи тільки колонку description",
-				"Select columns x, y, z",
-				"Обріж таблицю до колонок user та score"
-			],
-			"slots": {
-				"columns": {
-					"type": "list[column]",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "select_columns",
-					"args": {
-						"columns": "{columns}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "drop_columns",
-			"name": "Видалення колонок",
-			"description": "Видаляє вказані колонки з таблиці.",
-			"examples": [
-				"Видали колонку old_id",
-				"Прибери стовпці temp і aux",
-				"Дропни колонку unnamed: 0",
-				"Видали поля password та secret",
-				"Мені не потрібна колонка comments",
-				"Викинь стовпець index з таблиці",
-				"Зроби drop columns A, B",
-				"Видалити зайві поля: x1, x2",
-				"Очисти таблицю від колонки internal_code",
-				"Прибери колонку date_modified"
-			],
-			"slots": {
-				"columns": {
-					"type": "list[column]",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "drop_columns",
-					"args": {
-						"columns": "{columns}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "rename_column",
-			"name": "Перейменування колонки",
-			"description": "Змінює назву однієї колонки на нову.",
-			"examples": [
-				"Перейменуй колонку 'name' на 'full_name'",
-				"Зміни назву стовпця 'p' на 'price'",
-				"Назви колонку 'id' як 'user_id'",
-				"Rename 'qty' to 'quantity'",
-				"Поміняй заголовок 'tel' на 'phone'",
-				"Перейменувати 'col1' в 'Category'",
-				"Дай колонці 'dt' назву 'date'",
-				"Зроби ренейм 'old' -> 'new'",
-				"Заміни назву поля 'adres' на 'address'",
-				"Виправ назву стовпця 'count' на 'total_count'"
-			],
-			"slots": {
-				"old_name": {
-					"type": "column",
-					"required": true
-				},
-				"new_name": {
-					"type": "str",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "rename_column",
-					"args": {
-						"old_name": "{old_name}",
-						"new_name": "{new_name}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 5
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "drop_rows_by_position",
-			"name": "Видалення рядків за позицією",
-			"description": "Видаляє рядки за порядковими номерами (індексами), які вказав користувач.",
-			"examples": [
-				"Видали рядок номер 10",
-				"Видали рядки 98 і 99",
-				"Прибери 1, 2, 3 рядки",
-				"Видали рядки з номерами 5-7",
-				"Видали останній рядок",
-				"Видали перші 2 рядки",
-				"Прибери рядки 12 та 15",
-				"Видали рядки 20, 21, 22",
-				"Зітри рядок номер 4",
-				"Видали рядки 30-35 включно",
-				"Дропни нульовий рядок",
-				"Викинь рядки під індексами 100, 101"
-			],
-			"slots": {
-				"indices": {
-					"type": "row_indices",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "drop_rows_by_position",
-					"args": {
-						"indices": "{indices}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "return_df_preview",
-					"args": {
-						"rows": 20
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "drop_duplicates",
-			"name": "Видалення дублікатів",
-			"description": "Видаляє рядки, які повністю дублюють один одного (або за вказаними колонками).",
-			"examples": [
-				"Видали дублікати",
-				"Прибери повтори в таблиці",
-				"Видали однакові рядки",
-				"Залиш тільки унікальні рядки",
-				"Drop duplicates",
-				"Почисти таблицю від дублів",
-				"Видалити записи, що повторюються",
-				"Зроби так щоб рядки не повторювались",
-				"Видали дублікати по колонці email",
-				"Прибери повтори де співпадає id"
-			],
-			"slots": {
-				"subset": {
-					"type": "list[column]",
-					"required": false
-				}
-			},
-			"plan": [
-				{
-					"op": "drop_duplicates",
-					"args": {
-						"subset": "{subset}"
-					},
-					"out": "df"
-				},
-				{
-					"op": "stats_shape",
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "export_csv",
-			"name": "Експорт у CSV",
-			"description": "Зберігає поточну таблицю у файл формату CSV.",
-			"examples": [
-				"Збережи таблицю у csv",
-				"Експортуй у CSV файл",
-				"Зроби експорт у csv з роздільником ;",
-				"Збережи csv без індексу",
-				"Експортуй у CSV з кодуванням utf-8",
-				"Зроби файл results.csv",
-				"Вивантаж таблицю в csv",
-				"Експорт у CSV, separator=comma",
-				"Збережи як data.csv",
-				"Експортуй csv з index=false",
-				"Запиши результат у файл",
-				"Скачати як csv"
-			],
-			"slots": {
-				"filename": {
-					"type": "str",
-					"required": false,
-					"default": "export.csv"
-				},
-				"sep": {
-					"type": "str",
-					"required": false,
-					"default": ","
-				},
-				"encoding": {
-					"type": "str",
-					"required": false,
-					"default": "utf-8"
-				},
-				"index": {
-					"type": "bool",
-					"required": false,
-					"default": false
-				}
-			},
-			"plan": [
-				{
-					"op": "export_csv",
-					"args": {
-						"filename": "{filename}",
-						"sep": "{sep}",
-						"encoding": "{encoding}",
-						"index": "{index}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "stats_describe",
-			"name": "Описова статистика",
-			"description": "Повертає describe() для числових колонок або вибраних колонок.",
-			"examples": [
-				"Зроби describe по числових колонках",
-				"Дай описову статистику",
-				"Покажи describe()",
-				"Статистика по колонках",
-				"Describe для price та quantity",
-				"Порахуй mean median min max",
-				"Зведена статистика по числових",
-				"Опиши дані",
-				"Описова статистика для score",
-				"Describe numeric columns"
-			],
-			"slots": {
-				"columns": {
-					"type": "columns",
-					"required": false
-				}
-			},
-			"plan": [
-				{
-					"op": "stats_describe",
-					"args": {
-						"columns": "{columns}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "groupby_agg",
-			"name": "Групування з агрегацією",
-			"description": "Групує за колонкою і рахує sum/mean/min/max для цільової колонки.",
-			"examples": [
-				"Сума продажів по бренду",
-				"Порахуй середню ціну по категоріях",
-				"Max score по групах",
-				"Мінімум по кожному клієнту",
-				"Sum по колонці amount для кожного city",
-				"Середнє значення quantity по brand",
-				"Агрегація mean по групах",
-				"Порахуй sum для кожної марки",
-				"Сума по регіонах",
-				"Average price per category",
-				"TOP-3 категорії за загальною кількістю товарів на складі",
-				"Які категорії мають найбільшу сумарну кількість",
-				"ТОП-5 категорій за загальною кількістю товарів",
-				"Розподіл кількості товарів за категоріями",
-				"Сума цін для кожної категорії",
-				"Загальна кількість по брендах",
-				"Категорії з найбільшою кількістю одиниць"
-			],
-			"slots": {
-				"group_col": {
-					"type": "column",
-					"required": true
-				},
-				"target_col": {
-					"type": "column",
-					"required": true
-				},
-				"agg": {
-					"type": "enum",
-					"required": false,
-					"default": "sum",
-					"values": ["sum", "mean", "min", "max"]
-				}
-			},
-			"plan": [
-				{
-					"op": "groupby_agg",
-					"args": {
-						"group_col": "{group_col}",
-						"target_col": "{target_col}",
-						"agg": "{agg}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "filter_contains",
-			"name": "Фільтр містить",
-			"description": "Фільтрує рядки, де колонка містить підрядок (case-insensitive).",
-			"examples": [
-				"Знайди рядки де name містить ivan",
-				"Фільтр по підрядку у колонці city",
-				"Покажи записи де опис містить pro",
-				"contains для колонки brand",
-				"Де title містить слово max",
-				"Фільтруй коли адреса містить kyiv",
-				"Містить текст у полі comment",
-				"Відфільтруй за підрядком",
-				"Пошук по частині слова",
-				"Rows where name contains ann",
-				"Покажи товари, де бренд містить NVIDIA",
-				"Знайди позиції де модель містить RTX",
-				"Покажи записи, де опис містить GeForce",
-				"Виведи товари, де категорія містить миш",
-				"Пошук по Intel у назві товару"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"value": {
-					"type": "str",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "filter_contains",
-					"args": {
-						"column": "{column}",
-						"value": "{value}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "filtered_metric_aggregation",
-			"name": "Агрегація з фільтром підрядка",
-			"description": "Рахує max/min/mean/sum/median для числової колонки всередині відфільтрованої підмножини (contains).",
-			"examples": [
-				"Яка максимальна ціна серед мишей?",
-				"Покажи мінімальну ціну серед клавіатур",
-				"Середня ціна для ноутбуків",
-				"Сума quantity серед категорії відеокарт",
-				"Медіана ціни серед товарів з категорією монітор",
-				"Максимальна вартість серед бренду ASUS",
-				"Яка середня ціна серед товарів з RTX"
-			],
-			"slots": {
-				"filter_col": {
-					"type": "column",
-					"required": true
-				},
-				"filter_value": {
-					"type": "str",
-					"required": true
-				},
-				"target_col": {
-					"type": "column",
-					"required": true
-				},
-				"metric": {
-					"type": "enum",
-					"required": true,
-					"values": ["mean", "sum", "min", "max", "median"]
-				}
-			},
-			"plan": [
-				{
-					"op": "filter_contains_aggregation",
-					"args": {
-						"filter_col": "{filter_col}",
-						"filter_value": "{filter_value}",
-						"target_col": "{target_col}",
-						"metric": "{metric}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "keyword_search_count",
-			"name": "Пошук за ключовим словом (count)",
-			"description": "Рахує кількість рядків, де ключове слово зустрічається в текстових колонках.",
-			"examples": [
-				"Скільки товарів NVIDIA",
-				"Порахуй позиції з RTX",
-				"Скільки записів містять GeForce",
-				"Кількість товарів з Intel",
-				"Порахуй рядки де є слово wireless",
-				"Скільки товарів із SSD",
-				"Скільки позицій з AMD"
-			],
-			"slots": {
-				"keyword": {
-					"type": "str",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "keyword_search_count",
-					"args": {
-						"keyword": "{keyword}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "keyword_search_rows",
-			"name": "Пошук за ключовим словом (rows)",
-			"description": "Повертає рядки, де ключове слово зустрічається в текстових колонках.",
-			"examples": [
-				"Покажи товари з NVIDIA",
-				"Знайди позиції з GeForce",
-				"Виведи записи де є RTX",
-				"Покажи товари з Intel",
-				"Знайди рядки зі словом wireless",
-				"Покажи позиції з SSD",
-				"Виведи товари з AMD"
-			],
-			"slots": {
-				"keyword": {
-					"type": "str",
-					"required": true
-				},
-				"top_n": {
-					"type": "int",
-					"required": false,
-					"default": 20
-				}
-			},
-			"plan": [
-				{
-					"op": "keyword_search_rows",
-					"args": {
-						"keyword": "{keyword}",
-						"top_n": "{top_n}"
-					},
-					"out": "result"
-				}
-			]
-		},
-		{
-			"id": "filter_range_numeric",
-			"name": "Числовий діапазон",
-			"description": "Фільтрує рядки, де значення у колонці між min та max.",
-			"examples": [
-				"Покажи ціни між 100 і 200",
-				"Фільтр по діапазону для amount 10-50",
-				"Де score від 0.5 до 0.8",
-				"between для price",
-				"Залиши рядки з quantity 1-5",
-				"Відфільтруй по діапазону",
-				"Покажи значення у межах",
-				"Ціна від 500 до 1000",
-				"Range filter for value 20-40",
-				"Between min and max"
-			],
-			"slots": {
-				"column": {
-					"type": "column",
-					"required": true
-				},
-				"min": {
-					"type": "float",
-					"required": true
-				},
-				"max": {
-					"type": "float",
-					"required": true
-				}
-			},
-			"plan": [
-				{
-					"op": "filter_range_numeric",
-					"args": {
-						"column": "{column}",
-						"min": "{min}",
-						"max": "{max}"
-					},
-					"out": "result"
-				}
-			]
-		}
-	]
+  "catalog_version": "0.2.0",
+  "language": "uk",
+  "embedding": {
+    "provider": "openai_compatible",
+    "base_url": "http://192.168.200.129:8031/v1",
+    "model": "bge-m3",
+    "dimensions": null,
+    "timeout_s": 30
+  },
+  "intents": [
+    {
+      "id": "stats_shape",
+      "name": "Розмір таблиці",
+      "description": "Повертає загальну інформацію про розмірність даних (рядки та стовпці).",
+      "examples": [
+        "Скільки рядків і стовпців у таблиці?",
+        "Порахуй кількість рядків та колонок",
+        "Який розмір таблиці?",
+        "Скажи shape таблиці",
+        "Скільки рядків у таблиці і скільки колонок?",
+        "Дай розмірність датафрейму",
+        "Покажи кількість записів і полів",
+        "Скільки всього рядків і колонок тут?",
+        "Порахуй rows і columns",
+        "Мені треба знати об'єм даних",
+        "Скільки всього записів?",
+        "Яка структура таблиці по розміру?",
+        "Виведи кількість стрічок і стовпчиків",
+        "Напишіть розміри df",
+        "Скільки даних завантажено?"
+      ],
+      "slots": {},
+      "plan": [
+        {
+          "op": "stats_shape",
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "head_tail",
+      "name": "Перегляд рядків",
+      "description": "Показує перші або останні N рядків таблиці (head/tail).",
+      "examples": [
+        "Покажи перші 5 рядків",
+        "Виведи останні 10 записів",
+        "Дай хед таблиці",
+        "Подивитись початок таблиці",
+        "Покажи кінець списку",
+        "Виведи 3 приклада даних",
+        "Покажи топ 10 рядків",
+        "Глянути на останні 5 стрічок",
+        "Зроби head(20)",
+        "Покажи зразки даних зверху"
+      ],
+      "slots": {
+        "n": {
+          "type": "int",
+          "required": false,
+          "default": 5
+        },
+        "side": {
+          "type": "enum",
+          "required": false,
+          "default": "head",
+          "values": [
+            "head",
+            "tail"
+          ]
+        }
+      },
+      "plan": [
+        {
+          "op": "head_tail",
+          "args": {
+            "n": "{n}",
+            "side": "{side}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "stats_nulls",
+      "name": "Аналіз пропусків",
+      "description": "Рахує кількість пропусків (null/NaN) по колонках або для конкретної колонки.",
+      "examples": [
+        "Порахуй пропуски по всіх колонках",
+        "Скільки пустих значень у таблиці?",
+        "Покажи null count по колонках",
+        "Дай кількість NaN по кожній колонці",
+        "Чи є пропуски? Дай статистику",
+        "Скільки пропусків у колонці price?",
+        "Порахуй пусті значення у полі date",
+        "Покажи де найбільше пропусків",
+        "Виведи колонки з пропусками",
+        "Зроби звіт по missing values",
+        "Перевір чи є нульові значення в id",
+        "Скільки незаповнених полів у address?",
+        "Чи є нани в колонці score?",
+        "Де у нас не вистачає даних?",
+        "Порахуй NaNs"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": false
+        },
+        "top_n": {
+          "type": "int",
+          "required": false,
+          "default": 0
+        }
+      },
+      "plan": [
+        {
+          "op": "stats_nulls",
+          "args": {
+            "column": "{column}",
+            "top_n": "{top_n}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "unique_nunique",
+      "name": "Унікальні значення",
+      "description": "Рахує кількість унікальних значень у колонці або по всіх колонках.",
+      "examples": [
+        "Скільки унікальних значень у колонці brand?",
+        "Порахуй унікальні імена клієнтів",
+        "Скільки різних категорій є в таблиці?",
+        "Дай nunique для user_id",
+        "Покажи кількість унікальних значень для кожної колонки",
+        "Скільки унікальних міст?",
+        "Порахуй різні значення в колонці status",
+        "Скільки унікальних записів у полі product_code?",
+        "Дай список колонок і кількість унікальних значень",
+        "Порахуй distinct values для manager",
+        "Як багато різних значень приймає колонка type?",
+        "Порахуй варіативність у колонці group",
+        "Скільки неповторюваних записів у email?",
+        "Виведи кількість унікальних для всіх стовпців",
+        "Дай статистику унікальності"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": false
+        }
+      },
+      "plan": [
+        {
+          "op": "stats_nunique",
+          "args": {
+            "column": "{column}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "stats_aggregation",
+      "name": "Агрегація (сума, середнє, мін, макс)",
+      "description": "Обчислює статистичні показники (сума, середнє, медіана, мінімум, максимум) для числової колонки.",
+      "examples": [
+        "Порахуй середнє значення ціни",
+        "Яка максимальна зарплата?",
+        "Знайди мінімальний вік",
+        "Дай суму продажів",
+        "Порахуй медіану по колонці score",
+        "Який середній чек (mean) по column 'total'?",
+        "Знайди max для temperature",
+        "Підсумуй значення у колонці amount",
+        "Яке найменше значення quantity?",
+        "Порахуй total sum для profit",
+        "Середня оцінка (average) по класу",
+        "Який максимум у стовпці height?",
+        "Мінімум по weight",
+        "Дай загальну суму витрат"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "metric": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            "mean",
+            "sum",
+            "min",
+            "max",
+            "median"
+          ]
+        }
+      },
+      "plan": [
+        {
+          "op": "stats_aggregation",
+          "args": {
+            "column": "{column}",
+            "metric": "{metric}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "groupby_count",
+      "name": "Групування та підрахунок",
+      "description": "Групує дані по колонці і рахує кількість записів у кожній групі.",
+      "examples": [
+        "Надай кількість товарів для кожного бренду",
+        "Порахуй скільки рядків на кожен region",
+        "Згрупуй по department і порахуй кількість",
+        "Скільки співробітників у кожному відділі?",
+        "Дай count по category",
+        "Покажи кількість записів для кожного значення status",
+        "Зроби групування по year з кількістю",
+        "Порахуй кількість по колонці country",
+        "Згрупуй по gender і порахуй скільки",
+        "Побудуй таблицю: місто → кількість клієнтів",
+        "Розподіл замовлень по менеджерах",
+        "Скільки разів зустрічається кожне значення в col1?",
+        "Згрупувати за типом та порахувати",
+        "Статистика кількості по групах товарів",
+        "ТОП категорій за кількістю записів",
+        "Розподіл рядків за категоріями"
+      ],
+      "capabilities": {
+        "filters": [
+          "equals",
+          "contains",
+          "startswith",
+          "endswith"
+        ],
+        "prefilter_before_groupby": true,
+        "metric_types": [
+          "count"
+        ],
+        "requires_numeric_target": false
+      },
+      "slots": {
+        "group_col": {
+          "type": "column",
+          "required": true
+        },
+        "sort": {
+          "type": "enum",
+          "required": false,
+          "default": "desc",
+          "values": [
+            "asc",
+            "desc",
+            "none"
+          ]
+        },
+        "top_n": {
+          "type": "int",
+          "required": false,
+          "default": 0
+        },
+        "out_col": {
+          "type": "str",
+          "required": false,
+          "default": "count"
+        }
+      },
+      "plan": [
+        {
+          "op": "groupby_count",
+          "args": {
+            "group_col": "{group_col}",
+            "out_col": "{out_col}",
+            "sort": "{sort}",
+            "top_n": "{top_n}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_equals",
+      "name": "Фільтр точної рівності",
+      "description": "Фільтрує рядки, де значення в колонці точно дорівнює заданому тексту або числу.",
+      "examples": [
+        "Покажи записи, де значення поля точно дорівнює вказаному",
+        "Відфільтруй рядки з точним збігом значення",
+        "Залиш лише записи зі статусом exact match",
+        "Знайди рядки, де код дорівнює заданому значенню",
+        "Покажи записи, де прапорець дорівнює true",
+        "Вибери дані, де рік точно дорівнює потрібному",
+        "Show rows where field equals given value",
+        "Filter by exact value in selected column",
+        "Exact match filter for identifier",
+        "Покажи лише записи зі значенням \"активний\""
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "value": {
+          "type": "str",
+          "required": true
+        },
+        "case_insensitive": {
+          "type": "bool",
+          "required": false,
+          "default": true
+        },
+        "top_n": {
+          "type": "int",
+          "required": false,
+          "default": 0
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_equals",
+          "args": {
+            "column": "{column}",
+            "value": "{value}",
+            "case_insensitive": "{case_insensitive}",
+            "top_n": "{top_n}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_multi_conditions",
+      "name": "Multi-column filter",
+      "description": "Фільтрує рядки за кількома умовами одночасно (AND), коли запит містить 2+ фільтри по різних колонках.",
+      "examples": [
+        "Покажи всі записи, де категорія = X і виробник = Y",
+        "Знайди всі товари заданої категорії від заданого виробника",
+        "Покажи всі позиції типу <тип> від <виробник>",
+        "Знайди всі ноутбуки певного виробника",
+        "Show all items where category is X and maker is Y",
+        "Filter records with two conditions across different fields",
+        "Вибери записи, де статус = active і канал = online",
+        "Покажи рядки, де одна умова текстова, а друга числова",
+        "Знайди об'єкти з групою G1 і кількістю більше 0"
+      ],
+      "capabilities": {
+        "filters": [
+          "equals",
+          "contains",
+          "gt",
+          "lt",
+          "gte",
+          "lte"
+        ],
+        "prefilter_before_groupby": false,
+        "metric_types": [],
+        "requires_numeric_target": false
+      },
+      "slots": {
+        "conditions": {
+          "type": "json",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_multi_conditions",
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_comparison",
+      "name": "Фільтр порівняння (числовий)",
+      "description": "Фільтрує рядки за числовою умовою (більше, менше, більше-рівне, менше-рівне).",
+      "examples": [
+        "Покажи рядки де ціна більше 1000",
+        "Відфільтруй де age < 18",
+        "Залиш записи де score більше або дорівнює 90",
+        "Виведи товари з кількістю менше 5",
+        "Знайди де salary > 5000",
+        "Фільтруй: year >= 2020",
+        "Покажи де discount менше 10%",
+        "Вибери записи з рейтингом вище 4.5",
+        "Прибери все де value <= 0",
+        "Покажи транзакції більше 100 грн",
+        "Де температура нижче 0?",
+        "Фільтр по height більше 180"
+      ],
+      "capabilities": {
+        "filters": [
+          "gt",
+          "lt",
+          "gte",
+          "lte",
+          "equals"
+        ],
+        "prefilter_before_groupby": false,
+        "metric_types": [],
+        "requires_numeric_target": true
+      },
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "operator": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            ">",
+            "<",
+            ">=",
+            "<=",
+            "="
+          ]
+        },
+        "value": {
+          "type": "float",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_comparison",
+          "args": {
+            "column": "{column}",
+            "operator": "{operator}",
+            "value": "{value}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 20
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_count",
+      "name": "Підрахунок за числовим фільтром",
+      "description": "Рахує кількість рядків, що задовольняють числову умову (>, <, >=, <=, =).",
+      "examples": [
+        "Скільки товарів мають кількість менше 5",
+        "Порахуй записи де ціна більше 1000",
+        "Скільки моделей з кількістю менше 5 штук",
+        "How many rows where score >= 90",
+        "Кількість рядків де discount <= 10"
+      ],
+      "capabilities": {
+        "filters": [
+          "gt",
+          "lt",
+          "gte",
+          "lte",
+          "equals"
+        ],
+        "prefilter_before_groupby": false,
+        "metric_types": [
+          "count"
+        ],
+        "requires_numeric_target": true
+      },
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "operator": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            ">",
+            "<",
+            ">=",
+            "<=",
+            "="
+          ]
+        },
+        "value": {
+          "type": "float",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_count",
+          "args": {
+            "column": "{column}",
+            "operator": "{operator}",
+            "value": "{value}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "sort_by_column",
+      "name": "Сортування",
+      "description": "Сортує таблицю за вказаною колонкою (за зростанням або спаданням).",
+      "examples": [
+        "Відсортуй таблицю по price за спаданням",
+        "Відсортуй по date за зростанням",
+        "Зроби сортування по прізвищу",
+        "Посортуй по quantity desc",
+        "Сортуй по колонці rating",
+        "Відсортуй за salary від більшої до меншої",
+        "Зроби order by id",
+        "Сортуй за name по алфавіту",
+        "Відсортуй по created_at у зворотному порядку",
+        "Покажи таблицю відсортовану по total",
+        "Впорядкуй дані за віком",
+        "Сортування таблиці: стовпець X, descending"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "order": {
+          "type": "enum",
+          "required": false,
+          "default": "asc",
+          "values": [
+            "asc",
+            "desc"
+          ]
+        }
+      },
+      "plan": [
+        {
+          "op": "sort_values",
+          "args": {
+            "column": "{column}",
+            "order": "{order}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 20
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "select_columns",
+      "name": "Вибір колонок",
+      "description": "Залишає в таблиці тільки вказані колонки (проекція).",
+      "examples": [
+        "Залиш тільки колонки name та email",
+        "Покажи мені лише price і product",
+        "Вибери стовпці: date, amount, status",
+        "Прибери зайві колонки, залиш тільки id",
+        "Створи таблицю тільки з колонок A і B",
+        "Мені потрібні лише поля first_name та last_name",
+        "Відфільтруй стовпці: залиш city та country",
+        "Виведи тільки колонку description",
+        "Select columns x, y, z",
+        "Обріж таблицю до колонок user та score"
+      ],
+      "slots": {
+        "columns": {
+          "type": "list[column]",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "select_columns",
+          "args": {
+            "columns": "{columns}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 20
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "drop_columns",
+      "name": "Видалення колонок",
+      "description": "Видаляє вказані колонки з таблиці.",
+      "examples": [
+        "Видали колонку old_id",
+        "Прибери стовпці temp і aux",
+        "Дропни колонку unnamed: 0",
+        "Видали поля password та secret",
+        "Мені не потрібна колонка comments",
+        "Викинь стовпець index з таблиці",
+        "Зроби drop columns A, B",
+        "Видалити зайві поля: x1, x2",
+        "Очисти таблицю від колонки internal_code",
+        "Прибери колонку date_modified"
+      ],
+      "slots": {
+        "columns": {
+          "type": "list[column]",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "drop_columns",
+          "args": {
+            "columns": "{columns}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 20
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "rename_column",
+      "name": "Перейменування колонки",
+      "description": "Змінює назву однієї колонки на нову.",
+      "examples": [
+        "Перейменуй колонку 'name' на 'full_name'",
+        "Зміни назву стовпця 'p' на 'price'",
+        "Назви колонку 'id' як 'user_id'",
+        "Rename 'qty' to 'quantity'",
+        "Поміняй заголовок 'tel' на 'phone'",
+        "Перейменувати 'col1' в 'Category'",
+        "Дай колонці 'dt' назву 'date'",
+        "Зроби ренейм 'old' -> 'new'",
+        "Заміни назву поля 'adres' на 'address'",
+        "Виправ назву стовпця 'count' на 'total_count'"
+      ],
+      "slots": {
+        "old_name": {
+          "type": "column",
+          "required": true
+        },
+        "new_name": {
+          "type": "str",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "rename_column",
+          "args": {
+            "old_name": "{old_name}",
+            "new_name": "{new_name}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 5
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "drop_rows_by_position",
+      "name": "Видалення рядків за позицією",
+      "description": "Видаляє рядки за порядковими номерами (індексами), які вказав користувач.",
+      "examples": [
+        "Видали рядок номер 10",
+        "Видали рядки 98 і 99",
+        "Прибери 1, 2, 3 рядки",
+        "Видали рядки з номерами 5-7",
+        "Видали останній рядок",
+        "Видали перші 2 рядки",
+        "Прибери рядки 12 та 15",
+        "Видали рядки 20, 21, 22",
+        "Зітри рядок номер 4",
+        "Видали рядки 30-35 включно",
+        "Дропни нульовий рядок",
+        "Викинь рядки під індексами 100, 101"
+      ],
+      "slots": {
+        "indices": {
+          "type": "row_indices",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "drop_rows_by_position",
+          "args": {
+            "indices": "{indices}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "return_df_preview",
+          "args": {
+            "rows": 20
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "drop_duplicates",
+      "name": "Видалення дублікатів",
+      "description": "Видаляє рядки, які повністю дублюють один одного (або за вказаними колонками).",
+      "examples": [
+        "Видали дублікати",
+        "Прибери повтори в таблиці",
+        "Видали однакові рядки",
+        "Залиш тільки унікальні рядки",
+        "Drop duplicates",
+        "Почисти таблицю від дублів",
+        "Видалити записи, що повторюються",
+        "Зроби так щоб рядки не повторювались",
+        "Видали дублікати по колонці email",
+        "Прибери повтори де співпадає id"
+      ],
+      "slots": {
+        "subset": {
+          "type": "list[column]",
+          "required": false
+        }
+      },
+      "plan": [
+        {
+          "op": "drop_duplicates",
+          "args": {
+            "subset": "{subset}"
+          },
+          "out": "df"
+        },
+        {
+          "op": "stats_shape",
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "export_csv",
+      "name": "Експорт у CSV",
+      "description": "Зберігає поточну таблицю у файл формату CSV.",
+      "examples": [
+        "Збережи таблицю у csv",
+        "Експортуй у CSV файл",
+        "Зроби експорт у csv з роздільником ;",
+        "Збережи csv без індексу",
+        "Експортуй у CSV з кодуванням utf-8",
+        "Зроби файл results.csv",
+        "Вивантаж таблицю в csv",
+        "Експорт у CSV, separator=comma",
+        "Збережи як data.csv",
+        "Експортуй csv з index=false",
+        "Запиши результат у файл",
+        "Скачати як csv"
+      ],
+      "slots": {
+        "filename": {
+          "type": "str",
+          "required": false,
+          "default": "export.csv"
+        },
+        "sep": {
+          "type": "str",
+          "required": false,
+          "default": ","
+        },
+        "encoding": {
+          "type": "str",
+          "required": false,
+          "default": "utf-8"
+        },
+        "index": {
+          "type": "bool",
+          "required": false,
+          "default": false
+        }
+      },
+      "plan": [
+        {
+          "op": "export_csv",
+          "args": {
+            "filename": "{filename}",
+            "sep": "{sep}",
+            "encoding": "{encoding}",
+            "index": "{index}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "stats_describe",
+      "name": "Описова статистика",
+      "description": "Повертає describe() для числових колонок або вибраних колонок.",
+      "examples": [
+        "Зроби describe по числових колонках",
+        "Дай описову статистику",
+        "Покажи describe()",
+        "Статистика по колонках",
+        "Describe для price та quantity",
+        "Порахуй mean median min max",
+        "Зведена статистика по числових",
+        "Опиши дані",
+        "Описова статистика для score",
+        "Describe numeric columns"
+      ],
+      "slots": {
+        "columns": {
+          "type": "columns",
+          "required": false
+        }
+      },
+      "plan": [
+        {
+          "op": "stats_describe",
+          "args": {
+            "columns": "{columns}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "groupby_agg",
+      "name": "Групування з агрегацією",
+      "description": "Групує за колонкою і рахує sum/mean/min/max для цільової колонки.",
+      "examples": [
+        "Сума продажів по бренду",
+        "Порахуй середню ціну по категоріях",
+        "Max score по групах",
+        "Мінімум по кожному клієнту",
+        "Sum по колонці amount для кожного city",
+        "Середнє значення quantity по brand",
+        "Агрегація mean по групах",
+        "Порахуй sum для кожної марки",
+        "Сума по регіонах",
+        "Average price per category",
+        "TOP-3 категорії за загальною кількістю товарів на складі",
+        "Які категорії мають найбільшу сумарну кількість",
+        "ТОП-5 категорій за загальною кількістю товарів",
+        "Розподіл кількості товарів за категоріями",
+        "Сума цін для кожної категорії",
+        "Загальна кількість по брендах",
+        "Категорії з найбільшою кількістю одиниць"
+      ],
+      "capabilities": {
+        "filters": [
+          "equals",
+          "contains",
+          "startswith",
+          "endswith"
+        ],
+        "prefilter_before_groupby": true,
+        "metric_types": [
+          "numeric",
+          "product"
+        ],
+        "requires_numeric_target": true
+      },
+      "slots": {
+        "group_col": {
+          "type": "column",
+          "required": true
+        },
+        "target_col": {
+          "type": "column",
+          "required": true
+        },
+        "agg": {
+          "type": "enum",
+          "required": false,
+          "default": "sum",
+          "values": [
+            "sum",
+            "mean",
+            "min",
+            "max"
+          ]
+        }
+      },
+      "plan": [
+        {
+          "op": "groupby_agg",
+          "args": {
+            "group_col": "{group_col}",
+            "target_col": "{target_col}",
+            "agg": "{agg}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_contains",
+      "name": "Фільтр містить",
+      "description": "Фільтрує рядки, де колонка містить підрядок (case-insensitive).",
+      "examples": [
+        "Знайди рядки, де текст поля містить вказане слово",
+        "Фільтр по частковому збігу в колонці",
+        "Покажи записи, де опис містить заданий фрагмент",
+        "Contains-пошук у текстовому полі",
+        "Відфільтруй записи за підрядком",
+        "Пошук по частині слова у назві",
+        "Rows where text field contains a token",
+        "Find records containing keyword in description",
+        "Покажи елементи, де статус містить потрібний фрагмент",
+        "Виведи записи з підрядком у коментарі"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "value": {
+          "type": "str",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_contains",
+          "args": {
+            "column": "{column}",
+            "value": "{value}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filtered_metric_aggregation",
+      "name": "Агрегація з фільтром підрядка",
+      "description": "Рахує max/min/mean/sum/median для числової колонки всередині відфільтрованої підмножини (contains).",
+      "examples": [
+        "Яка максимальна ціна серед мишей?",
+        "Покажи мінімальну ціну серед клавіатур",
+        "Середня ціна для ноутбуків",
+        "Сума quantity серед категорії відеокарт",
+        "Медіана ціни серед товарів з категорією монітор",
+        "Максимальна вартість серед бренду ASUS",
+        "Яка середня ціна серед товарів з RTX"
+      ],
+      "slots": {
+        "filter_col": {
+          "type": "column",
+          "required": true
+        },
+        "filter_value": {
+          "type": "str",
+          "required": true
+        },
+        "target_col": {
+          "type": "column",
+          "required": true
+        },
+        "metric": {
+          "type": "enum",
+          "required": true,
+          "values": [
+            "mean",
+            "sum",
+            "min",
+            "max",
+            "median"
+          ]
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_contains_aggregation",
+          "args": {
+            "filter_col": "{filter_col}",
+            "filter_value": "{filter_value}",
+            "target_col": "{target_col}",
+            "metric": "{metric}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "keyword_search_count",
+      "name": "Пошук за ключовим словом (count)",
+      "description": "Рахує кількість рядків, де ключове слово зустрічається в текстових колонках.",
+      "examples": [
+        "Скільки товарів NVIDIA",
+        "Порахуй позиції з RTX",
+        "Скільки записів містять GeForce",
+        "Кількість товарів з Intel",
+        "Порахуй рядки де є слово wireless",
+        "Скільки товарів із SSD",
+        "Скільки позицій з AMD"
+      ],
+      "slots": {
+        "keyword": {
+          "type": "str",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "keyword_search_count",
+          "args": {
+            "keyword": "{keyword}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "keyword_search_rows",
+      "name": "Пошук за ключовим словом (rows)",
+      "description": "Повертає рядки, де ключове слово зустрічається в текстових колонках.",
+      "examples": [
+        "Покажи товари з NVIDIA",
+        "Знайди позиції з GeForce",
+        "Виведи записи де є RTX",
+        "Покажи товари з Intel",
+        "Знайди рядки зі словом wireless",
+        "Покажи позиції з SSD",
+        "Виведи товари з AMD"
+      ],
+      "capabilities": {
+        "filters": [],
+        "prefilter_before_groupby": false,
+        "metric_types": [],
+        "requires_numeric_target": false
+      },
+      "slots": {
+        "keyword": {
+          "type": "str",
+          "required": true
+        },
+        "top_n": {
+          "type": "int",
+          "required": false,
+          "default": 20
+        }
+      },
+      "plan": [
+        {
+          "op": "keyword_search_rows",
+          "args": {
+            "keyword": "{keyword}",
+            "top_n": "{top_n}"
+          },
+          "out": "result"
+        }
+      ]
+    },
+    {
+      "id": "filter_range_numeric",
+      "name": "Числовий діапазон",
+      "description": "Фільтрує рядки, де значення у колонці між min та max.",
+      "examples": [
+        "Покажи ціни між 100 і 200",
+        "Фільтр по діапазону для amount 10-50",
+        "Де score від 0.5 до 0.8",
+        "between для price",
+        "Залиши рядки з quantity 1-5",
+        "Відфільтруй по діапазону",
+        "Покажи значення у межах",
+        "Ціна від 500 до 1000",
+        "Range filter for value 20-40",
+        "Between min and max"
+      ],
+      "slots": {
+        "column": {
+          "type": "column",
+          "required": true
+        },
+        "min": {
+          "type": "float",
+          "required": true
+        },
+        "max": {
+          "type": "float",
+          "required": true
+        }
+      },
+      "plan": [
+        {
+          "op": "filter_range_numeric",
+          "args": {
+            "column": "{column}",
+            "min": "{min}",
+            "max": "{max}"
+          },
+          "out": "result"
+        }
+      ]
+    }
+  ]
 }
